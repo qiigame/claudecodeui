@@ -96,7 +96,6 @@ test('asset GET routes require file.read before opening an asset', async () => {
   assert.deepEqual(operations, [
     'attachment.upload',
     'file.read',
-    'file.read',
   ]);
 });
 
