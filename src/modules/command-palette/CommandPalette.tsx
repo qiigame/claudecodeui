@@ -245,7 +245,7 @@ function CommandPalette({
                       onShowTab?.(tab.id);
                     })}
                   >
-                    <span className="flex-1">{t(tab.labelKey)}</span>
+                    <span className="flex-1">{tab.label}</span>
                   </CommandItem>
                 ))}
               </CommandGroup>

@@ -274,7 +274,7 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
     if (!canManageSkills) {
       return;
     }
-    const queuedFolders = buildQueuedSkillFolders(selectedFiles);
+    const queuedFolders = buildQueuedSkillFolders(selectedFiles, t);
     setQueuedFiles((previous) => {
       const nextMap = new Map(previous.map((file) => [file.id, file]));
       queuedFolders.forEach((folder) => nextMap.set(folder.id, folder));

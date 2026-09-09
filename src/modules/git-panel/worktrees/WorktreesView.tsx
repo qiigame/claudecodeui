@@ -49,6 +49,7 @@ type WorktreeRowProps = {
 };
 
 function WorktreeRow({ worktree, isMobile, isBusy, onOpen, onMerge, onRemove, canMutate }: WorktreeRowProps) {
+  const { t } = useTranslation();
   const branchLabel = worktree.branch
     ?? (worktree.headSha ? t('git:worktrees.detachedAt', { sha: worktree.headSha.slice(0, 7) }) : t('git:worktrees.detached'));
 

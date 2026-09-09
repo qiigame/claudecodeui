@@ -34,6 +34,7 @@ export default function GitPanel({
   onProjectSelect,
   onProjectsRefresh,
 }: GitPanelProps) {
+  const { t } = useTranslation();
   const { authMode, user } = useAuth();
   const { can, isReadOnly } = useDeploymentPolicy();
   const uiReadOnly = isReadOnly || isManagedIdentityRestricted(authMode, user);

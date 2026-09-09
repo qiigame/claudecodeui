@@ -105,17 +105,7 @@ export function useScheduledMessages(
     }
   }, [scope, scopeKey]);
 
-  // Cleared during the switch render, not by the fetch that follows: the
-  // previous session's banner must never paint over the new session, not even
-  // for the frame before an effect could run.
-  const [renderedSessionId, setRenderedSessionId] = useState(sessionId);
-  if (renderedSessionId !== sessionId) {
-    setRenderedSessionId(sessionId);
-    setScheduledMessages([]);
-  }
-
   useEffect(() => {
-    activeSessionRef.current = sessionId;
     void refresh();
     return () => {
       requestGenerationRef.current += 1;

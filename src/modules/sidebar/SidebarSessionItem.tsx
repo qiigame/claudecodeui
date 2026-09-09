@@ -1,12 +1,14 @@
-import { memo, useState } from 'react';
-import { Check, Edit2, Loader2, MoreHorizontal, Trash2, X } from 'lucide-react';
+import { memo, useEffect, useRef, useState } from 'react';
+import { Check, Edit2, GitBranch, Loader2, MoreHorizontal, Trash2, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
-import { Badge, Dialog, DialogContent, DialogTitle, LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
+import { ActionMenu, Badge, Dialog, DialogContent, DialogTitle, LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
 import { cn } from '@/shared/utils';
 import type { LLMProvider, Project, ProjectSession, SessionWithProvider } from '@/shared/types';
 import { PROVIDER_LABELS, createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
+import { useProviderSessionIdCopy } from '@/modules/sidebar/hooks/useProviderSessionIdCopy';
+import { useSessionForkingProviders } from '@/shared/hooks/useProviderCapabilities';
 import SessionActorBadge from '@/modules/sidebar/SessionActorBadge';
 
 type SidebarSessionItemProps = {
@@ -62,10 +64,15 @@ function SidebarSessionItem({
   const isSelected = selectedSession?.id === session.id;
   const compactSessionAge = formatCompactAge(sessionView.sessionTime, currentTime);
   const [isMobileOptionsOpen, setIsMobileOptionsOpen] = useState(false);
+  const editingContainerRef = useRef<HTMLDivElement>(null);
+  const forkableProviders = useSessionForkingProviders();
+  const canForkThisSession = forkableProviders.has(session.__provider);
   const showAttentionIndicator = needsAttention && !isSelected;
   const showRecentIndicator = !showAttentionIndicator && !isProcessing && sessionView.isActive;
   const providerLabel = PROVIDER_LABELS[session.__provider];
   const sessionIsEditing = isEditing && canWriteSessions;
+  const { copyState, copyLabel, setOptionsOpen, handleCopyAction, isCopyPending, CopyStateIcon } =
+    useProviderSessionIdCopy(session.id, providerLabel);
 
   // While editing, dismiss only when the user clicks outside the inline rename panel
   // (matches Escape / cancel-button behaviour). The mobile rename lives inside the
@@ -112,42 +119,6 @@ function SidebarSessionItem({
       return;
     }
     onForkSession(session);
-  };
-
-  const loadProviderSessionId = async () => {
-    const requestId = ++providerIdRequestRef.current;
-    setCopyState('loading');
-    try {
-      const response = await api.providerSessionId(session.id);
-      const payload = await response.json();
-      const loadedSessionId = payload?.data?.sessionId;
-      if (!response.ok || typeof loadedSessionId !== 'string' || !loadedSessionId) {
-        throw new Error('Provider session ID is unavailable');
-      }
-
-      if (requestId !== providerIdRequestRef.current) return;
-      setProviderSessionId(loadedSessionId);
-      setCopyState('idle');
-    } catch {
-      if (requestId !== providerIdRequestRef.current) return;
-      setProviderSessionId(null);
-      setCopyState('error');
-    }
-  };
-
-  const resetCopyState = () => {
-    providerIdRequestRef.current += 1;
-    setCopyState('idle');
-    setProviderSessionId(null);
-  };
-
-  const setOptionsOpen = (open: boolean) => {
-    if (open) {
-      setProviderSessionId(null);
-      void loadProviderSessionId();
-    } else {
-      resetCopyState();
-    }
   };
 
   const setMobileOptionsOpen = (open: boolean) => {

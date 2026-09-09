@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { ReactNode } from 'react';
 
 import { api } from '@/shared/api';
@@ -145,6 +146,7 @@ export function useAuth(): AuthContextValue {
 
 /** Used by App to expose the session, and its login/logout actions, to every module through useAuth. */
 export function AuthProvider({ children }: AuthProviderProps) {
+  const { t } = useTranslation();
   // The user and token are one state unit so a tab can never render one
   // account's user together with another account's bearer credential.
   const [authSession, setAuthSession] = useState<AuthSessionState>(() => ({

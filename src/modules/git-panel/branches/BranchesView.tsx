@@ -38,6 +38,7 @@ type BranchRowProps = {
 };
 
 function BranchRow({ name, isCurrent, isRemote, aheadCount, behindCount, isMobile, onSwitch, onDelete, canMutate }: BranchRowProps) {
+  const { t } = useTranslation();
   return (
     <div
       className={`group flex items-center gap-3 border-b border-border/40 px-4 transition-colors hover:bg-accent/40 ${

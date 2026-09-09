@@ -153,6 +153,7 @@ function HelpContent({
   data: HelpCommandData;
   canManageSettings: boolean;
 }) {
+  const { t } = useTranslation();
   const [query, setQuery] = useState('');
   const availableCommands = (Array.isArray(data.commands) && data.commands.length > 0
     ? data.commands
@@ -443,6 +444,7 @@ function ModelsContent({
 }
 
 function CostContent({ data }: { data: CostCommandData }) {
+  const { t } = useTranslation();
   const used = Number(data.tokenUsage?.used ?? 0);
   const total = Number(data.tokenUsage?.total ?? 0);
   const model = data.model || 'Unknown';
@@ -523,6 +525,7 @@ function CostContent({ data }: { data: CostCommandData }) {
 }
 
 function StatusContent({ data }: { data: StatusCommandData }) {
+  const { t } = useTranslation();
   const memoryRssMb = data.memoryUsage?.rssMb;
   const rows = [
     { label: 'Package', value: data.packageName || 'claude-code-ui', icon: Package },
@@ -577,6 +580,7 @@ function CommandResultModal({
   readOnly = false,
   onSelectProviderModel,
 }: CommandResultModalProps) {
+  const { t } = useTranslation();
   // A stale or forged `/models` result must not reopen the hidden model library
   // in a Runtime-only/read-only build.
   const visiblePayload = (comicRuntimeOnly || readOnly) && payload?.kind === 'models' ? null : payload;

@@ -303,6 +303,7 @@ type McpServerFormState =
   | null;
 
 export function useMcpServers({ selectedProvider, currentProjects, canManage = false }: UseMcpServersArgs) {
+  const { t } = useTranslation('settings');
   const [servers, setServers] = useState<ProviderMcpServer[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);

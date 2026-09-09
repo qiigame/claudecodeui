@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo, useState } from "react";
-import { ChevronDown, Plus } from "lucide-react";
+import { Check, ChevronDown, Plus } from "lucide-react";
 import { Trans, useTranslation } from "react-i18next";
 
 import type {
@@ -20,7 +20,10 @@ import {
   CommandInput,
   CommandList,
   CommandEmpty,
+  CommandGroup,
+  CommandItem,
   Card,
+  Badge,
   Button,
   LLMProviderLogo,
 } from "@/shared/ui";
@@ -147,12 +150,13 @@ export default function ProviderSelectionEmptyState({
   const [dialogOpen, setDialogOpen] = useState(false);
   const [modelLibraryOpen, setModelLibraryOpen] = useState(false);
 
-  const visibleProviderGroups = useMemo<ProviderGroup[]>(() => {
+  const visibleProviderGroups = useMemo<ModelGroup[]>(() => {
     const providerMeta = runtimeSelectorOnly
       ? RUNTIME_PROVIDER_META
       : PROVIDER_META;
     return providerMeta.map((p) => ({
-      id: p.id,
+      key: p.id,
+      provider: p.id,
       name: p.name,
       models: providerModelCatalog[p.id]?.OPTIONS ?? [],
     }));
@@ -180,7 +184,7 @@ export default function ProviderSelectionEmptyState({
       setProvider(providerId);
       writeSelectedProvider(providerId);
       setProviderModel(providerId, modelValue);
-      setPickerOpen(false);
+      setDialogOpen(false);
       setTimeout(() => textareaRef.current?.focus(), 100);
     },
     [canManageProviderModels, runtimeSelectorOnly, setProvider, setProviderModel, textareaRef],
@@ -197,13 +201,13 @@ export default function ProviderSelectionEmptyState({
   );
 
   const openModelLibrary = () => {
-    setPickerOpen(false);
+    setDialogOpen(false);
     setModelLibraryOpen(true);
   };
 
   const closeModelLibrary = () => {
     setModelLibraryOpen(false);
-    setPickerOpen(true);
+    setDialogOpen(true);
   };
 
   const renderUnavailableState = (title: string) => (
@@ -242,7 +246,7 @@ export default function ProviderSelectionEmptyState({
             </p>
           </div>
 
-          <Dialog open={dialogOpen} onOpenChange={setPickerOpen}>
+          <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
             <DialogTrigger asChild>
               <Card
                 className="group mx-auto max-w-xs cursor-pointer border-border/60 transition-all duration-150 hover:border-border hover:shadow-md active:scale-[0.99]"
@@ -360,7 +364,7 @@ export default function ProviderSelectionEmptyState({
                       </CommandEmpty>
                       {visibleProviderGroups.map((group, idx) => (
                         <CommandGroup
-                          key={group.id}
+                          key={group.key}
                           className={
                             idx > 0
                               ? "border-t border-border/40 [&_[cmdk-group-heading]]:mt-1 [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider"
@@ -368,7 +372,7 @@ export default function ProviderSelectionEmptyState({
                           }
                           heading={
                             <span className="flex items-center gap-1.5">
-                              <LLMProviderLogo provider={group.id} className="h-3.5 w-3.5 shrink-0" />
+                              <LLMProviderLogo provider={group.provider} className="h-3.5 w-3.5 shrink-0" />
                               {group.name}
                             </span>
                           }
@@ -379,12 +383,12 @@ export default function ProviderSelectionEmptyState({
                             </CommandItem>
                           ) : null}
                           {group.models.map((model) => {
-                            const isSelected = provider === group.id && currentModel === model.value;
+                            const isSelected = provider === group.provider && currentModel === model.value;
                             return (
                               <CommandItem
-                                key={`${group.id}-${model.value}`}
+                                key={`${group.key}-${model.value}`}
                                 value={`${group.name} ${model.label} ${model.description || ''}`}
-                                onSelect={() => handleModelSelect(group.id, model.value)}
+                                onSelect={() => handleModelSelect(group.provider, model.value)}
                                 className="ml-4 border-l border-border/40 pl-4"
                               >
                                 <div className="min-w-0 flex-1">

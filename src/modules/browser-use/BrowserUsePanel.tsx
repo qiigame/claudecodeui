@@ -144,6 +144,7 @@ const PROMPT_KEYS = ['browserUse.prompt1', 'browserUse.prompt2'];
 
 /** Used by the project-workspace module to render the Browser tab's session list and live preview. */
 export default function BrowserUsePanel({ isVisible, onShowSettings }: BrowserUsePanelProps) {
+  const { t } = useTranslation('browser');
   const { authMode, user, canManageSettings: authCanManageSettings } = useAuth();
   const { can, isReadOnly } = useDeploymentPolicy();
   const managedIdentityRestricted = isManagedIdentityRestricted(authMode, user);

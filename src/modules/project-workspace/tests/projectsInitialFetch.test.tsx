@@ -195,7 +195,7 @@ test('a selected session outside the loaded page still resolves its authoritativ
       isMobile: false,
       isSessionProcessing: () => false,
     }),
-    { initialProps: { urlSessionId: undefined } },
+    { initialProps: { urlSessionId: undefined as string | undefined } },
   );
 
   await waitFor(() => {
@@ -253,7 +253,7 @@ test('a session whose project no longer exists cannot inherit another project', 
       isMobile: false,
       isSessionProcessing: () => false,
     }),
-    { initialProps: { urlSessionId: undefined } },
+    { initialProps: { urlSessionId: undefined as string | undefined } },
   );
 
   await waitFor(() => {
