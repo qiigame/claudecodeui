@@ -417,7 +417,7 @@
       "modes": {
         "default": {
           "title": "默认",
-          "description": "只有受信任的命令（ls、cat、grep、git status 等）会自动运行。其他命令将被跳过。可以写入工作区。"
+          "description": "在工作区沙箱内运行命令。Codex 决定何时需要批准；此非交互式集成无法批准请求。"
         },
         "acceptEdits": {
           "title": "接受编辑",

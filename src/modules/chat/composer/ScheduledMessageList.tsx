@@ -15,7 +15,8 @@ type ScheduledMessageListProps = {
  * visible in the session it will be sent to — and can be called off.
  *
  * Failed ones are shown too: a message that did not go is exactly the thing a
- * user needs to know about, and the server records why.
+ * user needs to know about, and the server records why. Dismissing one goes
+ * through the same cancel endpoint, so it stays gone across reloads.
  */
 export function ScheduledMessageList({ scheduledMessages, onCancel, canCancel = false }: ScheduledMessageListProps) {
   const { t } = useTranslation('chat');

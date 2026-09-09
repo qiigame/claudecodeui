@@ -527,7 +527,7 @@ test('Agent route reuses a matching checkout without cloning or deleting it', as
     } as unknown as AgentDependencies['fileSystem'],
     spawnProcess,
     models: {
-      getProviderModels: async () => ({ models: { DEFAULT: 'default-model' } }),
+      getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'default-model' }),
     } as unknown as AgentDependencies['models'],
     queryClaude: (async () => undefined) as AgentDependencies['queryClaude'],
   }), async (baseUrl) => {

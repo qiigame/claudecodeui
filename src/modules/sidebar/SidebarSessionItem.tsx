@@ -1,13 +1,11 @@
-import { memo, useEffect, useRef, useState } from 'react';
-import { Check, Copy, Edit2, GitBranch, Loader2, MoreHorizontal, Trash2, X } from 'lucide-react';
+import { memo, useState } from 'react';
+import { Check, Edit2, Loader2, MoreHorizontal, Trash2, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
-import { ActionMenu, Badge, Dialog, DialogContent, DialogTitle, LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
-import { cn,copyTextToClipboard } from '@/shared/utils';
+import { Badge, Dialog, DialogContent, DialogTitle, LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
+import { cn } from '@/shared/utils';
 import type { LLMProvider, Project, ProjectSession, SessionWithProvider } from '@/shared/types';
-import { api } from '@/shared/api';
-import { useSessionForkingProviders } from '@/shared/hooks/useProviderCapabilities';
-import { createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
+import { PROVIDER_LABELS, createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
 import SessionActorBadge from '@/modules/sidebar/SessionActorBadge';
 
@@ -37,14 +35,6 @@ type SidebarSessionItemProps = {
   t: TFunction;
 };
 
-const PROVIDER_LABELS: Record<LLMProvider, string> = {
-  claude: 'Claude',
-  codex: 'Codex',
-  cursor: 'Cursor',
-  opencode: 'OpenCode',
-};
-
-type CopyState = 'loading' | 'idle' | 'copying' | 'copied' | 'error';
 /** Rendered by SidebarProjectSessions for one session row, including its rename, copy and delete controls. */
 function SidebarSessionItem({
   project,
@@ -71,11 +61,7 @@ function SidebarSessionItem({
   const sessionView = createSessionViewModel(session, currentTime, t);
   const isSelected = selectedSession?.id === session.id;
   const compactSessionAge = formatCompactAge(sessionView.sessionTime, currentTime);
-  const editingContainerRef = useRef<HTMLDivElement>(null);
   const [isMobileOptionsOpen, setIsMobileOptionsOpen] = useState(false);
-  const [copyState, setCopyState] = useState<CopyState>('idle');
-  const [providerSessionId, setProviderSessionId] = useState<string | null>(null);
-  const providerIdRequestRef = useRef(0);
   const showAttentionIndicator = needsAttention && !isSelected;
   const showRecentIndicator = !showAttentionIndicator && !isProcessing && sessionView.isActive;
   const providerLabel = PROVIDER_LABELS[session.__provider];
@@ -113,12 +99,6 @@ function SidebarSessionItem({
     }
     onSaveEditingSession(project.projectId, session.id, renameDraft, session.__provider);
   };
-
-  // Read from the backend capability matrix rather than branching on the
-  // provider id here; the underlying request is cached module-side, so every
-  // row in the sidebar shares one fetch.
-  const forkableProviders = useSessionForkingProviders();
-  const canForkThisSession = forkableProviders.has(session.__provider);
 
   const requestDeleteSession = () => {
     if (!canWriteSessions) {
@@ -186,37 +166,6 @@ function SidebarSessionItem({
     saveEditedSession();
     setMobileOptionsOpen(false);
   };
-
-  const copyProviderSessionId = async () => {
-    if (!providerSessionId) {
-      setCopyState('error');
-      return;
-    }
-
-    setCopyState('copying');
-    const didCopy = await copyTextToClipboard(providerSessionId);
-    setCopyState(didCopy ? 'copied' : 'error');
-  };
-
-  const handleCopyAction = () => {
-    if (copyState === 'error' && !providerSessionId) {
-      void loadProviderSessionId();
-    } else {
-      void copyProviderSessionId();
-    }
-  };
-
-  const isCopyPending = copyState === 'loading' || copyState === 'copying';
-  const CopyStateIcon = copyState === 'copied' ? Check : Copy;
-  const copyLabel = copyState === 'loading'
-    ? `Loading ${providerLabel} session ID…`
-    : copyState === 'copied'
-      ? `${providerLabel} session ID copied`
-      : copyState === 'error'
-        ? providerSessionId
-          ? `Couldn't copy ${providerLabel} session ID`
-          : `${providerLabel} session ID unavailable`
-        : `Copy ${providerLabel} session ID`;
 
   return (
     <div className="group relative">

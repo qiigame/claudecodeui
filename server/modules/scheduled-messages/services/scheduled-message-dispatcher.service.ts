@@ -190,6 +190,10 @@ async function sendClaimedMessage(
         userId: row.user_id,
         content: row.content,
         options: readOptions(row.options),
+        // The user picked this time on purpose; a run that happens to be going
+        // is aborted so the scheduled message lands when it was due, instead
+        // of being recorded as "not sent — session was busy".
+        interruptActiveRun: true,
       },
       {
         runtime,

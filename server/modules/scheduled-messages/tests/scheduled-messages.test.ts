@@ -38,7 +38,7 @@ async function withIsolatedDatabase(runTest: (userId: number) => void | Promise<
 
 type RunCall = { provider: string; command: string; options: Record<string, unknown> };
 
-function createRuntime(runs: RunCall[], behaviour: 'ok' | 'throw' = 'ok') {
+function createRuntime(runs: RunCall[], behaviour: 'ok' | 'throw' = 'ok', aborts: string[] = []) {
   return {
     hasRuntime: () => true,
     run: async (provider: string, command: string, options: Record<string, unknown>) => {
@@ -46,6 +46,10 @@ function createRuntime(runs: RunCall[], behaviour: 'ok' | 'throw' = 'ok') {
         throw new Error('provider exploded');
       }
       runs.push({ provider, command, options });
+    },
+    abort: async (_provider: string, sessionId: string) => {
+      aborts.push(sessionId);
+      return true;
     },
   } as never;
 }
@@ -278,6 +282,23 @@ test('a cancelled message never fires', async () => {
     const runs: RunCall[] = [];
     assert.equal(await dispatchDueScheduledMessages(createRuntime(runs)), 0);
     assert.equal(runs.length, 0);
+  });
+});
+
+test('a failed message can be dismissed, and stays dismissed', async () => {
+  await withIsolatedDatabase(async (userId) => {
+    const scheduled = scheduledMessagesService.schedule({
+      userId,
+      sessionId: SESSION_ID,
+      content: 'will fail',
+      scheduledFor: new Date(Date.now() - 1_000).toISOString(),
+    });
+    await dispatchDueScheduledMessages(createRuntime([], 'throw'));
+    assert.equal(scheduledMessagesDb.listForSession(userId, SESSION_ID)[0].status, 'failed');
+
+    scheduledMessagesService.cancel(userId, scheduled.id);
+
+    assert.equal(scheduledMessagesDb.listForSession(userId, SESSION_ID)[0].status, 'cancelled');
   });
 });
 

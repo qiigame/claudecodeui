@@ -1,5 +1,6 @@
 import { AlertCircle, Check, ChevronDown, Download, GitBranch, Plus, RefreshCw, RotateCcw, Search, Upload, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import type { ConfirmationRequest, GitRemoteStatus } from '@/shared/types';
 import NewBranchModal from '@/modules/git-panel/modals/NewBranchModal';
@@ -60,6 +61,7 @@ export default function GitPanelHeader({
   onClearError,
   onRequestConfirmation,
 }: GitPanelHeaderProps) {
+  const { t } = useTranslation();
   const [showBranchDropdown, setShowBranchDropdown] = useState(false);
   const [showNewBranchModal, setShowNewBranchModal] = useState(false);
   const [branchSearchQuery, setBranchSearchQuery] = useState('');
@@ -102,7 +104,7 @@ export default function GitPanelHeader({
   const requestPullConfirmation = () => {
     onRequestConfirmation({
       type: 'pull',
-      message: `Pull ${behindCount} commit${behindCount !== 1 ? 's' : ''} from ${remoteName}?`,
+      message: t('git:header.confirmPull', { count: behindCount, remote: remoteName }),
       onConfirm: onPull,
     });
   };
@@ -110,7 +112,7 @@ export default function GitPanelHeader({
   const requestPushConfirmation = () => {
     onRequestConfirmation({
       type: 'push',
-      message: `Push ${aheadCount} commit${aheadCount !== 1 ? 's' : ''} to ${remoteName}?`,
+      message: t('git:header.confirmPush', { count: aheadCount, remote: remoteName }),
       onConfirm: onPush,
     });
   };
@@ -118,7 +120,7 @@ export default function GitPanelHeader({
   const requestPublishConfirmation = () => {
     onRequestConfirmation({
       type: 'publish',
-      message: `Publish branch "${currentBranch}" to ${remoteName}?`,
+      message: t('git:header.confirmPublish', { branch: currentBranch, remote: remoteName }),
       onConfirm: onPublish,
     });
   };
@@ -126,7 +128,7 @@ export default function GitPanelHeader({
   const requestRevertLocalCommitConfirmation = () => {
     onRequestConfirmation({
       type: 'revertLocalCommit',
-      message: 'Revert the latest local commit? This removes the commit but keeps its changes staged.',
+      message: t('git:header.confirmRevert'),
       onConfirm: onRevertLocalCommit,
     });
   };
@@ -157,17 +159,17 @@ export default function GitPanelHeader({
               {remoteStatus?.hasRemote && (
                 <span className="flex items-center gap-0.5 text-xs">
                   {aheadCount > 0 && (
-                    <span className="text-green-600 dark:text-green-400" title={`${aheadCount} ahead`}>
+                    <span className="text-green-600 dark:text-green-400" title={t('git:header.aheadTitle', { n: aheadCount })}>
                       ↑{aheadCount}
                     </span>
                   )}
                   {behindCount > 0 && (
-                    <span className="text-primary" title={`${behindCount} behind`}>
+                    <span className="text-primary" title={t('git:header.behindTitle', { n: behindCount })}>
                       ↓{behindCount}
                     </span>
                   )}
                   {remoteStatus.isUpToDate && (
-                    <span className="text-muted-foreground" title="Up to date">✓</span>
+                    <span className="text-muted-foreground" title={t('git:header.upToDate')}>✓</span>
                   )}
                 </span>
               )}
@@ -184,14 +186,14 @@ export default function GitPanelHeader({
                   type="text"
                   value={branchSearchQuery}
                   onChange={(event) => setBranchSearchQuery(event.target.value)}
-                  placeholder="Search branches..."
+                  placeholder={t('git:header.searchBranches')}
                   className="w-full bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
                 />
                 {branchSearchQuery && (
                   <button
                     onClick={() => setBranchSearchQuery('')}
                     className="shrink-0 text-muted-foreground transition-colors hover:text-foreground"
-                    title="Clear search"
+                    title={t('git:header.clearSearch')}
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
@@ -199,7 +201,7 @@ export default function GitPanelHeader({
               </div>
               <div className="max-h-64 overflow-y-auto py-1">
                 {filteredBranches.length === 0 ? (
-                  <div className="px-4 py-3 text-center text-sm text-muted-foreground">No matching branches</div>
+                  <div className="px-4 py-3 text-center text-sm text-muted-foreground">{t('git:header.noMatchingBranches')}</div>
                 ) : (
                   filteredBranches.map((branch) => (
                     <button
@@ -226,7 +228,7 @@ export default function GitPanelHeader({
                   className="flex w-full items-center space-x-2 px-4 py-2 text-left text-sm transition-colors hover:bg-accent"
                 >
                   <Plus className="h-3 w-3" />
-                  <span>Create new branch</span>
+                  <span>{t('git:header.createNewBranch')}</span>
                 </button>
               </div>
             </div>
@@ -243,10 +245,10 @@ export default function GitPanelHeader({
                   onClick={requestPublishConfirmation}
                   disabled={anyPending}
                   className="flex items-center gap-1 rounded-lg bg-primary px-2.5 py-1 text-sm text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
-                  title={`Publish "${currentBranch}" to ${remoteName}`}
+                  title={t('git:header.publishTitle', { branch: currentBranch, remote: remoteName })}
                 >
                   <Upload className={`h-3 w-3 ${isPublishing ? 'animate-pulse' : ''}`} />
-                  {!isMobile && <span>{isPublishing ? 'Publishing…' : 'Publish'}</span>}
+                  {!isMobile && <span>{isPublishing ? t('git:header.publishing') : t('git:header.publish')}</span>}
                 </button>
                 )
               ) : (
@@ -256,7 +258,7 @@ export default function GitPanelHeader({
                     onClick={() => void onFetch()}
                     disabled={anyPending}
                     className="flex items-center gap-1 rounded-lg bg-primary px-2.5 py-1 text-sm text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
-                    title={`Fetch from ${remoteName}`}
+                    title={t('git:header.fetchTitle', { remote: remoteName })}
                   >
                     <RefreshCw className={`h-3 w-3 ${isFetching ? 'animate-spin' : ''}`} />
                     {!isMobile && <span>{isFetching ? 'Fetching…' : 'Fetch'}</span>}
@@ -267,10 +269,10 @@ export default function GitPanelHeader({
                       onClick={requestPullConfirmation}
                       disabled={anyPending}
                       className="flex items-center gap-1 rounded-lg bg-green-600 px-2.5 py-1 text-sm text-white transition-colors hover:bg-green-700 disabled:opacity-50"
-                      title={`Pull ${behindCount} from ${remoteName}`}
+                      title={t('git:header.pullTitle', { n: behindCount, remote: remoteName })}
                     >
                       <Download className={`h-3 w-3 ${isPulling ? 'animate-pulse' : ''}`} />
-                      {!isMobile && <span>{isPulling ? 'Pulling…' : `Pull ${behindCount}`}</span>}
+                      {!isMobile && <span>{isPulling ? t('git:header.pulling') : t('git:header.pullCount', { n: behindCount })}</span>}
                     </button>
                   )}
 
@@ -279,10 +281,10 @@ export default function GitPanelHeader({
                       onClick={requestPushConfirmation}
                       disabled={anyPending}
                       className="flex items-center gap-1 rounded-lg bg-orange-600 px-2.5 py-1 text-sm text-white transition-colors hover:bg-orange-700 disabled:opacity-50"
-                      title={`Push ${aheadCount} to ${remoteName}`}
+                      title={t('git:header.pushTitle', { n: aheadCount, remote: remoteName })}
                     >
                       <Upload className={`h-3 w-3 ${isPushing ? 'animate-pulse' : ''}`} />
-                      {!isMobile && <span>{isPushing ? 'Pushing…' : `Push ${aheadCount}`}</span>}
+                      {!isMobile && <span>{isPushing ? t('git:header.pushing') : t('git:header.pushCount', { n: aheadCount })}</span>}
                     </button>
                   )}
                 </>
@@ -307,7 +309,7 @@ export default function GitPanelHeader({
             onClick={onRefresh}
             disabled={isLoading}
             className={`rounded-lg transition-colors hover:bg-accent ${isMobile ? 'p-1' : 'p-1.5'}`}
-            title="Refresh git status"
+            title={t('git:header.refreshTitle')}
           >
             <RefreshCw className={`text-muted-foreground ${isLoading ? 'animate-spin' : ''} ${isMobile ? 'h-3 w-3' : 'h-4 w-4'}`} />
           </button>
@@ -322,7 +324,7 @@ export default function GitPanelHeader({
           <button
             onClick={onClearError}
             className="shrink-0 rounded p-0.5 hover:bg-destructive/20"
-            aria-label="Dismiss error"
+            aria-label={t('git:header.dismissError')}
           >
             <X className="h-3.5 w-3.5" />
           </button>

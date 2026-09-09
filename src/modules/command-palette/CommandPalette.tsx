@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import {
   ChevronRight,
   MessageSquare,
@@ -65,6 +66,7 @@ function CommandPalette({
   onOpenSettings,
   onShowTab,
 }: CommandPaletteProps) {
+  const { t } = useTranslation();
   const [open, setOpen] = React.useState(false);
   const [search, setSearch] = React.useState('');
   const [pages, setPages] = React.useState<Page[]>([]);
@@ -170,36 +172,38 @@ function CommandPalette({
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent className="max-w-xl overflow-hidden p-0">
-        <DialogTitle>Command palette</DialogTitle>
-        <Command label="Command palette" onKeyDown={handleKeyDown}>
+        <DialogTitle>{t('commandPalette.title')}</DialogTitle>
+        <Command label={t('commandPalette.title')} onKeyDown={handleKeyDown}>
           {page && (
             <div className="flex items-center gap-2 border-b px-3 py-2">
               <span className="inline-flex items-center gap-1 rounded-md bg-accent px-2 py-0.5 text-xs font-medium text-accent-foreground">
-                {PAGE_LABELS[page]}
+                {t(`commandPalette.pages.${page}`)}
                 <button
                   type="button"
                   onClick={popPage}
-                  aria-label="Back to all"
+                  aria-label={t('commandPalette.backToAll')}
                   className="ml-0.5 rounded-sm opacity-70 hover:opacity-100"
                 >
                   <X className="h-3 w-3" />
                 </button>
               </span>
-              <span className="text-xs text-muted-foreground">Backspace to go back</span>
+              <span className="text-xs text-muted-foreground">{t('commandPalette.backspaceHint')}</span>
             </div>
           )}
           <CommandInput
-            placeholder={page ? `Search ${PAGE_LABELS[page].toLowerCase()}…` : 'Type to search anything…'}
+            placeholder={page
+              ? t('commandPalette.searchPage', { page: t(`commandPalette.pages.${page}`).toLowerCase() })
+              : t('commandPalette.searchAnything')}
             value={search}
             onValueChange={setSearch}
           />
           <CommandList>
-            <CommandEmpty>No results.</CommandEmpty>
+            <CommandEmpty>{t('commandPalette.noResults')}</CommandEmpty>
 
             {showActions && (
-              <CommandGroup heading="Actions">
+              <CommandGroup heading={t('commandPalette.groupActions')}>
                 <CommandItem
-                  value="Start new chat"
+                  value={`${t('commandPalette.startNewChat')} new chat`}
                   disabled={startNewChatDisabled}
                   onSelect={() => {
                     if (!selectedProject) return;
@@ -207,9 +211,9 @@ function CommandPalette({
                   }}
                 >
                   <MessageSquarePlus className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <span className="flex-1">Start new chat</span>
+                  <span className="flex-1">{t('commandPalette.startNewChat')}</span>
                   {startNewChatDisabled && (
-                    <span className="text-xs text-muted-foreground">Select a project first</span>
+                    <span className="text-xs text-muted-foreground">{t('commandPalette.selectProjectFirst')}</span>
                   )}
                 </CommandItem>
                 {canManageSettings && (
@@ -220,7 +224,7 @@ function CommandPalette({
                 )}
                 <CommandItem value="Toggle theme dark light mode" onSelect={() => run(toggleDarkMode)}>
                   <SunMoon className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <span className="flex-1">Toggle theme</span>
+                  <span className="flex-1">{t('commandPalette.toggleTheme')}</span>
                 </CommandItem>
               </CommandGroup>
             )}
@@ -241,7 +245,7 @@ function CommandPalette({
                       onShowTab?.(tab.id);
                     })}
                   >
-                    <span className="flex-1">{tab.label}</span>
+                    <span className="flex-1">{t(tab.labelKey)}</span>
                   </CommandItem>
                 ))}
               </CommandGroup>
@@ -256,14 +260,14 @@ function CommandPalette({
                     onSelect={() => run(() => onOpenSettings(id))}
                   >
                     <Icon className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                    <span className="flex-1">Settings: {label}</span>
+                    <span className="flex-1">{t('commandPalette.settingsItem', { label })}</span>
                   </CommandItem>
                 ))}
               </CommandGroup>
             )}
 
             {showSessions && projectId && sessionsShown.length > 0 && (
-              <CommandGroup heading="Sessions">
+              <CommandGroup heading={t('commandPalette.groupSessions')}>
                 {sessionsShown.map((s) => (
                   <CommandItem
                     key={s.id}
@@ -283,7 +287,7 @@ function CommandPalette({
                   </CommandItem>
                 ))}
                 {!page && sessionRows.length > browseLimit && (
-                  <BrowseAllItem label={`Browse all sessions (${sessionRows.length})`} onSelect={() => pushPage('sessions')} />
+                  <BrowseAllItem label={t('commandPalette.browseAllSessions', { count: sessionRows.length })} onSelect={() => pushPage('sessions')} />
                 )}
               </CommandGroup>
             )}

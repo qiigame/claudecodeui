@@ -132,7 +132,7 @@ export const scheduledMessagesDb = {
       .prepare(
         `UPDATE scheduled_messages
          SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND user_id = ? AND status = 'pending'`
+         WHERE id = ? AND user_id = ? AND status IN ('pending', 'failed')`
       )
       .run(id, userId);
 

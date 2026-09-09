@@ -1,12 +1,11 @@
 import React, { useCallback, useMemo, useState } from "react";
-import { Check, ChevronDown, Plus } from "lucide-react";
+import { ChevronDown, Plus } from "lucide-react";
 import { Trans, useTranslation } from "react-i18next";
 
 import type {
   ProjectSession,
   LLMProvider,
   ProviderModelActions,
-  ProviderModelOption,
   ProviderModelsDefinition,
 } from "@/shared/types";
 import { COMIC_RUNTIME_PROVIDERS } from '@/shared/constants';
@@ -21,13 +20,11 @@ import {
   CommandInput,
   CommandList,
   CommandEmpty,
-  CommandGroup,
-  CommandItem,
   Card,
-  Badge,
   Button,
   LLMProviderLogo,
 } from "@/shared/ui";
+import ModelGroupList, { type ModelGroup } from "@/modules/chat/composer/ModelGroupList";
 import ModelLibraryPanel from "@/modules/chat/modals/ModelLibraryPanel";
 import { writeSelectedProvider } from '@/shared/selectedProvider';
 
@@ -80,12 +77,6 @@ type ProviderSelectionEmptyStateProps = {
   isTaskMasterInstalled: boolean | null;
   onShowAllTasks?: (() => void) | null;
   setInput: React.Dispatch<React.SetStateAction<string>>;
-};
-
-type ProviderGroup = {
-  id: LLMProvider;
-  name: string;
-  models: ProviderModelOption[];
 };
 
 function getModelConfig(
@@ -189,7 +180,7 @@ export default function ProviderSelectionEmptyState({
       setProvider(providerId);
       writeSelectedProvider(providerId);
       setProviderModel(providerId, modelValue);
-      setDialogOpen(false);
+      setPickerOpen(false);
       setTimeout(() => textareaRef.current?.focus(), 100);
     },
     [canManageProviderModels, runtimeSelectorOnly, setProvider, setProviderModel, textareaRef],
@@ -206,13 +197,13 @@ export default function ProviderSelectionEmptyState({
   );
 
   const openModelLibrary = () => {
-    setDialogOpen(false);
+    setPickerOpen(false);
     setModelLibraryOpen(true);
   };
 
   const closeModelLibrary = () => {
     setModelLibraryOpen(false);
-    setDialogOpen(true);
+    setPickerOpen(true);
   };
 
   const renderUnavailableState = (title: string) => (
@@ -251,7 +242,7 @@ export default function ProviderSelectionEmptyState({
             </p>
           </div>
 
-          <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+          <Dialog open={dialogOpen} onOpenChange={setPickerOpen}>
             <DialogTrigger asChild>
               <Card
                 className="group mx-auto max-w-xs cursor-pointer border-border/60 transition-all duration-150 hover:border-border hover:shadow-md active:scale-[0.99]"
