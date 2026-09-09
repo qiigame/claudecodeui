@@ -19,7 +19,7 @@ const deploymentState = vi.hoisted(() => ({
 }));
 
 vi.mock('@/modules/auth', async (importOriginal) => ({
-  ...await importOriginal<typeof import('@/modules/auth')>(),
+  ...await importOriginal<Record<string, unknown>>(),
   useAuth: () => authState,
 }));
 
