@@ -5,7 +5,7 @@ import test from 'node:test';
 
 import express, { type NextFunction, type Request, type Response } from 'express';
 
-import { createCommandsRouter } from '@/modules/commands/commands.routes.js';
+import { createCommandsRouter } from '@/modules/commands/index.js';
 import {
   createDeploymentPolicyGuard,
   captureDeploymentPolicy,
@@ -13,11 +13,11 @@ import {
   mountPreApiKeyCapabilityRoute,
   parseDeploymentPolicy,
 } from '@/modules/deployment-policy/index.js';
-import { createPluginsRouter } from '@/modules/plugins/plugins.routes.js';
-import { createProviderRouter } from '@/modules/providers/provider.routes.js';
-import { createTaskmasterRouter } from '@/modules/taskmaster/taskmaster.routes.js';
-import { createScheduledMessagesRouter } from '@/modules/scheduled-messages/scheduled-messages.routes.js';
-import { createWorktreesRouter } from '@/modules/worktrees/worktrees.routes.js';
+import { createPluginsRouter } from '@/modules/plugins/index.js';
+import { createProviderRouter } from '@/modules/providers/index.js';
+import { createTaskmasterRouter } from '@/modules/taskmaster/index.js';
+import { createScheduledMessagesRouter } from '@/modules/scheduled-messages/index.js';
+import { createWorktreesRouter } from '@/modules/worktrees/index.js';
 import { AppError } from '@/shared/utils.js';
 
 const readonlyPolicy = parseDeploymentPolicy({

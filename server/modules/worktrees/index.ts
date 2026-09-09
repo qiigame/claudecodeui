@@ -5,3 +5,4 @@ export {
   worktreesRoutes,
   type WorktreesModuleOptions,
 } from './worktrees.module.js';
+export { createWorktreesRouter } from './worktrees.routes.js';

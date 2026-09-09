@@ -62,7 +62,9 @@ export function parseShellMessage(payload: string): ShellIncomingMessage | null 
 }
 
 export function sendSocketMessage(ws: WebSocket | null, message: ShellOutgoingMessage): void {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  // `WebSocket` is not guaranteed to exist in non-browser test/SSR runtimes;
+  // the protocol constant is stable and the socket already exposes the state.
+  if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify(message));
   }
 }

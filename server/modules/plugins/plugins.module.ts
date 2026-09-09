@@ -7,7 +7,7 @@ import mime from 'mime-types';
 // Import the pure startup auth policy directly instead of the Auth barrel: the
 // barrel also composes bcrypt/database-backed routes, which would introduce a
 // needless initialization cycle for standalone plugin embedders.
-import { AUTH_DEPLOYMENT_MODE } from '@/modules/auth/auth-policy.js';
+import { AUTH_DEPLOYMENT_MODE } from '@/modules/auth/index.js';
 import { collaborationService } from '@/modules/collaboration/index.js';
 import { projectsDb } from '@/modules/database/index.js';
 import type { DeploymentPolicy } from '@/modules/deployment-policy/index.js';

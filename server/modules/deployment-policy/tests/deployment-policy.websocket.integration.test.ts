@@ -3,8 +3,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import { WebSocket } from 'ws';
 
-import { handleChatConnection } from '@/modules/websocket/services/chat-websocket.service.js';
-import { handleShellConnection } from '@/modules/websocket/services/shell-websocket.service.js';
+import { handleChatConnection, handleShellConnection } from '@/modules/websocket/index.js';
 import type { AuthenticatedWebSocketRequest } from '@/shared/types.js';
 
 import { parseDeploymentPolicy } from '../index.js';

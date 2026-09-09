@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -160,7 +160,7 @@ test('read capability environment aliases can explicitly disable optional reads'
   assert.equal(hasDeploymentCapability(policy, DEPLOYMENT_CAPABILITIES.BROWSER_USE), true);
 });
 
-test('middleware parses actor, session, and path context before checking capabilities', () => {
+test('middleware parses actor, session, and path context before checking capabilities', async () => {
   const guard = createDeploymentPolicyMiddleware({
     policy: { profile: 'product-qa-readonly', capabilities: { [DEPLOYMENT_CAPABILITIES.SESSION_READ]: true } },
     capability: DEPLOYMENT_CAPABILITIES.SESSION_READ,
@@ -169,7 +169,7 @@ test('middleware parses actor, session, and path context before checking capabil
   const request = {
     method: 'GET',
     params: { sessionId: 'session-1' },
-    query: { path: '/tmp/example' },
+    query: { path: process.cwd() },
     body: {},
     user: {
       id: 7,
@@ -178,17 +178,20 @@ test('middleware parses actor, session, and path context before checking capabil
   } as never;
   let nextError: unknown = 'not-called';
 
-  guard(request, {} as never, (error?: unknown) => {
-    nextError = error;
+  await new Promise<void>((resolve) => {
+    guard(request, {} as never, (error?: unknown) => {
+      nextError = error;
+      resolve();
+    });
   });
 
   assert.equal(nextError, undefined);
-  assert.deepEqual(readDeploymentPolicyRequestContext(request), {
+  assert.deepEqual((request as any).deploymentPolicyContext, {
     actor: { userId: 7, actorId: 11, provider: 'dingtalk' },
     sessionId: 'session-1',
     projectPath: null,
-    targetPath: '/tmp/example',
-    canonicalTargetPath: null,
+    targetPath: process.cwd(),
+    canonicalTargetPath: process.cwd(),
   });
 });
 
@@ -241,7 +244,7 @@ test('canonical path helper resolves symlinks and denies paths outside root', as
   await symlink(insideDirectory, link, 'dir');
 
   const canonical = await resolveCanonicalPath(path.join(link, 'file.txt'), { beneath: root });
-  assert.equal(canonical, path.join(insideDirectory, 'file.txt'));
+  assert.equal(canonical, await realpath(path.join(insideDirectory, 'file.txt')));
 
   await assert.rejects(
     resolveCanonicalPath(path.join(outsideDirectory, 'file.txt'), { beneath: insideDirectory }),

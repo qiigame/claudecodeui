@@ -18,10 +18,10 @@ import {
   parseDeploymentPolicy,
   type DeploymentPolicy,
 } from '@/modules/deployment-policy/index.js';
-import { ClaudeMcpProvider } from '@/modules/providers/list/claude/index.js';
+import { ClaudeMcpProvider } from '@/modules/providers/index.js';
 import { dataverseRuntimeBridgeService } from '@/modules/runtime-bridge/index.js';
 import type { AuthenticatedWebSocketRequest } from '@/shared/types.js';
-import { hasVerifiedDingTalkActor } from '@/modules/websocket/services/websocket-auth.service.js';
+import { hasVerifiedDingTalkActor } from '@/modules/websocket/index.js';
 import {
   filterProviderEnvironmentForReadOnly,
   parseIncomingJsonObject,

@@ -5,3 +5,4 @@ export {
   createFileTreeModule,
   fileTreeRoutes,
 } from '@/modules/file-tree/file-tree.module.js';
+export { createFileTreeRouter } from './file-tree.routes.js';

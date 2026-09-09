@@ -574,6 +574,9 @@ export async function startCloneProject(
     });
   }
 
+  // Validate the derived child name before URL normalization; `/..` must not
+  // become the host root and hide an unsafe clone target.
+  resolveCloneTargetPath(absolutePath, normalizedGithubUrl);
   const cloneUrl = normalizeCredentialFreeCloneUrl(normalizedGithubUrl);
   if (isCancelled()) {
     return cancelledCloneOperation();

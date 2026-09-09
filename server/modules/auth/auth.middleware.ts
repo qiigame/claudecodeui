@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import {
   collaborationService,
 } from '@/modules/collaboration/index.js';
-import { userDb, appConfigDb } from '../database/index.js';
+import { userDb, appConfigDb } from '@/modules/database/index.js';
 
 import { AUTH_DEPLOYMENT_MODE } from './auth-policy.js';
 import {

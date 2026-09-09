@@ -256,7 +256,11 @@ test('command listing rejects an unregistered absolute project path', async () =
       body: JSON.stringify({ projectPath: '/etc' }),
     });
     assert.equal(response.status, 403);
-    assert.deepEqual(await response.json(), { code: 'PROJECT_PATH_NOT_REGISTERED' });
+    assert.deepEqual(await response.json(), {
+      code: 'PROJECT_PATH_NOT_REGISTERED',
+      error: 'Project path is not registered for this deployment.',
+      message: 'Project path is not registered for this deployment.',
+    });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

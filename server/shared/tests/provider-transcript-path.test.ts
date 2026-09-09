@@ -108,6 +108,36 @@ test('authenticated transcript descriptor remains bound when its pathname is rep
   }
 });
 
+test('a configured root alias accepts indexed canonical paths but rejects child symlinks', async () => {
+  const root = await makeRoot('provider-transcript-root-alias-');
+  try {
+    const canonicalRoot = await realpath(root);
+    const storageRoot = path.join(canonicalRoot, 'storage');
+    const configuredRoot = path.join(canonicalRoot, 'configured-root');
+    await mkdir(storageRoot);
+    await symlink(storageRoot, configuredRoot);
+    for (const provider of ['claude', 'codex'] as const) {
+      const cwd = canonicalRoot;
+      const directory = provider === 'claude' ? buildClaudeProjectDirectoryName(cwd, {})! : '2026';
+      const parent = path.join(storageRoot, directory);
+      await mkdir(parent, { recursive: true });
+      const transcriptPath = path.join(parent, `${provider}-id.jsonl`);
+      const record = provider === 'claude'
+        ? { sessionId: `${provider}-id`, cwd }
+        : { type: 'session_meta', payload: { id: `${provider}-id`, cwd } };
+      await writeFile(transcriptPath, `${JSON.stringify(record)}\n`);
+      const input = { provider, rootPath: configuredRoot, providerSessionId: `${provider}-id`, expectedProjectPath: cwd };
+      assert.equal(await validateProviderTranscriptPath({ ...input, candidatePath: transcriptPath }), transcriptPath);
+      assert.equal(await validateProviderTranscriptPath({ ...input, candidatePath: path.join(configuredRoot, directory, `${provider}-id.jsonl`) }), transcriptPath);
+      const childAlias = path.join(storageRoot, `${provider}-alias`);
+      await symlink(parent, childAlias);
+      assert.equal(await validateProviderTranscriptPath({ ...input, candidatePath: path.join(childAlias, `${provider}-id.jsonl`) }), null);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('provider transcript validator rejects escaped, symlinked, and non-file candidates', async () => {
   const root = await makeRoot('provider-transcript-boundary-');
   const outside = await makeRoot('provider-transcript-outside-');
@@ -295,7 +325,7 @@ test('provider transcript validator binds the opening cwd to the effective sessi
         providerSessionId: 'isolated-claude',
         expectedProjectPath: sourceCwd,
       }),
-      claudeFile,
+      await realpath(claudeFile),
     );
     assert.equal(
       await validateProviderTranscriptPath({
@@ -305,7 +335,7 @@ test('provider transcript validator binds the opening cwd to the effective sessi
         providerSessionId: 'isolated-codex',
         expectedProjectPath: sourceCwd,
       }),
-      codexFile,
+      await realpath(codexFile),
     );
   } finally {
     await rm(root, { recursive: true, force: true });

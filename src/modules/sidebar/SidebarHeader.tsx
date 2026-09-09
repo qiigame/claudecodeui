@@ -6,8 +6,7 @@ import { CLOUDCLI_WORDMARK_FONT_FAMILY } from '@/shared/constants';
 import { IS_PLATFORM,cn } from '@/shared/utils';
 import type { SidebarSearchMode } from '@/shared/types';
 import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
-import { useAuth } from '@/modules/auth';
-import { isManagedIdentityRestricted } from '@/modules/auth/identityAccess';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
 
 const MOD_KEY =
   typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl';

@@ -151,7 +151,7 @@ test('Git fetch has an independent capability while pull still requires Git writ
       if (args.includes('--is-inside-work-tree')) child.stdout.write('true\n');
       if (args.includes('--show-toplevel')) child.stdout.write('/workspace/repo\n');
       if (args[0] === 'symbolic-ref') child.stdout.write('main\n');
-      if (args[0] === 'rev-parse' && args.includes('@{upstream}')) child.stdout.write('origin/main\n');
+      if (args[0] === 'rev-parse' && args.some((arg) => arg.endsWith('@{upstream}'))) child.stdout.write('origin/main\n');
       if (args[0] === 'fetch') child.stdout.write('Fetch completed\n');
       child.stdout.end();
       child.stderr.end();

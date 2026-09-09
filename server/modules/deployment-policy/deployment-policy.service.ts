@@ -518,7 +518,8 @@ export function readDeploymentPolicyRequestContext(request: Request): Deployment
   return {
     actor: actor && typeof actor === 'object'
       ? {
-        userId: readIdValue(actor, ['userId', 'id']),
+        userId: readIdValue(actor, ['userId', 'id'])
+          ?? readIdValue(user, ['userId', 'id']),
         actorId: readIdValue(actor, ['actorId', 'id']),
         provider: readStringValue(actor, ['provider', 'providerName']),
       }

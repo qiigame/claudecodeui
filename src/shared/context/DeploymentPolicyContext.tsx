@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 
 // Import the auth context directly to avoid a barrel cycle: the auth barrel
 // exports ProtectedRoute, which itself consumes this deployment policy.
-import { useAuth } from '@/modules/auth/context/AuthContext';
+import { useAuth } from '@/modules/auth';
 import { api } from '@/shared/api';
 
 /** Names accepted by the client when checking a server deployment capability. */

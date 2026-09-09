@@ -8,7 +8,7 @@ import type { Project, ProjectSession } from '@/shared/types';
 import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
 
-import { isProductQaReadOnlyPlugin } from './pluginAccess';
+import { isProductQaReadOnlyPlugin } from '@/modules/plugins/pluginAccess';
 
 type PluginTabContentProps = {
   pluginName: string;

@@ -13,7 +13,7 @@ import {
 // `developer` profile may intentionally run behind DingTalk SSO; in that
 // hybrid mode the profile alone must not make this legacy API-key execution
 // endpoint trust an arbitrary local account.
-import { AUTH_DEPLOYMENT_MODE } from '@/modules/auth/auth-policy.js';
+import { AUTH_DEPLOYMENT_MODE } from '@/modules/auth/index.js';
 import type { ProviderRunFunction } from '@/shared/types.js';
 import { AppError, normalizeProjectPath } from '@/shared/utils.js';
 
@@ -212,7 +212,8 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         },
       }));
     }
-    req.deploymentPolicy = policy;
+    // Do not turn our legacy fallback into an explicit request policy: auth
+    // distinguishes a composition-owned snapshot from an omitted one below.
     return next();
   };
 

@@ -72,6 +72,7 @@
           "server/shared/claude-cli-path.ts",
           "server/shared/image-attachments.ts",
           "server/shared/message-unification.ts"
+          ,"server/shared/bearer-token.ts"
         ],
         "mode": "file"
       },

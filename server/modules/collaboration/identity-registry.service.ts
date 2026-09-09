@@ -548,7 +548,12 @@ function writeAutomaticRuntimeBinding(input: {
     try {
       fs.unlinkSync(temporaryPath);
     } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+      // Cleanup failure must not replace the stable enrollment error. The
+      // temporary file remains account-private (0600) and is retried/cleaned
+      // by the next enrollment attempt.
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
+        console.warn('Unable to remove temporary identity runtime map file.');
+      }
     }
   }
 }

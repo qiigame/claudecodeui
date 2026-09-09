@@ -491,7 +491,14 @@ export async function preflightProviderTranscriptPath(
   try {
     const lexicalRoot = path.resolve(input.rootPath);
     const lexicalCandidate = path.resolve(input.candidatePath);
-    if (!isCanonicalPathInsideRoot(lexicalRoot, lexicalCandidate)) {
+    const canonicalRoot = path.resolve(await realpath(lexicalRoot));
+    // Synchronizers persist canonical paths. A configured root may itself be
+    // a symlink (including macOS /var -> /private/var), so accept either root
+    // spelling without allowing symlinks in provider-owned child directories.
+    const candidateRoot = isCanonicalPathInsideRoot(lexicalRoot, lexicalCandidate)
+      ? lexicalRoot
+      : canonicalRoot;
+    if (!isCanonicalPathInsideRoot(candidateRoot, lexicalCandidate)) {
       return null;
     }
 
@@ -507,10 +514,9 @@ export async function preflightProviderTranscriptPath(
       return null;
     }
 
-    const canonicalRoot = path.resolve(await realpath(lexicalRoot));
     // Do this before reading the candidate.  In particular, a parent symlink
     // must not get a chance to redirect the first JSONL read outside root.
-    if (await hasSymlinkedPathComponentBelowRoot(lexicalRoot, lexicalCandidate)) {
+    if (await hasSymlinkedPathComponentBelowRoot(candidateRoot, lexicalCandidate)) {
       return null;
     }
 

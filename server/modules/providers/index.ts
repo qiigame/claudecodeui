@@ -18,6 +18,9 @@ export { sessionsService } from './services/sessions.service.js';
 export { initializeSessionsWatcher } from './services/sessions-watcher.service.js';
 export { closeSessionsWatcher } from './services/sessions-watcher.service.js';
 
+// ClaudeMcpProvider is the public adapter used by the WebSocket shell.
+export { ClaudeMcpProvider } from './list/claude/index.js';
+
 // createProviderRouter: used by the server composition root to inject the
 // immutable deployment policy into provider/session HTTP boundaries.
 export { createProviderRouter } from './provider.routes.js';

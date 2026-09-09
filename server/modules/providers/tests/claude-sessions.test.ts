@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -37,7 +37,7 @@ const AGENT_TOOL_USE_ID = 'toolu_agent_1';
 // canonical-root/metadata validator; this explicit seam keeps the behavior
 // tests focused on message normalization and branch handling.
 const createFixtureProvider = (): ClaudeSessionsProvider => new ClaudeSessionsProvider({
-  validateTranscriptPath: async ({ candidatePath }) => candidatePath,
+  validateTranscriptPath: async ({ candidatePath }) => realpath(candidatePath),
 });
 
 /**

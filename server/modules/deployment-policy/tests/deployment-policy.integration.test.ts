@@ -13,8 +13,8 @@ import express, {
   type Response,
 } from 'express';
 
-import { createFileTreeRouter } from '@/modules/file-tree/file-tree.routes.js';
-import { createGitRouter } from '@/modules/git/git.routes.js';
+import { createFileTreeRouter } from '@/modules/file-tree/index.js';
+import { createGitRouter } from '@/modules/git/index.js';
 import type { FileTreeServices } from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
 

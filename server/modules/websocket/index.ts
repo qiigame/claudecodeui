@@ -14,6 +14,8 @@ export {
   hasVerifiedDingTalkActor,
 } from './services/websocket-auth.service.js';
 export { chatRunRegistry } from './services/chat-run-registry.service.js';
+export { handleChatConnection } from './services/chat-websocket.service.js';
+export { handleShellConnection } from './services/shell-websocket.service.js';
 // Consumed by the providers module's sessions watcher, which announces the
 // sessions it (re)indexed from disk through the same builder the chat gateway
 // uses, so both paths put the identical delta on the wire.
