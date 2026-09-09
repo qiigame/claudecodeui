@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -82,7 +82,7 @@ async function withIndexedSession(
   rows: TranscriptRow[],
   runTest: (context: { sessionId: string; workspacePath: string; homeDir: string }) => Promise<void>,
 ): Promise<void> {
-  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-edit-'));
+  const tempRoot = await realpath(await mkdtemp(path.join(os.tmpdir(), 'codex-edit-')));
   const workspacePath = path.join(tempRoot, 'workspace');
   await mkdir(workspacePath, { recursive: true });
   const restoreHomeDir = patchHomeDir(tempRoot);

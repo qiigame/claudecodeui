@@ -144,6 +144,9 @@ test('provider environment filter maps only absolute deployment-owned isolated p
     USERPROFILE: '/srv/cloudcli/state/provider-ro',
     CODEX_HOME: '/srv/cloudcli/state/provider-ro/codex',
     CLAUDE_CONFIG_DIR: '/srv/cloudcli/state/provider-ro/claude',
+    TMPDIR: '/srv/cloudcli/state/provider-ro/tmp',
+    TMP: '/srv/cloudcli/state/provider-ro/tmp',
+    TEMP: '/srv/cloudcli/state/provider-ro/tmp',
   });
 
   const relative = filterProviderEnvironmentForReadOnly({
@@ -179,6 +182,7 @@ test('provider runtime isolation fails closed without an absolute dedicated home
 
   const isolated = filterProviderEnvironmentForReadOnly({
     PATH: '/usr/bin',
+    CLOUDCLI_READONLY_PATH: '/usr/bin',
     CLOUDCLI_READONLY_HOME: '/srv/cloudcli/state/provider-ro',
     OPENAI_API_KEY: 'model-key',
   }, {
@@ -191,6 +195,9 @@ test('provider runtime isolation fails closed without an absolute dedicated home
     USERPROFILE: '/srv/cloudcli/state/provider-ro',
     CODEX_HOME: '/srv/cloudcli/state/provider-ro/.codex',
     CLAUDE_CONFIG_DIR: '/srv/cloudcli/state/provider-ro/.claude',
+    TMPDIR: '/srv/cloudcli/state/provider-ro/tmp',
+    TMP: '/srv/cloudcli/state/provider-ro/tmp',
+    TEMP: '/srv/cloudcli/state/provider-ro/tmp',
   });
 });
 

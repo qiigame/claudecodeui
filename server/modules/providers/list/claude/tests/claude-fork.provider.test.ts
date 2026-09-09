@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -79,7 +79,7 @@ async function createConfigDirectory(
   projectPaths: string[],
   sourceSessionIds: string[] = [SOURCE_SESSION_ID],
 ): Promise<string> {
-  const configDirectory = await mkdtemp(path.join(os.tmpdir(), 'claude-fork-'));
+  const configDirectory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'claude-fork-')));
   testContext.after(() => rm(configDirectory, { recursive: true, force: true }));
   await mkdir(path.join(configDirectory, 'projects'), { recursive: true });
   await Promise.all(projectPaths.flatMap((projectPath) => {

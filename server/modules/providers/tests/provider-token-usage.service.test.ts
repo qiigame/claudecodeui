@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -77,12 +77,12 @@ async function createClaudeTranscriptFixture(
 const openFixtureTranscriptForTest = async (
   input: ProviderTranscriptPathValidationInput,
 ): Promise<AuthenticatedProviderTranscript | null> => {
-  const opened = await openProviderTranscriptReadHandle(input.candidatePath);
+  const canonicalPath = await realpath(input.candidatePath);
+  const opened = await openProviderTranscriptReadHandle(canonicalPath);
   if (!opened) {
     return null;
   }
 
-  const canonicalPath = path.resolve(input.candidatePath);
   return {
     canonicalPath,
     canonicalRoot: path.dirname(canonicalPath),
@@ -181,6 +181,7 @@ test('Claude token usage binds an isolated session to runtime_path instead of a 
     const service = createProviderTokenUsageService({
       getSessionById: () => createSessionRow({
         jsonl_path: sourceTranscript,
+        provider_session_id: providerSessionId,
         project_path: sourcePath,
         runtime_path: runtimePath,
       }),
@@ -233,6 +234,7 @@ test('production Claude token usage reads from the authenticated descriptor, not
     const service = createProviderTokenUsageService({
       getSessionById: () => createSessionRow({
         jsonl_path: transcriptPath,
+        provider_session_id: providerSessionId,
         project_path: projectPath,
       }),
       getClaudeConfigDirectory: () => configDirectory,
@@ -363,6 +365,7 @@ test('Codex token usage binds an isolated session to runtime_path', async () => 
       getSessionById: () => createSessionRow({
         provider: 'codex',
         jsonl_path: sourceTranscript,
+        provider_session_id: providerSessionId,
         project_path: sourcePath,
         runtime_path: runtimePath,
       }),
@@ -423,6 +426,7 @@ test('production Codex token usage reads from the authenticated descriptor, not 
       getSessionById: () => createSessionRow({
         provider: 'codex',
         jsonl_path: transcriptPath,
+        provider_session_id: providerSessionId,
         project_path: projectPath,
       }),
       getCodexHomeDirectory: () => codexHome,

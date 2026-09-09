@@ -9,7 +9,7 @@ import type { ProviderRuntimeContext } from '@/shared/index.js';
 
 for (const resumed of [false, true]) {
   for (const permissionMode of [undefined, 'default', 'unknown', 'acceptEdits', 'bypassPermissions']) {
-    test(`Codex ${resumed ? 'resumes' : 'starts'} with supported permissions (${permissionMode ?? 'omitted'})`, async (t) => {
+    test(`Codex ${resumed ? 'resumes' : 'starts'} enforces permissions (${permissionMode ?? 'omitted'})`, async (t) => {
       let capturedOptions: ThreadOptions | undefined;
       let capturedPrompt: unknown;
       const messages: unknown[] = [];
@@ -40,17 +40,27 @@ for (const resumed of [false, true]) {
         isProviderInstalled: async () => true,
       };
 
-      await codexRuntime.run('hey there', {
+      const run = () => codexRuntime.run('hey there', {
         sessionId: resumed ? 'app-session' : undefined,
         permissionMode,
         cwd: process.cwd(),
       }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, context);
 
+      if (permissionMode === 'unknown') {
+        await assert.rejects(run, /Unsupported Codex permission mode/);
+        assert.equal(start.mock.callCount(), 0);
+        assert.equal(resume.mock.callCount(), 0);
+        return;
+      }
+      await run();
+
       assert.equal(start.mock.callCount(), resumed ? 0 : 1);
       assert.equal(resume.mock.callCount(), resumed ? 1 : 0);
       assert.equal(capturedPrompt, 'hey there');
       assert.equal(capturedOptions?.sandboxMode, permissionMode === 'bypassPermissions' ? 'danger-full-access' : 'workspace-write');
-      assert.equal(capturedOptions?.approvalPolicy, permissionMode === 'acceptEdits' || permissionMode === 'bypassPermissions' ? 'never' : 'on-request');
+      // The SDK exec transport is non-interactive; sandboxing, not an
+      // unavailable approval prompt, enforces its filesystem boundary.
+      assert.equal(capturedOptions?.approvalPolicy, 'never');
       assert.ok(messages.some((message: any) => message.kind === 'complete' && message.exitCode === 0));
       assert.ok(!messages.some((message: any) => message.kind === 'error'));
     });

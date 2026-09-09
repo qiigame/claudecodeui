@@ -1,8 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 
-// Import the auth context directly to avoid a barrel cycle: the auth barrel
-// exports ProtectedRoute, which itself consumes this deployment policy.
+// The auth hook is consumed at render time through the module's public API.
 import { useAuth } from '@/modules/auth';
 import { api } from '@/shared/api';
 

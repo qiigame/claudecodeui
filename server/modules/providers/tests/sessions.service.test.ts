@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { access, appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -8,6 +8,7 @@ import { closeConnection, initializeDatabase, projectsDb, sessionsDb } from '@/m
 import { parseDeploymentPolicy } from '@/modules/deployment-policy/index.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import type { SessionWorkspaceService } from '@/shared/types.js';
+import { buildClaudeTranscriptFilePath } from '@/shared/utils.js';
 
 async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
@@ -317,6 +318,7 @@ function claudeTextRow(
   role: 'user' | 'assistant',
   text: string,
   ordinal: number,
+  cwd: string,
 ): Record<string, unknown> {
   return {
     type: role,
@@ -324,28 +326,32 @@ function claudeTextRow(
     parentUuid: ordinal === 0 ? null : `row-${ordinal - 1}`,
     timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, ordinal)).toISOString(),
     sessionId,
+    cwd,
     message: { role, content: [{ type: 'text', text }] },
   };
 }
 
 test('history pages are sliced from the cached full transcript and see appended rows', { concurrency: false }, async () => {
-  const transcriptDirectory = await mkdtemp(path.join(os.tmpdir(), 'sessions-service-history-'));
+  const transcriptDirectory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'sessions-service-history-')));
+  const previousClaudeConfig = process.env.COMIC_CLAUDE_CONFIG_DIR;
+  process.env.COMIC_CLAUDE_CONFIG_DIR = path.join(transcriptDirectory, '.claude');
   const sessionId = 'claude-history-cache-session';
-  const transcriptPath = path.join(transcriptDirectory, `${sessionId}.jsonl`);
+  const transcriptPath = buildClaudeTranscriptFilePath(process.env.COMIC_CLAUDE_CONFIG_DIR, transcriptDirectory, sessionId)!;
 
   try {
     await withIsolatedDatabase(async () => {
       const rows = [
-        claudeTextRow(sessionId, 'user', 'one', 0),
-        claudeTextRow(sessionId, 'assistant', 'reply one', 1),
-        claudeTextRow(sessionId, 'user', 'two', 2),
-        claudeTextRow(sessionId, 'assistant', 'reply two', 3),
+        claudeTextRow(sessionId, 'user', 'one', 0, transcriptDirectory),
+        claudeTextRow(sessionId, 'assistant', 'reply one', 1, transcriptDirectory),
+        claudeTextRow(sessionId, 'user', 'two', 2, transcriptDirectory),
+        claudeTextRow(sessionId, 'assistant', 'reply two', 3, transcriptDirectory),
       ];
+      await mkdir(path.dirname(transcriptPath), { recursive: true });
       await writeFile(transcriptPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
       sessionsDb.createSession(
         sessionId,
         'claude',
-        '/tmp/history-cache-project',
+        transcriptDirectory,
         'History cache conversation',
         '2026-01-01T00:00:00.000Z',
         '2026-01-01T00:00:10.000Z',
@@ -360,7 +366,7 @@ test('history pages are sliced from the cached full transcript and see appended 
       // A row appended after the page was cached must appear on the next read.
       await appendFile(
         transcriptPath,
-        `${JSON.stringify(claudeTextRow(sessionId, 'user', 'three', 4))}\n`,
+        `${JSON.stringify(claudeTextRow(sessionId, 'user', 'three', 4, transcriptDirectory))}\n`,
         'utf8',
       );
       const refreshed = await sessionsService.fetchHistory(sessionId, { limit: 2, offset: 0 });
@@ -373,22 +379,27 @@ test('history pages are sliced from the cached full transcript and see appended 
       assert.equal(older.hasMore, true);
     });
   } finally {
+    if (previousClaudeConfig === undefined) delete process.env.COMIC_CLAUDE_CONFIG_DIR;
+    else process.env.COMIC_CLAUDE_CONFIG_DIR = previousClaudeConfig;
     await rm(transcriptDirectory, { recursive: true, force: true });
   }
 });
 
 test('history resolves a provider-native alias to the canonical app session', { concurrency: false }, async () => {
-  const transcriptDirectory = await mkdtemp(path.join(os.tmpdir(), 'sessions-service-native-history-'));
+  const transcriptDirectory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'sessions-service-native-history-')));
+  const previousClaudeConfig = process.env.COMIC_CLAUDE_CONFIG_DIR;
+  process.env.COMIC_CLAUDE_CONFIG_DIR = path.join(transcriptDirectory, '.claude');
   const appSessionId = 'app-native-history-session';
   const providerSessionId = 'claude-native-history-session';
-  const transcriptPath = path.join(transcriptDirectory, `${providerSessionId}.jsonl`);
+  const transcriptPath = buildClaudeTranscriptFilePath(process.env.COMIC_CLAUDE_CONFIG_DIR, transcriptDirectory, providerSessionId)!;
 
   try {
     await withIsolatedDatabase(async () => {
       const rows = [
-        claudeTextRow(providerSessionId, 'user', 'native prompt', 0),
-        claudeTextRow(providerSessionId, 'assistant', 'native response', 1),
+        claudeTextRow(providerSessionId, 'user', 'native prompt', 0, transcriptDirectory),
+        claudeTextRow(providerSessionId, 'assistant', 'native response', 1, transcriptDirectory),
       ];
+      await mkdir(path.dirname(transcriptPath), { recursive: true });
       await writeFile(transcriptPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
 
       // Reproduce an app-created session after the provider watcher has
@@ -397,7 +408,7 @@ test('history resolves a provider-native alias to the canonical app session', { 
       sessionsDb.createSession(
         providerSessionId,
         'claude',
-        '/tmp/native-history-project',
+        transcriptDirectory,
         'Native history conversation',
         '2026-01-02T00:00:00.000Z',
         '2026-01-02T00:00:10.000Z',
@@ -406,7 +417,7 @@ test('history resolves a provider-native alias to the canonical app session', { 
       sessionsDb.createAppSession(
         appSessionId,
         'claude',
-        '/tmp/native-history-project',
+        transcriptDirectory,
         'App history conversation',
       );
       sessionsDb.assignProviderSessionId(appSessionId, providerSessionId);
@@ -421,6 +432,8 @@ test('history resolves a provider-native alias to the canonical app session', { 
       assert.ok(history.messages.every((message) => message.sessionId === appSessionId));
     });
   } finally {
+    if (previousClaudeConfig === undefined) delete process.env.COMIC_CLAUDE_CONFIG_DIR;
+    else process.env.COMIC_CLAUDE_CONFIG_DIR = previousClaudeConfig;
     await rm(transcriptDirectory, { recursive: true, force: true });
   }
 });

@@ -206,8 +206,12 @@ test('a repointed session does not reuse or overwrite a pending load from its ol
     const firstGate = new Promise<void>((resolve) => { firstRelease = resolve; });
     const secondGate = new Promise<void>((resolve) => { secondRelease = resolve; });
     const loads: string[] = [];
+    const started = new Map<string, () => void>();
+    const firstStarted = new Promise<void>((resolve) => { started.set('first', resolve); });
+    const secondStarted = new Promise<void>((resolve) => { started.set('second', resolve); });
     const loadFor = (pathMarker: string, gate: Promise<void>) => async () => {
       loads.push(pathMarker);
+      started.get(pathMarker)?.();
       await gate;
       return historyResult(pathMarker);
     };
@@ -218,7 +222,7 @@ test('a repointed session does not reuse or overwrite a pending load from its ol
       loadFull: loadFor('first', firstGate),
     });
     // Let the first request reach its loader before switching the indexed path.
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await firstStarted;
     const secondRequest = cache.getFullHistory({
       sessionId: 'repointed-session',
       resolveCanonicalTranscriptPath: async () => secondPath,
@@ -226,7 +230,7 @@ test('a repointed session does not reuse or overwrite a pending load from its ol
     });
 
     // Both paths must have independent in-flight work.
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await secondStarted;
     assert.deepEqual(loads, ['first', 'second']);
     secondRelease!();
     const second = await secondRequest;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -10,6 +10,7 @@ import { sessionsService } from '@/modules/providers/index.js';
 import { handleChatConnection } from '@/modules/websocket/services/chat-websocket.service.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
 import { connectedClients } from '@/modules/websocket/services/websocket-state.service.js';
+import { buildClaudeTranscriptFilePath } from '@/shared/utils.js';
 
 const SESSION_ID = 'edit-session';
 
@@ -87,9 +88,21 @@ async function withGateway(
   } = {},
 ): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
-  const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'chat-edit-send-'));
-  const transcriptPath = path.join(tempDirectory, `${SESSION_ID}.jsonl`);
-  await writeFile(transcriptPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
+  const previousClaudeConfig = process.env.COMIC_CLAUDE_CONFIG_DIR;
+  const previousCodexHome = process.env.COMIC_CODEX_HOME;
+  const tempDirectory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'chat-edit-send-')));
+  process.env.COMIC_CLAUDE_CONFIG_DIR = path.join(tempDirectory, '.claude');
+  process.env.COMIC_CODEX_HOME = path.join(tempDirectory, '.codex');
+  const transcriptPath = provider === 'claude'
+    ? buildClaudeTranscriptFilePath(process.env.COMIC_CLAUDE_CONFIG_DIR, tempDirectory, SESSION_ID)!
+    : path.join(process.env.COMIC_CODEX_HOME, 'sessions', `${SESSION_ID}.jsonl`);
+  await mkdir(path.dirname(transcriptPath), { recursive: true });
+  // Exercise the production transcript boundary, including its native opening
+  // envelope, configured provider root, and effective working directory.
+  const authenticatedRows = provider === 'codex'
+    ? [{ type: 'session_meta', payload: { id: SESSION_ID, cwd: tempDirectory } }, ...rows]
+    : rows.map((row) => ({ ...(row as Record<string, unknown>), cwd: tempDirectory }));
+  await writeFile(transcriptPath, `${authenticatedRows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8');
 
   closeConnection();
   process.env.DATABASE_PATH = path.join(tempDirectory, 'auth.db');
@@ -132,6 +145,10 @@ async function withGateway(
     holdRun = null;
     connectedClients.clear();
     chatRunRegistry.clearAll();
+    if (previousClaudeConfig === undefined) delete process.env.COMIC_CLAUDE_CONFIG_DIR;
+    else process.env.COMIC_CLAUDE_CONFIG_DIR = previousClaudeConfig;
+    if (previousCodexHome === undefined) delete process.env.COMIC_CODEX_HOME;
+    else process.env.COMIC_CODEX_HOME = previousCodexHome;
     closeConnection();
     if (previousDatabasePath === undefined) {
       delete process.env.DATABASE_PATH;

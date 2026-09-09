@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -13,7 +13,7 @@ test('Claude history only reads an indexed transcript below the configured proje
 }, async () => {
   const previousDatabasePath = process.env.DATABASE_PATH;
   const previousClaudeConfigDirectory = process.env.COMIC_CLAUDE_CONFIG_DIR;
-  const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'claude-transcript-boundary-'));
+  const tempDirectory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'claude-transcript-boundary-')));
   const databasePath = path.join(tempDirectory, 'cloudcli.db');
   const configDirectory = path.join(tempDirectory, 'claude-config');
   const projectPath = path.join(tempDirectory, 'workspace');

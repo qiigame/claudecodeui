@@ -49,8 +49,8 @@ test('a deployment without agent.use never loads scheduled messages', async () =
   view.rerender({ canSchedule: true });
   await waitFor(() => {
     assert.equal(listScheduledMessages.mock.calls.length, 1);
+    assert.equal(view.result.current.scheduledMessages.length, 1);
   });
-  assert.equal(view.result.current.scheduledMessages.length, 1);
 
   view.rerender({ canSchedule: false });
   await waitFor(() => {

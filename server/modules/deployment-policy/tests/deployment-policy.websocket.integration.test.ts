@@ -96,7 +96,7 @@ test('shell fails closed when the managed actor revalidator throws', () => {
   assert.deepEqual(JSON.parse(socket.frames[0]!), {
     type: 'error',
     code: 'IDENTITY_ENROLLMENT_REQUIRED',
-    message: 'A verified DingTalk project identity is required before starting a terminal.',
+    message: 'A verified DingTalk project identity is required before using the terminal.',
   });
   assert.deepEqual(socket.closeCalls, [{
     code: 1008,

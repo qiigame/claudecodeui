@@ -18,12 +18,9 @@ const deploymentState = vi.hoisted(() => ({
   can: vi.fn(() => true),
 }));
 
-vi.mock('@/modules/auth', () => ({
+vi.mock('@/modules/auth', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/modules/auth')>(),
   useAuth: () => authState,
-  isManagedIdentityRestricted: (_authMode: string | null, user: typeof authState.user) =>
-    user?.actor?.identityStatus === 'pending'
-      || user?.actor?.identityStatus === 'ambiguous'
-      || user?.actor?.identityStatus === 'configured',
 }));
 
 vi.mock('@/shared/context/DeploymentPolicyContext', () => ({

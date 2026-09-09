@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -33,7 +33,7 @@ async function writeRollout(
 test('Codex synchronizer indexes only the configured CODEX_HOME tree', {
   concurrency: false,
 }, async () => {
-  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'cloudcli-codex-home-isolation-'));
+  const tempRoot = await realpath(await mkdtemp(path.join(os.tmpdir(), 'cloudcli-codex-home-isolation-')));
   const isolatedHome = path.join(tempRoot, 'candidate-codex');
   const unrelatedHome = path.join(tempRoot, 'host-codex');
   const workspacePath = path.join(tempRoot, 'workspace');
