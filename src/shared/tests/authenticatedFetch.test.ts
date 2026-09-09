@@ -2,18 +2,22 @@ import assert from 'node:assert/strict';
 
 import { afterEach, beforeEach, test, vi } from 'vitest';
 
-import { AUTH_SESSION_EXPIRED_EVENT, AUTH_TOKEN_REFRESHED_EVENT } from '@/shared/authToken';
+import {
+  AUTH_SESSION_EXPIRED_EVENT,
+  AUTH_TOKEN_REFRESHED_EVENT,
+  establishAuthSession,
+} from '@/shared/authToken';
 
 /**
  * The consumer side of the JWT lifecycle that authToken.ts owns.
  * authToken.test.ts covers the primitives; nothing covered the request helper
  * that calls them on every API call in the app.
  *
- * IS_PLATFORM is resolved at module scope from a build-time flag and decides
- * whether the app authenticates with a bearer token at all, so each test loads
- * a fresh copy of api.ts with the flag stubbed. Reading the ambient value would
- * make these tests agree with whatever .env the machine happens to have — this
- * workspace has VITE_IS_PLATFORM=true, CI does not.
+ * Hosting is a presentation concern; the server-authoritative auth mode owns
+ * whether a request is allowed. A hosted/product build must still send its
+ * DingTalk-issued bearer token, so these tests keep the historical env stubs to
+ * prove the request helper does not accidentally reintroduce an `IS_PLATFORM`
+ * authentication bypass.
  */
 
 const loadFetch = async (isPlatform: boolean) => {
@@ -70,14 +74,14 @@ test('a live token is sent as a bearer credential', async () => {
   assert.equal(sentHeaders().Authorization, `Bearer ${token}`);
 });
 
-test('platform builds send no bearer token, because the session is a cookie', async () => {
+test('platform builds still send a bearer token when one is present', async () => {
   const token = liveToken();
   localStorage.setItem('auth-token', token);
   respondWith();
 
   await (await loadFetch(true))('/api/projects');
 
-  assert.equal('Authorization' in sentHeaders(), false);
+  assert.equal(sentHeaders().Authorization, `Bearer ${token}`);
 });
 
 test('an expired token is never put on the wire', async () => {
@@ -178,4 +182,80 @@ test('an ordinary response leaves the stored token alone', async () => {
   await (await loadFetch(false))('/api/projects');
 
   assert.equal(localStorage.getItem('auth-token'), token);
+});
+
+test('a stale response cannot replace a token installed by another tab', async () => {
+  const requestToken = liveToken().replace('signature', 'request');
+  const nextAccountToken = liveToken().replace('signature', 'next-account');
+  const staleRotation = liveToken().replace('signature', 'stale-rotation');
+  localStorage.setItem('auth-token', requestToken);
+  let finishRequest!: () => void;
+  vi.stubGlobal('fetch', vi.fn((_url: string, init?: RequestInit) => {
+    lastInit = init;
+    return new Promise<Response>((resolve) => {
+      finishRequest = () => resolve(new Response('{}', {
+        status: 200,
+        headers: { 'X-Refreshed-Token': staleRotation },
+      }));
+    });
+  }));
+
+  const request = (await loadFetch(false))('/api/projects');
+  localStorage.setItem('auth-token', nextAccountToken);
+  finishRequest();
+  await request;
+
+  assert.equal(localStorage.getItem('auth-token'), nextAccountToken);
+});
+
+test('a stale auth error cannot log out the account selected after the request began', async () => {
+  const requestToken = liveToken().replace('signature', 'request');
+  const nextAccountToken = liveToken().replace('signature', 'next-account');
+  localStorage.setItem('auth-token', requestToken);
+  let finishRequest!: () => void;
+  let expiries = 0;
+  const onExpired = () => {
+    expiries += 1;
+  };
+  window.addEventListener(AUTH_SESSION_EXPIRED_EVENT, onExpired);
+  vi.stubGlobal('fetch', vi.fn((_url: string, init?: RequestInit) => {
+    lastInit = init;
+    return new Promise<Response>((resolve) => {
+      finishRequest = () => resolve(new Response('{}', {
+        status: 401,
+        headers: { 'X-Auth-Error': 'invalid' },
+      }));
+    });
+  }));
+
+  const request = (await loadFetch(false))('/api/projects');
+  localStorage.setItem('auth-token', nextAccountToken);
+  finishRequest();
+  await request;
+  window.removeEventListener(AUTH_SESSION_EXPIRED_EVENT, onExpired);
+
+  assert.equal(localStorage.getItem('auth-token'), nextAccountToken);
+  assert.equal(expiries, 0);
+});
+
+test('a stale response cannot affect a re-login that received the same JWT string', async () => {
+  const sameToken = liveToken();
+  establishAuthSession(sameToken);
+  let finishRequest!: () => void;
+  vi.stubGlobal('fetch', vi.fn((_url: string, init?: RequestInit) => {
+    lastInit = init;
+    return new Promise<Response>((resolve) => {
+      finishRequest = () => resolve(new Response('{}', {
+        status: 401,
+        headers: { 'X-Auth-Error': 'invalid' },
+      }));
+    });
+  }));
+
+  const request = (await loadFetch(false))('/api/projects');
+  establishAuthSession(sameToken);
+  finishRequest();
+  await request;
+
+  assert.equal(localStorage.getItem('auth-token'), sameToken);
 });

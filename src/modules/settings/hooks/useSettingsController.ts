@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { useTheme } from '@/shared/context/ThemeContext';
 import { api } from '@/shared/api';
-import { setNotificationSoundEnabled } from '@/shared/utils';
+import { setNotificationSoundEnabled, taskMasterUiEnabled } from '@/shared/utils';
 import {
   readCodeEditorSettings,
   writeCodeEditorSettings,
@@ -58,7 +58,7 @@ const KNOWN_MAIN_TABS: SettingsMainTab[] = ['agents', 'appearance', 'git', 'api'
 
 const normalizeMainTab = (tab: string): SettingsMainTab => {
   // Keep backwards compatibility with older callers that still pass "tools".
-  if (tab === 'tools') {
+  if (tab === 'tools' || (!taskMasterUiEnabled && tab === 'tasks')) {
     return 'agents';
   }
 
@@ -301,6 +301,19 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
   const isInitialLoadRef = useRef(true);
 
   useEffect(() => {
+    // The settings dialog is also mounted briefly while deployment policy is
+    // loading.  Do not arm a delayed writer in that state: a policy transition
+    // from developer to product/QA read-only must be able to cancel every
+    // pending settings write.  `isOpen` is passed as the effective, policy
+    // checked value by Settings.
+    if (!isOpen) {
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+      return;
+    }
+
     // Skip auto-save on initial load (settings are being loaded from the store)
     if (isInitialLoadRef.current) {
       isInitialLoadRef.current = false;
@@ -320,7 +333,7 @@ export function useSettingsController({ isOpen, initialTab }: UseSettingsControl
         window.clearTimeout(autoSaveTimerRef.current);
       }
     };
-  }, [saveSettings]);
+  }, [isOpen, saveSettings]);
 
   // Clear save status after 2 seconds
   useEffect(() => {

@@ -9,7 +9,9 @@ import express, {
   type Response,
 } from 'express';
 
+import { parseDeploymentPolicy } from '@/modules/deployment-policy/index.js';
 import { createWorktreesRouter } from '@/modules/worktrees/worktrees.routes.js';
+import type { WorktreesRouterOptions } from '@/modules/worktrees/worktrees.routes.js';
 import type {
   CreateWorktreeInput,
   WorktreeServices,
@@ -25,6 +27,7 @@ function createFakeServices(overrides: Partial<WorktreeServices> = {}): Worktree
     resolveProjectPath: () => {
       throw new Error('Unexpected project resolution');
     },
+    planSessionWorkspace: unused,
     list: unused,
     create: unused,
     createAndOpen: unused,
@@ -38,10 +41,11 @@ function createFakeServices(overrides: Partial<WorktreeServices> = {}): Worktree
 async function withWorktreesServer(
   services: WorktreeServices,
   run: (baseUrl: string) => Promise<void>,
+  options: WorktreesRouterOptions = {},
 ): Promise<void> {
   const app = express();
   app.use(express.json());
-  app.use('/api/worktrees', createWorktreesRouter(services));
+  app.use('/api/worktrees', createWorktreesRouter(services, options));
   app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (error instanceof AppError) {
       res.status(error.statusCode).json({ error: error.code });
@@ -63,6 +67,34 @@ async function withWorktreesServer(
     });
   }
 }
+
+test('session plan resolves only the server-owned project path', async () => {
+  let plannedPath = '';
+  const services = createFakeServices({
+    resolveProjectPath: (projectId) => {
+      assert.equal(projectId, 'project-1');
+      return '/workspace/source';
+    },
+    planSessionWorkspace: async (projectPath) => {
+      plannedPath = projectPath;
+      return {
+        enabled: true,
+        requiresSelection: true,
+        defaultRepositoryKeys: [],
+        repositories: [],
+      };
+    },
+  });
+
+  await withWorktreesServer(services, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/worktrees/session-plan?project=project-1`);
+    const payload = await response.json() as { success: boolean; data: { enabled: boolean } };
+    assert.equal(response.status, 200);
+    assert.equal(payload.success, true);
+    assert.equal(payload.data.enabled, true);
+  });
+  assert.equal(plannedPath, '/workspace/source');
+});
 
 test('create route parses input and invokes the create-and-open application service', async () => {
   const createInputs: CreateWorktreeInput[] = [];
@@ -196,4 +228,31 @@ test('merge and remove routes do not coerce string booleans to true', async () =
   assert.equal(mergeInputs[0].removeAfterMerge, false);
   assert.equal(removeInputs[0].force, false);
   assert.equal(removeInputs[0].deleteBranch, false);
+});
+
+test('injected read-only deployment policy denies worktree mutations before services run', async () => {
+  let mutationCalls = 0;
+  const services = createFakeServices({
+    resolveProjectPath: () => '/workspace/repo',
+    createAndOpen: async () => {
+      mutationCalls += 1;
+      throw new Error('worktree mutation must not run');
+    },
+  });
+  const deploymentPolicy = parseDeploymentPolicy({
+    CLOUDCLI_DEPLOYMENT_PROFILE: 'product-qa-readonly',
+  });
+
+  await withWorktreesServer(services, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/worktrees/create`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ project: 'project-1', branch: 'feature/read-only' }),
+    });
+    const payload = await response.json() as { error: string };
+    assert.equal(response.status, 403);
+    assert.equal(payload.error, 'DEPLOYMENT_CAPABILITY_DENIED');
+  }, { deploymentPolicy });
+
+  assert.equal(mutationCalls, 0);
 });

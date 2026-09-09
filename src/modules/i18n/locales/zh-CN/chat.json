@@ -108,6 +108,10 @@
     "placeholder": "输入 / 调用命令，@ 选择文件，或向 {{provider}} 提问...",
     "placeholderDefault": "输入您的消息...",
     "disabled": "输入已禁用",
+    "abortUnavailable": "当前账号暂不能停止正在运行的任务。",
+    "sendUnavailable": "当前部署不支持发送消息。",
+    "providerReadOnlyUnsupported": "当前只读部署不支持继续 {{provider}} 会话，请选择 Claude 或 Codex 会话。",
+    "identityEnrollmentRequired": "当前钉钉项目身份尚未确认，对话暂为只读。请联系管理员开通系统权限。",
     "attachFiles": "附加文件",
     "attachImages": "附加图片",
     "send": "发送",
@@ -134,7 +138,16 @@
   "providerSelection": {
     "title": "选择您的 AI 助手",
     "description": "选择一个供应商以开始新对话",
+    "unavailableTitle": "当前暂时无法发起对话",
+    "readOnlyTitle": "当前会话为只读",
     "selectModel": "选择模型",
+    "runtimeOnly": {
+      "dialogTitle": "Runtime 选择器",
+      "choose": "选择 Runtime",
+      "description": "模型由服务器统一管理，您只需要选择 Runtime。",
+      "clickToChange": "点击切换 Runtime",
+      "ready": "{{runtime}} Runtime 已就绪，请在下方输入消息。"
+    },
     "providerInfo": {
       "anthropic": "由 Anthropic 提供",
       "openai": "由 OpenAI 提供",
@@ -259,7 +272,35 @@
     "json": {
       "label": "JSON (.json)",
       "description": "全部消息原样输出，供工具使用。"
+    },
+    "share": {
+      "label": "创建只读分享链接",
+      "description": "生成一份有效期 7 天的公开固定快照；任何拿到链接的人都能查看。",
+      "confirm": "将创建公开的只读快照，任何拿到链接的人都能查看其中的对话文本。快照不包含思考、原始工具信息和附件。确定继续吗？",
+      "copied": "分享链接已复制",
+      "copiedDescription": "任何拿到链接的人都可以查看这份固定的只读快照。",
+      "copyFailed": "链接已创建，但复制失败",
+      "copyFailedDescription": "请检查剪贴板权限，再次点击可重试。",
+      "failed": "无法创建分享链接",
+      "failedDescription": "再次点击可重试。",
+      "checking": "正在检查分享链接",
+      "checkingDescription": "正在查询你为当前会话创建的有效链接。",
+      "statusFailed": "无法检查分享链接",
+      "statusFailedDescription": "点击重试查询。",
+      "revoke": "撤销当前分享链接",
+      "revokeDescription": "立即停用你为当前会话创建的公开链接。",
+      "revokeFailed": "无法撤销分享链接",
+      "revokeFailedDescription": "链接可能仍可访问，请点击重试。",
+      "revoked": "分享链接已撤销",
+      "revokedDescription": "旧链接已经失效，点击可创建新链接。"
     }
+  },
+  "sessionWorkspace": {
+    "title": "选择本会话涉及的代码仓",
+    "description": "系统会从远端最新基线创建独立 worktree。其他会话不会看到本会话的未提交修改。",
+    "readOnly": "当前只读",
+    "cancel": "取消",
+    "create": "创建隔离会话"
   },
   "schedule": {
     "trigger": "定时发送这条消息",

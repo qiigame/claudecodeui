@@ -1,4 +1,4 @@
-import { access, readFile, stat } from 'node:fs/promises';
+import { access, readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { projectsDb } from '@/modules/database/index.js';
@@ -43,10 +43,26 @@ type NormalizedTaskMasterInfo = {
   status: 'configured' | 'not-configured';
 };
 
-type GetProjectTaskMasterByIdResult = {
+/** Internal TaskMaster details resolved from the project registry. */
+export type ProjectTaskMasterDetails = {
   projectId: string;
   projectPath: string;
   taskmaster: NormalizedTaskMasterInfo;
+};
+
+/**
+ * Public TaskMaster details returned by project routes.  The project path is
+ * optional because managed/read-only callers only need the project id and
+ * status metadata; local developer callers may retain the legacy field.
+ */
+export type ProjectTaskMasterResponse = Omit<ProjectTaskMasterDetails, 'projectPath'> & {
+  projectPath?: string;
+};
+
+/** Options controlling which deployment-owned details a project response exposes. */
+export type ProjectTaskMasterResponseOptions = {
+  /** Preserve the legacy absolute projectPath field for an explicitly local developer caller. */
+  includeProjectPath?: boolean;
 };
 
 type GetProjectTaskMasterDependencies = {
@@ -54,7 +70,7 @@ type GetProjectTaskMasterDependencies = {
   detectTaskMasterFolder: (projectPath: string) => Promise<TaskMasterDetectionResult>;
 };
 
-type GetProjectTaskMasterResolver = (projectId: string) => Promise<GetProjectTaskMasterByIdResult | null>;
+type GetProjectTaskMasterResolver = (projectId: string) => Promise<ProjectTaskMasterDetails | null>;
 
 function extractTasksFromJson(tasksData: unknown): TaskMasterTask[] {
   if (!tasksData || typeof tasksData !== 'object') {
@@ -81,9 +97,27 @@ function extractTasksFromJson(tasksData: unknown): TaskMasterTask[] {
   return taggedTaskCollections;
 }
 
-async function detectTaskMasterFolder(projectPath: string): Promise<TaskMasterDetectionResult> {
+export async function detectTaskMasterFolder(projectPath: string): Promise<TaskMasterDetectionResult> {
   try {
-    const taskMasterPath = path.join(projectPath, '.taskmaster');
+    // Project paths come from the DB. Resolve both the project and
+    // `.taskmaster` directory before opening any child so a stale symlink in
+    // the checkout cannot redirect this metadata reader outside the selected
+    // project. (The route is read-only, but this data is still user-visible.)
+    const canonicalProjectPath = await realpath(projectPath);
+    const lexicalTaskMasterPath = path.join(canonicalProjectPath, '.taskmaster');
+    const taskMasterPath = await realpath(lexicalTaskMasterPath);
+    const relativeTaskMasterPath = path.relative(canonicalProjectPath, taskMasterPath);
+    if (
+      !relativeTaskMasterPath
+      || relativeTaskMasterPath === '..'
+      || relativeTaskMasterPath.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relativeTaskMasterPath)
+    ) {
+      return {
+        hasTaskmaster: false,
+        reason: '.taskmaster path resolves outside the project root',
+      };
+    }
 
     try {
       const taskMasterStats = await stat(taskMasterPath);
@@ -110,7 +144,30 @@ async function detectTaskMasterFolder(projectPath: string): Promise<TaskMasterDe
     let hasEssentialFiles = true;
 
     for (const fileName of keyFiles) {
-      const absoluteFilePath = path.join(taskMasterPath, fileName);
+      const lexicalFilePath = path.join(taskMasterPath, fileName);
+      let absoluteFilePath: string;
+      try {
+        absoluteFilePath = await realpath(lexicalFilePath);
+        const relativeFilePath = path.relative(canonicalProjectPath, absoluteFilePath);
+        if (
+          !relativeFilePath
+          || relativeFilePath === '..'
+          || relativeFilePath.startsWith(`..${path.sep}`)
+          || path.isAbsolute(relativeFilePath)
+        ) {
+          fileStatus[fileName] = false;
+          if (fileName === 'tasks/tasks.json') {
+            hasEssentialFiles = false;
+          }
+          continue;
+        }
+      } catch {
+        fileStatus[fileName] = false;
+        if (fileName === 'tasks/tasks.json') {
+          hasEssentialFiles = false;
+        }
+        continue;
+      }
       try {
         await access(absoluteFilePath);
         fileStatus[fileName] = true;
@@ -124,7 +181,33 @@ async function detectTaskMasterFolder(projectPath: string): Promise<TaskMasterDe
 
     let taskMetadata: TaskMasterMetadata = null;
     if (fileStatus['tasks/tasks.json']) {
-      const tasksPath = path.join(taskMasterPath, 'tasks/tasks.json');
+      // Resolve again immediately before the read and use the canonical path
+      // returned by realpath, avoiding a second traversal through a swapped
+      // symlink. The file was already validated in the key-file pass; a race
+      // simply degrades to the existing parse-error response.
+      let tasksPath: string;
+      try {
+        tasksPath = await realpath(path.join(taskMasterPath, 'tasks/tasks.json'));
+        const relativeTasksPath = path.relative(canonicalProjectPath, tasksPath);
+        if (
+          !relativeTasksPath
+          || relativeTasksPath === '..'
+          || relativeTasksPath.startsWith(`..${path.sep}`)
+          || path.isAbsolute(relativeTasksPath)
+        ) {
+          throw new Error('tasks path outside project root');
+        }
+      } catch (error) {
+        console.warn('Failed to resolve tasks.json safely:', (error as Error).message);
+        taskMetadata = { error: 'Failed to parse tasks.json' };
+        return {
+          hasTaskmaster: true,
+          hasEssentialFiles: false,
+          files: fileStatus,
+          metadata: taskMetadata,
+          path: taskMasterPath,
+        };
+      }
       try {
         const tasksContent = await readFile(tasksPath, 'utf8');
         const parsedTasksJson = JSON.parse(tasksContent) as unknown;
@@ -210,7 +293,7 @@ const defaultDependencies: GetProjectTaskMasterDependencies = {
 export async function getProjectTaskMasterById(
   projectId: string,
   dependencies: GetProjectTaskMasterDependencies = defaultDependencies,
-): Promise<GetProjectTaskMasterByIdResult | null> {
+): Promise<ProjectTaskMasterDetails | null> {
   const projectPath = dependencies.resolveProjectPathById(projectId);
   if (!projectPath) {
     return null;
@@ -224,10 +307,28 @@ export async function getProjectTaskMasterById(
   };
 }
 
+/**
+ * Projects routes use this projection before serializing TaskMaster details.
+ * `projectPath` is a server-local absolute path and must be omitted for
+ * product/QA or managed callers; the default keeps existing local developer
+ * consumers source-compatible until they opt into the safer projection.
+ */
+export function projectTaskMasterResponse(
+  details: ProjectTaskMasterDetails,
+  options: ProjectTaskMasterResponseOptions = {},
+): ProjectTaskMasterResponse {
+  if (options.includeProjectPath !== false) {
+    return { ...details };
+  }
+
+  const { projectPath: _projectPath, ...safeDetails } = details;
+  return safeDetails;
+}
+
 export async function getProjectTaskMaster(
   projectId: string,
   resolveById: GetProjectTaskMasterResolver = getProjectTaskMasterById,
-): Promise<GetProjectTaskMasterByIdResult> {
+): Promise<ProjectTaskMasterDetails> {
   const normalizedProjectId = projectId.trim();
   if (!normalizedProjectId) {
     throw new AppError('projectId is required', {

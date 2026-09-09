@@ -1,16 +1,26 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import Database from 'better-sqlite3';
 
+import { parseDeploymentPolicy } from '@/modules/deployment-policy/index.js';
 import {
   createProviderTokenUsageService,
   summarizeClaudeTokenUsage,
 } from '@/modules/providers/services/provider-token-usage.service.js';
-import { AppError } from '@/shared/utils.js';
+import {
+  AppError,
+  buildClaudeProjectDirectoryName,
+  buildClaudeTranscriptFilePath,
+  openProviderTranscriptReadHandle,
+} from '@/shared/utils.js';
+import type {
+  AuthenticatedProviderTranscript,
+  ProviderTranscriptPathValidationInput,
+} from '@/shared/utils.js';
 
 function createSessionRow(overrides: Record<string, unknown> = {}) {
   return {
@@ -18,6 +28,7 @@ function createSessionRow(overrides: Record<string, unknown> = {}) {
     provider: 'claude',
     provider_session_id: 'provider-session',
     project_path: null,
+    runtime_path: null,
     jsonl_path: null,
     custom_name: null,
     model: null,
@@ -30,13 +41,66 @@ function createSessionRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function readonlyDeploymentPolicy() {
+  return parseDeploymentPolicy({
+    CLOUDCLI_DEPLOYMENT_PROFILE: 'product-qa-readonly',
+  });
+}
+
+/** Creates a transcript in the same provider-owned layout used in production. */
+async function createClaudeTranscriptFixture(
+  tempDirectory: string,
+  providerSessionId: string,
+  rows: string[],
+) {
+  const configDirectory = path.join(tempDirectory, 'claude-config');
+  const projectPath = path.join(tempDirectory, 'workspace');
+  await mkdir(projectPath, { recursive: true });
+  const transcriptPath = buildClaudeTranscriptFilePath(
+    configDirectory,
+    projectPath,
+    providerSessionId,
+  );
+  if (!transcriptPath) {
+    throw new Error('Could not build Claude transcript fixture path.');
+  }
+  await mkdir(path.dirname(transcriptPath), { recursive: true });
+  await writeFile(transcriptPath, rows.join('\n'));
+  return { configDirectory, projectPath, transcriptPath };
+}
+
+/**
+ * Test-only opener for deliberately synthetic parser fixtures. It returns an
+ * already-open descriptor; the service owns and closes that descriptor, so no
+ * test can accidentally restore a validate-then-reopen path seam.
+ */
+const openFixtureTranscriptForTest = async (
+  input: ProviderTranscriptPathValidationInput,
+): Promise<AuthenticatedProviderTranscript | null> => {
+  const opened = await openProviderTranscriptReadHandle(input.candidatePath);
+  if (!opened) {
+    return null;
+  }
+
+  const canonicalPath = path.resolve(input.candidatePath);
+  return {
+    canonicalPath,
+    canonicalRoot: path.dirname(canonicalPath),
+    device: opened.device,
+    inode: opened.inode,
+    handle: opened.handle,
+    firstRecord: null,
+  };
+};
+
 test('token usage lookup requires only the app-facing session id for Claude', async () => {
   const tempDirectory = await mkdtemp(path.join(tmpdir(), 'provider-token-usage-claude-'));
-  const sessionFilePath = path.join(tempDirectory, 'provider-session.jsonl');
 
   try {
-    await writeFile(sessionFilePath, [
+    const fixture = await createClaudeTranscriptFixture(tempDirectory, 'provider-session', [
       JSON.stringify({
+        sessionId: 'provider-session',
+        cwd: path.join(tempDirectory, 'workspace'),
         type: 'assistant',
         message: {
           usage: {
@@ -48,10 +112,14 @@ test('token usage lookup requires only the app-facing session id for Claude', as
         },
       }),
       '{incomplete',
-    ].join('\n'));
+    ]);
 
     const service = createProviderTokenUsageService({
-      getSessionById: () => createSessionRow({ jsonl_path: sessionFilePath }),
+      getSessionById: () => createSessionRow({
+        jsonl_path: fixture.transcriptPath,
+        project_path: fixture.projectPath,
+      }),
+      getClaudeConfigDirectory: () => fixture.configDirectory,
       getClaudeContextWindow: () => '180000',
     });
 
@@ -64,6 +132,131 @@ test('token usage lookup requires only the app-facing session id for Claude', as
       cacheCreationTokens: 5,
       cacheTokens: 25,
       breakdown: { input: 125, output: 30 },
+    });
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
+});
+
+test('Claude token usage binds an isolated session to runtime_path instead of a stale source transcript', async () => {
+  const tempDirectory = await mkdtemp(path.join(tmpdir(), 'provider-token-usage-claude-isolated-'));
+  const configDirectory = path.join(tempDirectory, 'claude-config');
+  const sourcePath = path.join(tempDirectory, 'source');
+  const runtimePath = path.join(tempDirectory, 'runtime');
+  const providerSessionId = 'isolated-claude-token-usage';
+
+  try {
+    await Promise.all([
+      mkdir(sourcePath, { recursive: true }),
+      mkdir(runtimePath, { recursive: true }),
+    ]);
+    const sourceProject = buildClaudeProjectDirectoryName(sourcePath, {
+      CLAUDE_CONFIG_DIR: configDirectory,
+    });
+    const runtimeProject = buildClaudeProjectDirectoryName(runtimePath, {
+      CLAUDE_CONFIG_DIR: configDirectory,
+    });
+    assert.ok(sourceProject);
+    assert.ok(runtimeProject);
+    const sourceTranscript = path.join(
+      configDirectory,
+      'projects',
+      sourceProject,
+      `${providerSessionId}.jsonl`,
+    );
+    const runtimeTranscript = path.join(
+      configDirectory,
+      'projects',
+      runtimeProject,
+      `${providerSessionId}.jsonl`,
+    );
+    await mkdir(path.dirname(sourceTranscript), { recursive: true });
+    await writeFile(sourceTranscript, `${JSON.stringify({
+      sessionId: providerSessionId,
+      cwd: sourcePath,
+      type: 'assistant',
+      message: { usage: { input_tokens: 7, output_tokens: 2 } },
+    })}\n`);
+
+    const service = createProviderTokenUsageService({
+      getSessionById: () => createSessionRow({
+        jsonl_path: sourceTranscript,
+        project_path: sourcePath,
+        runtime_path: runtimePath,
+      }),
+      getClaudeConfigDirectory: () => configDirectory,
+    });
+
+    await assert.rejects(
+      () => service.getSessionTokenUsage('app-session'),
+      (error: unknown) => error instanceof AppError && error.code === 'SESSION_FILE_NOT_FOUND',
+    );
+
+    await mkdir(path.dirname(runtimeTranscript), { recursive: true });
+    await writeFile(runtimeTranscript, `${JSON.stringify({
+      sessionId: providerSessionId,
+      cwd: runtimePath,
+      type: 'assistant',
+      message: { usage: { input_tokens: 11, output_tokens: 3 } },
+    })}\n`);
+
+    const usage = await service.getSessionTokenUsage('app-session');
+    assert.equal(usage.inputTokens, 11);
+    assert.equal(usage.outputTokens, 3);
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
+});
+
+test('production Claude token usage reads from the authenticated descriptor, not a reopened path', async () => {
+  const tempDirectory = await mkdtemp(path.join(tmpdir(), 'provider-token-usage-claude-descriptor-'));
+  const configDirectory = path.join(tempDirectory, 'claude-config');
+  const projectPath = path.join(tempDirectory, 'workspace');
+  const providerSessionId = 'descriptor-bound-claude-token-usage';
+
+  try {
+    await mkdir(projectPath, { recursive: true });
+    const transcriptPath = buildClaudeTranscriptFilePath(
+      configDirectory,
+      projectPath,
+      providerSessionId,
+    );
+    assert.ok(transcriptPath);
+    await mkdir(path.dirname(transcriptPath), { recursive: true });
+    await writeFile(transcriptPath, `${JSON.stringify({
+      sessionId: providerSessionId,
+      cwd: projectPath,
+      type: 'assistant',
+      message: { usage: { input_tokens: 17, output_tokens: 4 } },
+    })}\n`);
+
+    const service = createProviderTokenUsageService({
+      getSessionById: () => createSessionRow({
+        jsonl_path: transcriptPath,
+        project_path: projectPath,
+      }),
+      getClaudeConfigDirectory: () => configDirectory,
+      getClaudeContextWindow: () => '160000',
+      // These seams must not be used after the strict validator authenticates
+      // the file. If the service reopens the validated string path, the test
+      // fails instead of silently weakening the TOCTOU boundary.
+      readTextFileTail: () => {
+        throw new Error('path-based tail read must not run for production validation');
+      },
+      readTextFile: () => {
+        throw new Error('path-based full read must not run for production validation');
+      },
+    });
+
+    assert.deepEqual(await service.getSessionTokenUsage('app-session'), {
+      used: 21,
+      total: 160_000,
+      inputTokens: 17,
+      outputTokens: 4,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      cacheTokens: 0,
+      breakdown: { input: 17, output: 4 },
     });
   } finally {
     await rm(tempDirectory, { recursive: true, force: true });
@@ -103,6 +296,7 @@ test('Codex token usage uses the latest token_count snapshot', async () => {
         provider: 'codex',
         jsonl_path: sessionFilePath,
       }),
+      openAuthenticatedTranscriptForTest: openFixtureTranscriptForTest,
     });
 
     assert.deepEqual(await service.getSessionTokenUsage('app-session'), {
@@ -111,6 +305,143 @@ test('Codex token usage uses the latest token_count snapshot', async () => {
       inputTokens: 40,
       outputTokens: 9,
       breakdown: { input: 40, output: 9 },
+    });
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
+});
+
+test('Codex token usage binds an isolated session to runtime_path', async () => {
+  const tempDirectory = await mkdtemp(path.join(tmpdir(), 'provider-token-usage-codex-isolated-'));
+  const codexHome = path.join(tempDirectory, 'codex-home');
+  const sourcePath = path.join(tempDirectory, 'source');
+  const runtimePath = path.join(tempDirectory, 'runtime');
+  const providerSessionId = 'isolated-codex-token-usage';
+  const sourceTranscript = path.join(
+    codexHome,
+    'sessions',
+    '2026',
+    '09',
+    '06',
+    `rollout-source-${providerSessionId}.jsonl`,
+  );
+  const runtimeTranscript = path.join(
+    codexHome,
+    'sessions',
+    '2026',
+    '09',
+    '07',
+    `rollout-runtime-${providerSessionId}.jsonl`,
+  );
+
+  try {
+    await Promise.all([
+      mkdir(sourcePath, { recursive: true }),
+      mkdir(runtimePath, { recursive: true }),
+      mkdir(path.dirname(sourceTranscript), { recursive: true }),
+      mkdir(path.dirname(runtimeTranscript), { recursive: true }),
+    ]);
+    const transcript = (cwd: string, inputTokens: number) => `${[
+      JSON.stringify({
+        type: 'session_meta',
+        payload: { id: providerSessionId, cwd, thread_source: 'user' },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: inputTokens, output_tokens: 2 },
+            model_context_window: 100_000,
+          },
+        },
+      }),
+    ].join('\n')}\n`;
+    await writeFile(sourceTranscript, transcript(sourcePath, 5));
+
+    const service = createProviderTokenUsageService({
+      getSessionById: () => createSessionRow({
+        provider: 'codex',
+        jsonl_path: sourceTranscript,
+        project_path: sourcePath,
+        runtime_path: runtimePath,
+      }),
+      getCodexHomeDirectory: () => codexHome,
+    });
+
+    await assert.rejects(
+      () => service.getSessionTokenUsage('app-session'),
+      (error: unknown) => error instanceof AppError && error.code === 'CODEX_SESSION_FILE_NOT_FOUND',
+    );
+
+    await writeFile(runtimeTranscript, transcript(runtimePath, 13));
+    const usage = await service.getSessionTokenUsage('app-session');
+    assert.equal(usage.inputTokens, 13);
+    assert.equal(usage.outputTokens, 2);
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
+});
+
+test('production Codex token usage reads from the authenticated descriptor, not a reopened path', async () => {
+  const tempDirectory = await mkdtemp(path.join(tmpdir(), 'provider-token-usage-codex-descriptor-'));
+  const codexHome = path.join(tempDirectory, 'codex-home');
+  const projectPath = path.join(tempDirectory, 'workspace');
+  const providerSessionId = 'descriptor-bound-codex-token-usage';
+  const transcriptPath = path.join(
+    codexHome,
+    'sessions',
+    '2026',
+    '09',
+    '06',
+    `rollout-${providerSessionId}.jsonl`,
+  );
+
+  try {
+    await Promise.all([
+      mkdir(projectPath, { recursive: true }),
+      mkdir(path.dirname(transcriptPath), { recursive: true }),
+    ]);
+    await writeFile(transcriptPath, `${[
+      JSON.stringify({
+        type: 'session_meta',
+        payload: { id: providerSessionId, cwd: projectPath, thread_source: 'user' },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: 19, output_tokens: 6, total_tokens: 25 },
+            model_context_window: 120_000,
+          },
+        },
+      }),
+    ].join('\n')}\n`);
+
+    const service = createProviderTokenUsageService({
+      getSessionById: () => createSessionRow({
+        provider: 'codex',
+        jsonl_path: transcriptPath,
+        project_path: projectPath,
+      }),
+      getCodexHomeDirectory: () => codexHome,
+      // A descriptor-backed production read must not fall back to these
+      // path-based seams after the opening envelope has been authenticated.
+      readTextFileTail: () => {
+        throw new Error('path-based tail read must not run for production validation');
+      },
+      readTextFile: () => {
+        throw new Error('path-based full read must not run for production validation');
+      },
+    });
+
+    assert.deepEqual(await service.getSessionTokenUsage('app-session'), {
+      used: 25,
+      total: 120_000,
+      inputTokens: 19,
+      outputTokens: 6,
+      breakdown: { input: 19, output: 6 },
     });
   } finally {
     await rm(tempDirectory, { recursive: true, force: true });
@@ -174,6 +505,52 @@ test('Cursor returns an explicit unsupported token usage result', async () => {
   assert.equal(result.unsupported, true);
   assert.equal(result.used, 0);
   assert.equal(result.total, 0);
+});
+
+test('read-only token usage rejects Cursor and OpenCode before opening provider storage', async () => {
+  for (const provider of ['cursor', 'opencode'] as const) {
+    let databasePathCalls = 0;
+    const service = createProviderTokenUsageService({
+      getSessionById: () => createSessionRow({ provider }),
+      getOpenCodeDatabasePath: () => {
+        databasePathCalls += 1;
+        throw new Error('OpenCode storage must not be opened in read-only mode');
+      },
+      deploymentPolicy: readonlyDeploymentPolicy(),
+    });
+
+    await assert.rejects(
+      () => service.getSessionTokenUsage('app-session'),
+      (error: unknown) => (
+        error instanceof AppError
+        && error.code === 'PROVIDER_READ_ONLY_UNSUPPORTED'
+        && error.statusCode === 403
+        && (error.details as { provider?: string } | undefined)?.provider === provider
+      ),
+    );
+    assert.equal(databasePathCalls, 0);
+  }
+});
+
+test('token usage uses the construction-time policy when no per-call policy is supplied', async () => {
+  const policy = readonlyDeploymentPolicy();
+  const service = createProviderTokenUsageService({
+    getSessionById: () => createSessionRow({ provider: 'opencode' }),
+    getOpenCodeDatabasePath: () => {
+      throw new Error('OpenCode storage must not be opened in read-only mode');
+    },
+    deploymentPolicy: policy,
+  });
+  // The service owns a startup snapshot; later caller-side mutations cannot
+  // reopen an ambient provider database.
+  policy.profile = 'developer';
+
+  await assert.rejects(
+    () => service.getSessionTokenUsage('app-session'),
+    (error: unknown) => error instanceof AppError
+      && error.code === 'PROVIDER_READ_ONLY_UNSUPPORTED'
+      && error.statusCode === 403,
+  );
 });
 
 test('token usage reports SESSION_NOT_FOUND for an unknown app session id', async () => {
@@ -274,6 +651,7 @@ test('Claude token usage reads only the tail of a large transcript', async () =>
     const service = createProviderTokenUsageService({
       getSessionById: () => createSessionRow({ jsonl_path: sessionFilePath }),
       getClaudeContextWindow: () => '180000',
+      openAuthenticatedTranscriptForTest: openFixtureTranscriptForTest,
       // Reading the whole file here would defeat the tail read; fail loudly.
       readTextFile: () => { throw new Error('full read must not happen when the tail has usage'); },
     });
@@ -299,6 +677,7 @@ test('Claude token usage falls back to the whole file when the tail has no usage
     const service = createProviderTokenUsageService({
       getSessionById: () => createSessionRow({ jsonl_path: sessionFilePath }),
       getClaudeContextWindow: () => '180000',
+      openAuthenticatedTranscriptForTest: openFixtureTranscriptForTest,
     });
 
     const usage = await service.getSessionTokenUsage('app-session');
@@ -330,6 +709,7 @@ test('Codex token usage reads only the tail of a large rollout', async () => {
 
     const service = createProviderTokenUsageService({
       getSessionById: () => createSessionRow({ provider: 'codex', jsonl_path: sessionFilePath }),
+      openAuthenticatedTranscriptForTest: openFixtureTranscriptForTest,
       readTextFile: () => { throw new Error('full read must not happen when the tail has usage'); },
     });
 
@@ -363,6 +743,7 @@ test('Codex token usage falls back to the whole file when the tail has no token_
 
     const service = createProviderTokenUsageService({
       getSessionById: () => createSessionRow({ provider: 'codex', jsonl_path: sessionFilePath }),
+      openAuthenticatedTranscriptForTest: openFixtureTranscriptForTest,
     });
 
     const usage = await service.getSessionTokenUsage('app-session');

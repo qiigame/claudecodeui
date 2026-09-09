@@ -11,6 +11,7 @@ import { appConfigDb } from '@/modules/database/index.js';
 import { providerMcpService } from '@/modules/providers/index.js';
 import { getModuleDirectory } from '@/shared/utils.js';
 
+import { resolveBrowserUseMcpApiUrl } from './browser-use-mcp-url.service.js';
 import { getBrowserUseRuntime } from './browser-use-runtime.js';
 
 const require = createRequire(import.meta.url);
@@ -103,6 +104,30 @@ function readSettings(): BrowserUseSettings {
   }
 }
 
+type BrowserUseMcpRegistrationTarget<T = unknown> = {
+  getSettings: () => Promise<BrowserUseSettings>;
+  registerAgentMcp: () => Promise<T>;
+};
+
+/**
+ * Reconciles the persisted Browser setting with provider MCP configuration.
+ * Provider MCP writes are upserts, so running this after every server start is
+ * safe and also migrates callback URLs produced by older CloudCLI versions.
+ */
+export async function reconcileBrowserUseMcpRegistrationOnStartup<T>(
+  target: BrowserUseMcpRegistrationTarget<T>,
+): Promise<{ enabled: boolean; registration: T | null }> {
+  const settings = await target.getSettings();
+  if (!settings.enabled) {
+    return { enabled: false, registration: null };
+  }
+
+  return {
+    enabled: true,
+    registration: await target.registerAgentMcp(),
+  };
+}
+
 function writeSettings(settings: BrowserUseSettings): BrowserUseSettings {
   const normalized = {
     enabled: settings.enabled === true,
@@ -161,9 +186,31 @@ function getMcpCommand(): { command: string; args: string[] } {
   };
 }
 
-function getMcpApiUrl(): string {
-  const port = process.env.SERVER_PORT || process.env.PORT || '3001';
-  return `http://127.0.0.1:${port}/api/browser-use-mcp`;
+/**
+ * Builds the managed provider registration consumed by Browser Use startup and
+ * settings updates. Codex receives `approve` because Web Chat is headless and
+ * cannot answer MCP prompts; other provider adapters ignore that typed field.
+ */
+export function buildBrowserUseMcpRegistration(input: {
+  command: string;
+  args: string[];
+  token: string;
+  apiUrl: string;
+}) {
+  return {
+    name: MCP_SERVER_NAME,
+    scope: 'user' as const,
+    transport: 'stdio' as const,
+    command: input.command,
+    args: input.args,
+    env: {
+      CLOUDCLI_BROWSER_USE_MCP_TOKEN: input.token,
+      CLOUDCLI_BROWSER_USE_API_URL: input.apiUrl,
+    },
+    // Codex runs headlessly in Web Chat and cannot answer an MCP approval
+    // prompt. Other provider adapters intentionally ignore this Codex field.
+    defaultToolsApprovalMode: 'approve' as const,
+  };
 }
 
 async function removeMcpServerFromAllProviders(name: string) {
@@ -458,22 +505,29 @@ export const browserUseService = {
   async registerAgentMcp() {
     const { command, args } = getMcpCommand();
     await Promise.all(LEGACY_MCP_SERVER_NAMES.map((name) => removeMcpServerFromAllProviders(name)));
-    const results = await providerMcpService.addMcpServerToAllProviders({
-      name: MCP_SERVER_NAME,
-      scope: 'user',
-      transport: 'stdio',
+    const registration = buildBrowserUseMcpRegistration({
       command,
       args,
-      env: {
-        CLOUDCLI_BROWSER_USE_MCP_TOKEN: getOrCreateMcpToken(),
-        CLOUDCLI_BROWSER_USE_API_URL: getMcpApiUrl(),
-      },
+      token: getOrCreateMcpToken(),
+      apiUrl: resolveBrowserUseMcpApiUrl(),
     });
+    const results = await providerMcpService.addMcpServerToAllProviders(registration);
     return { name: MCP_SERVER_NAME, command, args, results };
   },
 
   getMcpToken() {
     return getOrCreateMcpToken();
+  },
+
+  /**
+   * Returns the persisted Browser MCP token without creating one.  The token
+   * guard uses this non-mutating path for unauthenticated requests so merely
+   * probing the bridge cannot write deployment configuration in a read-only
+   * process. Writable startup/settings flows call getMcpToken() explicitly
+   * when they need to provision the token for a new registration.
+   */
+  getExistingMcpToken() {
+    return appConfigDb.get(BROWSER_USE_MCP_TOKEN_KEY) || null;
   },
 
   async unregisterAgentMcp() {

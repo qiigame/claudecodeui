@@ -16,6 +16,8 @@ type EditorSidebarProps = {
   onToggleEditorExpand: () => void;
   projectPath?: string;
   fillSpace?: boolean;
+  /** Disables editing and save controls for product/QA deployments. */
+  readOnly?: boolean;
 };
 
 // Minimum width for the left content (file tree, chat, etc.)
@@ -36,6 +38,7 @@ export default function EditorSidebar({
   onToggleEditorExpand,
   projectPath,
   fillSpace,
+  readOnly = false,
 }: EditorSidebarProps) {
   const [poppedOut, setPoppedOut] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -100,6 +103,7 @@ export default function EditorSidebar({
         }}
         projectPath={projectPath}
         isSidebar={false}
+        readOnly={readOnly}
       />
     );
   }
@@ -129,6 +133,7 @@ export default function EditorSidebar({
           onClose={onCloseEditor}
           projectPath={projectPath}
           isSidebar
+          readOnly={readOnly}
           isExpanded={editorExpanded}
           onToggleExpand={onToggleEditorExpand}
           onPopOut={() => setPoppedOut(true)}

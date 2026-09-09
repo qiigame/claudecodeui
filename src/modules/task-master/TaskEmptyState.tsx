@@ -7,6 +7,7 @@ import type { PrdFile } from '@/shared/types';
 type TaskEmptyStateProps = {
   className?: string;
   hasTaskMasterDirectory: boolean;
+  canMutate?: boolean;
   existingPrds: PrdFile[];
   onOpenSetupModal: () => void;
   onCreatePrd: () => void;
@@ -17,6 +18,7 @@ type TaskEmptyStateProps = {
 export default function TaskEmptyState({
   className = '',
   hasTaskMasterDirectory,
+  canMutate = false,
   existingPrds,
   onOpenSetupModal,
   onCreatePrd,
@@ -46,13 +48,19 @@ export default function TaskEmptyState({
             </div>
           </div>
 
-          <button
-            onClick={onOpenSetupModal}
-            className="mx-auto flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 font-medium text-white transition-colors hover:bg-blue-700"
-          >
-            <Terminal className="h-4 w-4" />
-            {t('notConfigured.initializeButton')}
-          </button>
+          {canMutate ? (
+            <button
+              onClick={onOpenSetupModal}
+              className="mx-auto flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 font-medium text-white transition-colors hover:bg-blue-700"
+            >
+              <Terminal className="h-4 w-4" />
+              {t('notConfigured.initializeButton')}
+            </button>
+          ) : (
+            <p className="mx-auto max-w-sm rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300">
+              TaskMaster is not configured for this project. Initialization is available to developer deployments only.
+            </p>
+          )}
         </div>
       </div>
     );
@@ -77,13 +85,15 @@ export default function TaskEmptyState({
               <h4 className="mb-1 font-medium text-gray-900 dark:text-white">1. {t('gettingStarted.steps.createPRD.title')}</h4>
               <p className="mb-3 text-sm text-gray-600 dark:text-gray-400">{t('gettingStarted.steps.createPRD.description')}</p>
 
-              <button
-                onClick={onCreatePrd}
-                className="inline-flex items-center gap-2 rounded bg-purple-100 px-2 py-1 text-xs text-purple-700 hover:bg-purple-200 dark:bg-purple-900/30 dark:text-purple-300 dark:hover:bg-purple-900/50"
-              >
-                <FileText className="h-3 w-3" />
-                {t('gettingStarted.steps.createPRD.addButton')}
-              </button>
+              {canMutate && (
+                <button
+                  onClick={onCreatePrd}
+                  className="inline-flex items-center gap-2 rounded bg-purple-100 px-2 py-1 text-xs text-purple-700 hover:bg-purple-200 dark:bg-purple-900/30 dark:text-purple-300 dark:hover:bg-purple-900/50"
+                >
+                  <FileText className="h-3 w-3" />
+                  {t('gettingStarted.steps.createPRD.addButton')}
+                </button>
+              )}
 
               {existingPrds.length > 0 && (
                 <div className="mt-3 border-t border-gray-200 pt-3 dark:border-gray-700">
@@ -120,13 +130,15 @@ export default function TaskEmptyState({
             </div>
           </div>
 
-          <button
-            onClick={onCreatePrd}
-            className="inline-flex items-center gap-2 rounded-lg bg-purple-600 px-4 py-2 font-medium text-white hover:bg-purple-700"
-          >
-            <FileText className="h-4 w-4" />
-            {t('buttons.addPRD')}
-          </button>
+          {canMutate && (
+            <button
+              onClick={onCreatePrd}
+              className="inline-flex items-center gap-2 rounded-lg bg-purple-600 px-4 py-2 font-medium text-white hover:bg-purple-700"
+            >
+              <FileText className="h-4 w-4" />
+              {t('buttons.addPRD')}
+            </button>
+          )}
         </div>
 
         <p className="text-sm text-gray-500 dark:text-gray-400">{t('gettingStarted.tip')}</p>

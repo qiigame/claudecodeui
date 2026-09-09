@@ -1,6 +1,6 @@
 import type { DragEvent, ReactNode, RefObject } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronRight, Folder, FolderOpen, Upload } from 'lucide-react';
+import { ChevronRight, Folder, FolderOpen, Loader2, Upload } from 'lucide-react';
 
 import { cn } from '@/shared/utils';
 import type { FileTreeNode as FileTreeNodeType, FileTreeViewMode } from '@/shared/types';
@@ -40,6 +40,7 @@ type FileTreeNodeProps = {
 type TreeItemIconProps = {
   item: FileTreeNodeType;
   isOpen: boolean;
+  isLoadingChildren: boolean;
   renderFileIcon: (filename: string) => ReactNode;
 };
 
@@ -50,7 +51,7 @@ function getParentDirectoryPath(itemPath: string) {
   return segments.join('/');
 }
 
-function TreeItemIcon({ item, isOpen, renderFileIcon }: TreeItemIconProps) {
+function TreeItemIcon({ item, isOpen, isLoadingChildren, renderFileIcon }: TreeItemIconProps) {
   if (item.type === 'directory') {
     return (
       <span className="flex flex-shrink-0 items-center gap-0.5">
@@ -60,7 +61,9 @@ function TreeItemIcon({ item, isOpen, renderFileIcon }: TreeItemIconProps) {
             isOpen && 'rotate-90',
           )}
         />
-        {isOpen ? (
+        {isLoadingChildren ? (
+          <Loader2 className="h-4 w-4 flex-shrink-0 animate-spin text-blue-500" />
+        ) : isOpen ? (
           <FolderOpen className="h-4 w-4 flex-shrink-0 text-blue-500" />
         ) : (
           <Folder className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
@@ -103,6 +106,7 @@ export default function FileTreeNode({
   const { t } = useTranslation();
   const isDirectory = item.type === 'directory';
   const isOpen = isDirectory && expandedDirs.has(item.path);
+  const isLoadingChildren = isDirectory && item.isLoadingChildren === true;
   const hasChildren = Boolean(isDirectory && item.children && item.children.length > 0);
   const isRenaming = renamingItem?.path === item.path;
   const dragTargetPath = isDirectory ? item.path : getParentDirectoryPath(item.path);
@@ -134,7 +138,12 @@ export default function FileTreeNode({
         style={{ paddingLeft: `${level * 16 + 4}px` }}
         onClick={(e) => e.stopPropagation()}
       >
-        <TreeItemIcon item={item} isOpen={isOpen} renderFileIcon={renderFileIcon} />
+        <TreeItemIcon
+          item={item}
+          isOpen={isOpen}
+          isLoadingChildren={isLoadingChildren}
+          renderFileIcon={renderFileIcon}
+        />
         <Input
           ref={renameInputRef}
           type="text"
@@ -186,7 +195,12 @@ export default function FileTreeNode({
       {viewMode === 'detailed' ? (
         <>
           <div className="col-span-5 flex min-w-0 items-center gap-1.5">
-            <TreeItemIcon item={item} isOpen={isOpen} renderFileIcon={renderFileIcon} />
+            <TreeItemIcon
+              item={item}
+              isOpen={isOpen}
+              isLoadingChildren={isLoadingChildren}
+              renderFileIcon={renderFileIcon}
+            />
             <span className={nameClassName}>{item.name}</span>
           </div>
           <div className="col-span-2 text-sm tabular-nums text-muted-foreground">
@@ -198,7 +212,12 @@ export default function FileTreeNode({
       ) : viewMode === 'compact' ? (
         <>
           <div className="flex min-w-0 items-center gap-1.5">
-            <TreeItemIcon item={item} isOpen={isOpen} renderFileIcon={renderFileIcon} />
+            <TreeItemIcon
+              item={item}
+              isOpen={isOpen}
+              isLoadingChildren={isLoadingChildren}
+              renderFileIcon={renderFileIcon}
+            />
             <span className={nameClassName}>{item.name}</span>
           </div>
           <div className="ml-2 flex flex-shrink-0 items-center gap-3 text-sm text-muted-foreground">
@@ -212,7 +231,12 @@ export default function FileTreeNode({
         </>
       ) : (
         <>
-          <TreeItemIcon item={item} isOpen={isOpen} renderFileIcon={renderFileIcon} />
+          <TreeItemIcon
+            item={item}
+            isOpen={isOpen}
+            isLoadingChildren={isLoadingChildren}
+            renderFileIcon={renderFileIcon}
+          />
           <span className={nameClassName}>{item.name}</span>
         </>
       )}

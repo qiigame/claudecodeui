@@ -222,9 +222,24 @@ const clearProviderSkillCache = (provider: SkillsProvider): void => {
 type UseProviderSkillsArgs = {
   selectedProvider: SkillsProvider;
   currentProjects: SkillsProject[];
+  /**
+   * Whether this deployment may write provider skill configuration.  Listing
+   * remains available when false so product/QA users can inspect the skills
+   * that a runtime will see, while the mutation callback is still guarded in
+   * the hook for stale event handlers and non-UI callers.
+   */
+  canManage?: boolean;
 };
 
-export function useProviderSkills({ selectedProvider, currentProjects }: UseProviderSkillsArgs) {
+export function useProviderSkills({
+  selectedProvider,
+  currentProjects,
+  // Configuration hooks fail closed unless the caller passes the
+  // server-authorized capability explicitly. ProviderSkills supplies this
+  // value from the deployment/auth policy; direct or stale callers must not
+  // regain a write path by relying on the historical default.
+  canManage = false,
+}: UseProviderSkillsArgs) {
   const [skills, setSkills] = useState<ProviderSkill[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingProjectScopes, setIsLoadingProjectScopes] = useState(false);
@@ -320,6 +335,10 @@ export function useProviderSkills({ selectedProvider, currentProjects }: UseProv
   }, [cacheKey, projectTargets, selectedProvider]);
 
   const addSkills = useCallback(async (payload: ProviderSkillCreatePayload) => {
+    if (!canManage) {
+      throw new Error('Provider skill changes are disabled in this deployment.');
+    }
+
     try {
       const createdSkills = await saveProviderSkills(selectedProvider, payload);
       clearProviderSkillCache(selectedProvider);
@@ -330,7 +349,7 @@ export function useProviderSkills({ selectedProvider, currentProjects }: UseProv
       setSaveStatus('error');
       throw error;
     }
-  }, [refreshSkills, selectedProvider]);
+  }, [canManage, refreshSkills, selectedProvider]);
 
   useEffect(() => {
     void refreshSkills();

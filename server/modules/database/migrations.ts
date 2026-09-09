@@ -2,12 +2,15 @@ import { Database } from 'better-sqlite3';
 
 import {
   APP_CONFIG_TABLE_SCHEMA_SQL,
+  COLLABORATION_TABLES_SCHEMA_SQL,
   LAST_SCANNED_AT_SQL,
   NOTIFICATION_CHANNEL_ENDPOINTS_TABLE_SCHEMA_SQL,
   PROJECTS_TABLE_SCHEMA_SQL,
   PROVIDER_MODELS_TABLE_SCHEMA_SQL,
   PUSH_SUBSCRIPTIONS_TABLE_SCHEMA_SQL,
   SESSION_DRAFTS_TABLE_SCHEMA_SQL,
+  SESSION_SHARE_LINKS_TABLE_SCHEMA_SQL,
+  SESSION_WORKSPACES_TABLES_SCHEMA_SQL,
   SUPERSEDED_PROVIDER_SESSIONS_TABLE_SCHEMA_SQL,
   SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL,
   SESSIONS_TABLE_SCHEMA_SQL,
@@ -131,6 +134,7 @@ const rebuildProjectsTableWithPrimaryKeySchema = (db: Database): void => {
     addColumnToTableIfNotExists(db, 'projects', columnNames, 'custom_project_name', 'TEXT DEFAULT NULL');
     addColumnToTableIfNotExists(db, 'projects', columnNames, 'isStarred', 'BOOLEAN DEFAULT 0');
     addColumnToTableIfNotExists(db, 'projects', columnNames, 'isArchived', 'BOOLEAN DEFAULT 0');
+    addColumnToTableIfNotExists(db, 'projects', columnNames, 'isSessionWorkspace', 'BOOLEAN DEFAULT 0');
     db.exec(`
       UPDATE projects
       SET project_id = ${SQLITE_UUID_SQL}
@@ -175,7 +179,8 @@ const rebuildProjectsTableWithPrimaryKeySchema = (db: Database): void => {
         project_path TEXT NOT NULL UNIQUE,
         custom_project_name TEXT DEFAULT NULL,
         isStarred BOOLEAN DEFAULT 0,
-        isArchived BOOLEAN DEFAULT 0
+        isArchived BOOLEAN DEFAULT 0,
+        isSessionWorkspace BOOLEAN DEFAULT 0
       )
     `);
     db.exec(`
@@ -185,6 +190,7 @@ const rebuildProjectsTableWithPrimaryKeySchema = (db: Database): void => {
           ${customProjectNameExpression} AS custom_project_name,
           ${isStarredExpression} AS isStarred,
           ${isArchivedExpression} AS isArchived,
+          0 AS isSessionWorkspace,
           ${projectIdExpression} AS candidate_project_id,
           rowid AS source_rowid
         FROM projects
@@ -196,6 +202,7 @@ const rebuildProjectsTableWithPrimaryKeySchema = (db: Database): void => {
           custom_project_name,
           isStarred,
           isArchived,
+          isSessionWorkspace,
           candidate_project_id,
           source_rowid,
           ROW_NUMBER() OVER (PARTITION BY project_path ORDER BY source_rowid) AS project_path_rank
@@ -211,7 +218,8 @@ const rebuildProjectsTableWithPrimaryKeySchema = (db: Database): void => {
           project_path,
           custom_project_name,
           isStarred,
-          isArchived
+          isArchived,
+          isSessionWorkspace
         FROM deduped_paths
         WHERE project_path_rank = 1
       )
@@ -220,14 +228,16 @@ const rebuildProjectsTableWithPrimaryKeySchema = (db: Database): void => {
         project_path,
         custom_project_name,
         isStarred,
-        isArchived
+        isArchived,
+        isSessionWorkspace
       )
       SELECT
         project_id,
         project_path,
         custom_project_name,
         isStarred,
-        isArchived
+        isArchived,
+        isSessionWorkspace
       FROM prepared_rows
     `);
     db.exec('DROP TABLE projects');
@@ -266,6 +276,7 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
     addColumnToTableIfNotExists(db, 'sessions', columnNames, 'isArchived', 'BOOLEAN DEFAULT 0');
     addColumnToTableIfNotExists(db, 'sessions', columnNames, 'created_at', 'DATETIME');
     addColumnToTableIfNotExists(db, 'sessions', columnNames, 'updated_at', 'DATETIME');
+    addColumnToTableIfNotExists(db, 'sessions', columnNames, 'runtime_path', 'TEXT');
     db.exec('UPDATE sessions SET isArchived = COALESCE(isArchived, 0)');
     db.exec('UPDATE sessions SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)');
     db.exec('UPDATE sessions SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)');
@@ -315,6 +326,7 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
         custom_name TEXT,
         project_path TEXT,
         jsonl_path TEXT,
+        runtime_path TEXT,
         isArchived BOOLEAN DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -332,6 +344,7 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
           ${customNameExpression} AS custom_name,
           ${projectPathExpression} AS project_path,
           ${jsonlPathExpression} AS jsonl_path,
+          NULL AS runtime_path,
           ${isArchivedExpression} AS isArchived,
           ${createdAtExpression} AS created_at,
           ${updatedAtExpression} AS updated_at,
@@ -346,6 +359,7 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
           custom_name,
           project_path,
           jsonl_path,
+          runtime_path,
           isArchived,
           created_at,
           updated_at,
@@ -361,6 +375,7 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
         custom_name,
         project_path,
         jsonl_path,
+        runtime_path,
         isArchived,
         created_at,
         updated_at
@@ -371,6 +386,7 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
         custom_name,
         project_path,
         jsonl_path,
+        runtime_path,
         isArchived,
         created_at,
         updated_at
@@ -457,6 +473,12 @@ const addSessionEffortColumn = (db: Database): void => {
   addColumnToTableIfNotExists(db, 'sessions', columnNames, 'effort', 'TEXT');
 };
 
+/** Adds the isolated execution root while preserving project_path for grouping. */
+const addSessionRuntimePathColumn = (db: Database): void => {
+  const columnNames = getTableInfo(db, 'sessions').map((column) => column.name);
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'runtime_path', 'TEXT');
+};
+
 const ensureProjectsForSessionPaths = (db: Database): void => {
   if (!tableExists(db, 'sessions')) {
     return;
@@ -473,6 +495,38 @@ const ensureProjectsForSessionPaths = (db: Database): void => {
     FROM sessions
     WHERE project_path IS NOT NULL AND trim(project_path) <> ''
     ON CONFLICT(project_path) DO NOTHING
+  `);
+};
+
+const enforceOneSessionSharePerCreator = (db: Database): void => {
+  // Early builds allowed more than one row for the same creator and session.
+  // Keep the newest unrevoked row (or otherwise the newest row) before adding
+  // the guard so upgrades invalidate stale tokens instead of failing boot.
+  db.exec(`
+    DELETE FROM session_share_links
+    WHERE EXISTS (
+      SELECT 1
+      FROM session_share_links AS newer
+      WHERE newer.session_id = session_share_links.session_id
+        AND newer.created_by_user_id = session_share_links.created_by_user_id
+        AND (
+          (newer.revoked_at IS NULL AND session_share_links.revoked_at IS NOT NULL)
+          OR (
+            (newer.revoked_at IS NULL) = (session_share_links.revoked_at IS NULL)
+            AND (
+              datetime(newer.created_at) > datetime(session_share_links.created_at)
+              OR (
+                datetime(newer.created_at) = datetime(session_share_links.created_at)
+                AND newer.id > session_share_links.id
+              )
+            )
+          )
+        )
+    )
+  `);
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_session_share_links_creator_session
+    ON session_share_links(session_id, created_by_user_id)
   `);
 };
 
@@ -519,13 +573,47 @@ export const runMigrations = (db: Database) => {
     addSessionModelColumn(db);
     addSessionEffortColumn(db);
     addForkedFromSessionIdColumn(db);
+    addSessionRuntimePathColumn(db);
     ensureProjectsForSessionPaths(db);
+    // Collaboration tables reference the final repaired sessions shape, so
+    // they must be created only after all session rebuilds and column adds.
+    db.exec(COLLABORATION_TABLES_SCHEMA_SQL);
+    // Identity columns were added after the first collaboration rollout. Keep
+    // upgrades additive so existing actors and receipts remain readable and
+    // are explicitly treated as legacy/unknown until re-bound.
+    addColumnToTableIfNotExists(db, 'collaboration_actors', getTableInfo(db, 'collaboration_actors').map((column) => column.name), 'person_id', 'TEXT');
+    addColumnToTableIfNotExists(db, 'collaboration_actors', getTableInfo(db, 'collaboration_actors').map((column) => column.name), 'identity_status', "TEXT NOT NULL DEFAULT 'legacy'");
+    // Keep the original stable subject only for a protected enrollment
+    // workflow. Existing rows remain NULL and therefore cannot be mistaken
+    // for a verified identity until the next OAuth login refreshes them.
+    addColumnToTableIfNotExists(db, 'collaboration_actors', getTableInfo(db, 'collaboration_actors').map((column) => column.name), 'external_subject', 'TEXT');
+    addColumnToTableIfNotExists(db, 'collaboration_actors', getTableInfo(db, 'collaboration_actors').map((column) => column.name), 'subject_scope', 'TEXT');
+    addColumnToTableIfNotExists(db, 'collaboration_actors', getTableInfo(db, 'collaboration_actors').map((column) => column.name), 'external_provider_key', 'TEXT');
+    addColumnToTableIfNotExists(db, 'execution_runs', getTableInfo(db, 'execution_runs').map((column) => column.name), 'person_id', 'TEXT');
+    addColumnToTableIfNotExists(db, 'execution_runs', getTableInfo(db, 'execution_runs').map((column) => column.name), 'identity_status', "TEXT NOT NULL DEFAULT 'legacy'");
+    addColumnToTableIfNotExists(db, 'execution_runs', getTableInfo(db, 'execution_runs').map((column) => column.name), 'git_identity_mode', "TEXT NOT NULL DEFAULT 'unknown'");
+    addColumnToTableIfNotExists(db, 'commit_receipts', getTableInfo(db, 'commit_receipts').map((column) => column.name), 'human_actor', 'TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_collaboration_actors_user_id ON collaboration_actors(user_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_session_actor_events_session_id ON session_actor_events(session_id, event_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_session_participants_session_id ON session_participants(session_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_execution_runs_session_id ON execution_runs(session_id, started_at)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_execution_runs_actor_id ON execution_runs(actor_id, started_at)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_commit_receipts_session_id ON commit_receipts(session_id, receipt_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_commit_receipts_sha ON commit_receipts(commit_sha)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_commit_receipts_task_id ON commit_receipts(task_id, receipt_id)');
+    db.exec(SESSION_WORKSPACES_TABLES_SCHEMA_SQL);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_session_workspaces_source_project ON session_workspaces(source_project_id, status)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_session_workspace_repositories_session ON session_workspace_repositories(session_id)');
+    db.exec(SESSION_SHARE_LINKS_TABLE_SCHEMA_SQL);
+    enforceOneSessionSharePerCreator(db);
     db.exec(SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL);
 
     db.exec('CREATE INDEX IF NOT EXISTS idx_session_ids_lookup ON sessions(session_id)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_provider_session_id ON sessions(provider_session_id)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_project_path ON sessions(project_path)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_session_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_session_share_links_session_id ON session_share_links(session_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_session_share_links_token_hash ON session_share_links(token_hash)');
     // The due-message poll runs on a timer; without this it table-scans.
     db.exec('CREATE INDEX IF NOT EXISTS idx_scheduled_messages_due ON scheduled_messages(status, scheduled_for)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_scheduled_messages_session ON scheduled_messages(session_id)');

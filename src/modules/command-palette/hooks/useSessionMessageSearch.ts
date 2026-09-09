@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-import { api } from '@/shared/api';
+import { api, consumeSseResponse } from '@/shared/api';
 import type { LLMProvider } from '@/shared/types';
 
 export type SessionMessageMatch = {
@@ -31,69 +31,87 @@ export function useSessionMessageSearch(
 ) {
   const [items, setItems] = useState<SessionMessageMatch[]>([]);
   const seqRef = useRef(0);
-  const esRef = useRef<EventSource | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const trimmed = query.trim();
+    searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
+    seqRef.current++;
+
     if (!enabled || !projectId || trimmed.length < MIN_QUERY) {
       setItems([]);
-      esRef.current?.close();
-      esRef.current = null;
       return;
     }
 
-    esRef.current?.close();
-    esRef.current = null;
-    seqRef.current++;
+    let activeController: AbortController | null = null;
 
     const handle = setTimeout(() => {
       const seq = ++seqRef.current;
-      const url = api.searchConversationsUrl(trimmed);
-      const es = new EventSource(url);
-      esRef.current = es;
+      const controller = new AbortController();
+      activeController = controller;
+      searchAbortRef.current = controller;
       const accumulated: SessionMessageMatch[] = [];
 
-      es.addEventListener('result', (evt) => {
-        if (seq !== seqRef.current) {
-          es.close();
-          return;
-        }
+      const runSearch = async () => {
         try {
-          const data = JSON.parse((evt as MessageEvent).data) as { projectResult: ProjectResult };
-          const pr = data.projectResult;
-          if (pr.projectId !== projectId) return;
-          for (const s of pr.sessions) {
-            accumulated.push({
-              sessionId: s.sessionId,
-              label: s.sessionSummary || s.sessionId,
-              snippet: s.matches[0]?.snippet ?? '',
-              provider: s.provider,
-            });
-          }
-          setItems([...accumulated]);
-        } catch {
-          // ignore malformed
-        }
-      });
+          const response = await api.searchConversations(trimmed, 50, {
+            signal: controller.signal,
+          });
+          await consumeSseResponse(response, ({ event, data }) => {
+            if (event !== 'result' || seq !== seqRef.current || controller.signal.aborted) {
+              return;
+            }
 
-      const finish = () => {
-        if (seq !== seqRef.current) return;
-        es.close();
-        esRef.current = null;
+            try {
+              const payload = JSON.parse(data) as { projectResult: ProjectResult };
+              const projectResult = payload.projectResult;
+              if (projectResult.projectId !== projectId) return;
+              for (const session of projectResult.sessions) {
+                accumulated.push({
+                  sessionId: session.sessionId,
+                  label: session.sessionSummary || session.sessionId,
+                  snippet: session.matches[0]?.snippet ?? '',
+                  provider: session.provider,
+                });
+              }
+              setItems([...accumulated]);
+            } catch {
+              // Ignore malformed
+            }
+          });
+        } catch (error) {
+          if (!controller.signal.aborted && seq === seqRef.current) {
+            // A failed search should leave any partial matches visible, just
+            // as the old EventSource error handler did.
+            console.error('[CommandPalette] Session message search failed:', error);
+          }
+        } finally {
+          if (searchAbortRef.current === controller) {
+            searchAbortRef.current = null;
+          }
+          if (activeController === controller) {
+            activeController = null;
+          }
+        }
       };
-      es.addEventListener('done', finish);
-      es.addEventListener('error', finish);
+
+      void runSearch();
     }, DEBOUNCE_MS);
 
     return () => {
       clearTimeout(handle);
+      activeController?.abort();
+      if (searchAbortRef.current === activeController) {
+        searchAbortRef.current = null;
+      }
     };
   }, [projectId, query, enabled]);
 
   useEffect(() => {
     return () => {
-      esRef.current?.close();
-      esRef.current = null;
+      searchAbortRef.current?.abort();
+      searchAbortRef.current = null;
     };
   }, []);
 

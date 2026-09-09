@@ -5,6 +5,7 @@ This module owns the server-side WebSocket gateway used by:
 1. Chat streaming (`/ws`)
 2. Interactive terminal sessions (`/shell`)
 3. Plugin WebSocket passthrough (`/plugin-ws/:pluginName`)
+4. Desktop notification registration (`/desktop-notifications`)
 
 It is intentionally structured as **small services** plus a **barrel export** in `index.ts`.
 
@@ -40,6 +41,7 @@ Benefits:
 | `services/plugin-websocket-proxy.service.ts` | Bridges client socket to plugin socket |
 | `services/websocket-writer.service.ts` | Adapts raw WebSocket to writer interface (`send`, `setSessionId`, `getSessionId`) for non-chat writer consumers |
 | `services/websocket-state.service.ts` | Holds shared chat client set and open-state constant |
+| `modules/notifications/websocket/desktop-notifications-websocket.service.ts` | Handles authenticated desktop-notification endpoint registration |
 
 ## High-Level Architecture
 
@@ -51,12 +53,14 @@ flowchart LR
   D -->|/ws| E[handleChatConnection]
   D -->|/shell| F[handleShellConnection]
   D -->|/plugin-ws/:name| G[handlePluginWsProxy]
+  D -->|/desktop-notifications| O[handleDesktopNotificationsConnection]
   D -->|other| H[close()]
 
   E --> I[connectedClients Set]
   E --> J[chatRunRegistry + ChatSessionWriter]
   F --> K[ptySessionsMap]
   G --> L[Upstream Plugin ws://127.0.0.1:port/ws]
+  O --> P[notification endpoint store]
 
   I --> M[projects.service loading_progress]
   I --> N[sessions-watcher.service session_upserted]
@@ -76,10 +80,10 @@ sequenceDiagram
 
   Client->>WSS: Upgrade Request
   WSS->>Auth: verifyClient(info)
-  alt Platform mode
+  alt Explicit legacy platform-auth policy
     Auth->>Auth: authenticateWebSocket(null)
     Auth->>Auth: attach request.user
-  else OSS mode
+  else Token-auth policy
     Auth->>Auth: read token from ?token or Authorization
     Auth->>Auth: authenticateWebSocket(token)
     Auth->>Auth: attach request.user
@@ -93,14 +97,67 @@ sequenceDiagram
     alt pathname == /ws
       Router->>Chat: handleChatConnection(ws, request, deps.chat)
     else pathname == /shell
-      Router->>Shell: handleShellConnection(ws, deps.shell)
+      Router->>Shell: handleShellConnection(ws, deps.shell, request)
     else pathname startsWith /plugin-ws/
       Router->>Proxy: handlePluginWsProxy(ws, pathname, getPluginPort)
+    else pathname == /desktop-notifications
+      Router->>Router: handleDesktopNotificationsConnection(ws, request, {deploymentPolicy})
     else unknown
       Router->>Router: ws.close()
     end
   end
 ```
+
+### Authentication and deployment-policy boundary
+
+The upgrade check authenticates the request and attaches `request.user`; it is
+not, by itself, proof that a managed DingTalk identity is verified. The
+composition root supplies the startup-resolved deployment policy and the
+managed-SSO flags to each route:
+
+| Route | Transport admission | Operation gate |
+|---|---|---|
+| `/ws` | A token is required unless the explicit legacy platform-auth policy is enabled. In managed SSO mode the principal must carry a DingTalk actor, but `pending`, `ambiguous`, and `configured` actors may still connect. | `chat.subscribe` and session/read frames remain available to those actors. `chat.send`, `chat.edit-send`, `chat.abort`, and `chat.permission-response` require a verified DingTalk actor when managed SSO is enabled, and still pass the deployment capability/provider checks. |
+| `/shell` | Authenticated upgrade plus a verified DingTalk actor in managed SSO mode. | Requires `terminal.interactive` before a PTY or message listener is installed. The product/QA read-only profile therefore closes the socket without creating a process. |
+| `/plugin-ws/:pluginName` | Authenticated upgrade. | Requires a verified DingTalk actor in managed SSO mode and `plugin.use` (or the legacy `plugin.write`) before proxying any frame upstream. |
+| `/desktop-notifications` | Authenticated upgrade with a numeric user id. | Device registration is a session-metadata write and is checked against `session.write`; product/QA may retain this personal notification registration while code/provider execution remains disabled. |
+
+Pending or ambiguous DingTalk actors are intentionally admitted only far enough
+to read the chat transport and finish enrollment. They must not be treated as
+verified by websocket clients or downstream services. A `1008` close or a
+`protocol_error`/`IDENTITY_ENROLLMENT_REQUIRED` frame is expected when an
+execution message reaches a verified-only boundary.
+
+Chat session subscriptions are deployment-wide realtime reads; the websocket
+layer does not turn a subscription into an ownership grant. Session/project
+ownership and any additional HTTP policy checks remain authoritative for the
+corresponding REST resources.
+
+The `product-qa-readonly` profile is an application-layer policy, not an OS
+filesystem sandbox. It denies shell/PTTY, plugin execution, and mutating chat
+operations before provider work starts. The deployment still needs a separate
+service account/container and read-only project mount for an OS-level boundary.
+
+### Provider and credential boundary in read-only deployments
+
+The websocket gateway does not start DeepSeek Harness (DSH) and does not expose
+provider credentials to the browser. If the deployment explicitly configures
+`COMIC_DATAVERSE_TOKEN_HELPER`, the server may invoke that operator-owned helper
+for a provider turn and keep its short-lived token in memory; this is an
+optional Dataverse bridge, not a DSH dependency or a client-controlled command.
+In the `product-qa-readonly` profile the helper is disabled by default. It is
+only executed when the deployment startup environment explicitly sets
+`CLOUDCLI_READONLY_ALLOW_DATAVERSE_HELPER=1`; request payloads and session
+options cannot enable it. Directly provisioned model credentials remain
+usable without executing the helper.
+
+For `product-qa-readonly`, Claude runs with plan mode and an explicit read-only
+tool allowlist; `WebFetch` and `WebSearch` are excluded and denied. The provider
+still needs network access to its configured model endpoint unless a local model
+is used, so a deployment that requires zero egress needs a container/firewall
+policy (and would also have to provide a local model). Codex uses a read-only
+sandbox with network disabled; Cursor and OpenCode are rejected until their
+adapters provide an equivalent server-enforced read-only contract.
 
 ## `/ws` Chat Flow
 

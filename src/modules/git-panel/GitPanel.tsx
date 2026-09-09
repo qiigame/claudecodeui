@@ -12,6 +12,8 @@ import GitPanelHeader from '@/modules/git-panel/GitPanelHeader';
 import GitRepositoryErrorState from '@/modules/git-panel/GitRepositoryErrorState';
 import GitViewTabs from '@/modules/git-panel/GitViewTabs';
 import ConfirmActionModal from '@/modules/git-panel/modals/ConfirmActionModal';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type GitPanelProps = {
   selectedProject: Project | null;
@@ -31,6 +33,12 @@ export default function GitPanel({
   onProjectSelect,
   onProjectsRefresh,
 }: GitPanelProps) {
+  const { authMode, user } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const uiReadOnly = isReadOnly || isManagedIdentityRestricted(authMode, user);
+  const canMutateGit = can('git.write') && !uiReadOnly;
+  const canFetchGit = can('git.fetch') && !uiReadOnly;
+  const canMutateWorktrees = can('worktree.mutate') && !uiReadOnly;
   const [activeView, setActiveView] = useState<GitPanelView>('changes');
   const [wrapText, setWrapText] = useState(true);
   const [hasExpandedFiles, setHasExpandedFiles] = useState(false);
@@ -78,12 +86,15 @@ export default function GitPanel({
     selectedProject,
     activeView,
     onFileOpen,
+    canMutateGit,
+    canFetchGit,
   });
 
   const { isRevertingLocalCommit, revertLatestLocalCommit } = useRevertLocalCommit({
     // `projectId` (DB primary key) is forwarded to the revert API which uses it
     // as the `project` body param.
     projectId: selectedProject?.projectId ?? null,
+    canMutate: canMutateGit,
     onSuccess: refreshAll,
   });
 
@@ -129,6 +140,8 @@ export default function GitPanel({
           isPushing={isPushing}
           isPublishing={isPublishing}
           isRevertingLocalCommit={isRevertingLocalCommit}
+          canMutateGit={canMutateGit}
+          canFetchGit={canFetchGit}
           operationError={operationError}
           onRefresh={refreshAll}
           onRevertLocalCommit={revertLatestLocalCommit}
@@ -147,7 +160,7 @@ export default function GitPanel({
         <GitRepositoryErrorState
           error={gitStatus.error}
           details={gitStatus.details}
-          canInitRepository={isMissingRepository}
+          canInitRepository={isMissingRepository && canMutateGit}
           isInitializingRepository={isInitializingRepository}
           initError={isMissingRepository ? operationError : null}
           onInitRepository={() => {
@@ -174,6 +187,7 @@ export default function GitPanel({
               isLoading={isLoading}
               wrapText={wrapText}
               isCreatingInitialCommit={isCreatingInitialCommit}
+              canMutateGit={canMutateGit}
               onWrapTextChange={setWrapText}
               onCreateInitialCommit={createInitialCommit}
               onOpenFile={openFile}
@@ -209,6 +223,7 @@ export default function GitPanel({
               localBranches={localBranches}
               onProjectSelect={onProjectSelect}
               onProjectsRefresh={onProjectsRefresh}
+              canMutateWorktrees={canMutateWorktrees}
             />
           )}
 
@@ -221,6 +236,7 @@ export default function GitPanel({
               remoteBranches={remoteBranches}
               remoteStatus={remoteStatus}
               isCreatingBranch={isCreatingBranch}
+              canMutateBranches={canMutateGit}
               onSwitchBranch={switchBranch}
               onCreateBranch={createBranch}
               onDeleteBranch={deleteBranch}

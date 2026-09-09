@@ -27,6 +27,10 @@ export type ProviderModelOption = {
 export type ProviderModelsDefinition = {
   OPTIONS: ProviderModelOption[];
   DEFAULT: string;
+  /** Reasoning effort inherited from the active provider configuration. */
+  DEFAULT_EFFORT?: string;
+  /** Service tier inherited from the active provider configuration. */
+  SERVICE_TIER?: string;
 };
 
 /** User-supplied fields for creating or editing a custom provider model entry. */
@@ -50,8 +54,67 @@ export type ProviderModelActions = {
 
 //----------------- PROJECTS AND SESSIONS ------------
 
+/** A trusted DingTalk or local account shown on shared session attribution. */
+export type CollaborationActorSummary = {
+  actorId: number;
+  userId: number;
+  displayName: string;
+  badge: string;
+  provider: string;
+  providerName: string;
+  personId?: string | null;
+  identityStatus?: 'verified' | 'configured' | 'pending' | 'ambiguous' | 'legacy';
+};
+
+/** Compact shared-workspace attribution returned with one sidebar session. */
+export type SessionAttributionSummary = {
+  createdBy: CollaborationActorSummary;
+  lastActor: CollaborationActorSummary;
+  participantCount: number;
+  lastAction: string;
+  updatedAt: string;
+};
+
 /** Identifies the workspace pane the user is looking at; plugin panes are namespaced by plugin id. */
-export type AppTab = 'chat' | 'files' | 'shell' | 'git' | 'tasks' | 'browser' | `plugin:${string}`;
+export type AppTab = 'chat' | 'guide' | 'files' | 'shell' | 'git' | 'tasks' | 'browser' | `plugin:${string}`;
+
+/** One fixed project-root documentation file returned by the Collaboration guide endpoint. */
+export type ProjectGuideDocument = {
+  name: string;
+  title: string;
+  content: string;
+  size: number;
+  updatedAt: string;
+};
+
+/** The project label and safe root documentation rendered in the workspace Guide tab. */
+export type ProjectGuidePayload = {
+  projectId: string;
+  projectName: string;
+  documents: ProjectGuideDocument[];
+};
+
+/** One public transcript row; tools, reasoning, attachments and internal identifiers are absent. */
+export type PublicShareMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+};
+
+/** Immutable public-safe session snapshot materialized when its share link is created. */
+export type PublicSessionSharePayload = {
+  expiresAt: string;
+  snapshot: {
+    version: 1;
+    title: string;
+    provider: LLMProvider;
+    projectName: string;
+    createdAt: string | null;
+    sharedAt: string;
+    messages: PublicShareMessage[];
+    isTruncated: boolean;
+  };
+};
 
 /** A message queued to be sent to a session at a future time. */
 export type ScheduledMessage = {
@@ -83,7 +146,46 @@ export type ProjectSession = {
   // Tags the session with the owning project's DB `projectId` so UI handlers
   // (session switching, sidebar focus, etc.) can match against selectedProject.
   __projectId?: string;
+  attribution?: SessionAttributionSummary;
+  workspace?: SessionWorkspaceSummary;
   [key: string]: unknown;
+};
+
+/** Repository choice offered before creating an isolated team session. */
+export type SessionWorkspaceRepositoryOption = {
+  key: string;
+  displayName: string;
+  relativePath: string;
+  baseBranch: string;
+  writable: boolean;
+  unavailableReason: string | null;
+};
+
+/** Server-owned plan for selecting repositories in a new session. */
+export type SessionWorkspacePlan = {
+  enabled: boolean;
+  requiresSelection: boolean;
+  defaultRepositoryKeys: string[];
+  repositories: SessionWorkspaceRepositoryOption[];
+};
+
+/** Exact branch and fetched base used by one repository worktree. */
+export type SessionWorkspaceRepository = {
+  repositoryKey: string;
+  sourcePath: string;
+  worktreePath: string;
+  branchName: string;
+  remoteName: string;
+  baseBranch: string;
+  baseSha: string;
+};
+
+/** Hidden execution project attached to one visible conversation. */
+export type SessionWorkspaceSummary = {
+  projectId: string;
+  path: string;
+  branchPrefix: string;
+  repositories: SessionWorkspaceRepository[];
 };
 
 /** Pagination metadata returned alongside a project's session page. */
@@ -220,6 +322,18 @@ export type QueueItemStatus = 'completed' | 'in_progress' | 'pending';
 // ---------------------------
 
 //----------------- AUTH ------------
+
+/** Public DingTalk organization option returned by the auth status endpoint. */
+export type DingTalkLoginProvider = {
+  key: string;
+  name: string;
+};
+
+/** Optional cancellation and ownership checks for authenticated user-data hydration. */
+export type UserDataHydrationOptions = {
+  signal?: AbortSignal;
+  isCurrent?: () => boolean;
+};
 
 
 // ---------------------------
@@ -373,6 +487,7 @@ export type SessionEstablishedContext = {
   provider: LLMProvider;
   project: Project;
   summary?: string | null;
+  workspace?: SessionWorkspaceSummary | null;
 };
 
 /** The result returned for a tool call, carrying its content, error flag, timestamp and any provider-specific extras that the tool renderers read. */
@@ -740,6 +855,8 @@ export type FileTreeNode = {
   modified?: string;
   permissionsRwx?: string;
   children?: FileTreeNode[];
+  /** Client-only marker shown while this directory's immediate children load. */
+  isLoadingChildren?: boolean;
   [key: string]: unknown;
 };
 
@@ -1267,6 +1384,12 @@ export type SidebarProjectListProps = {
   onStartEditingSession: (projectId: string, sessionId: string, initialName: string) => void;
   onCancelEditingSession: () => void;
   onSaveEditingSession: (projectName: string, sessionId: string, summary: string, provider: LLMProvider) => void;
+  /** Server-authorized project metadata mutation capability (create/rename/archive/star). */
+  canMutateProjects?: boolean;
+  /** Server-authorized session metadata mutation capability (rename/archive/fork). */
+  canWriteSessions?: boolean;
+  /** Server-authorized filesystem capability required by transcript forks and permanent deletion. */
+  canWriteSessionFiles?: boolean;
   t: TFunction;
 };
 

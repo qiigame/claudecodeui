@@ -23,6 +23,8 @@ type WorktreesViewProps = {
   localBranches: string[];
   onProjectSelect?: (project: Project) => void;
   onProjectsRefresh?: () => void;
+  /** Enables create/open/merge/remove worktree controls. */
+  canMutateWorktrees?: boolean;
 };
 
 /** Shortens an absolute worktree path to "container/folder" for display. */
@@ -42,9 +44,10 @@ type WorktreeRowProps = {
   onOpen: () => void;
   onMerge: () => void;
   onRemove: () => void;
+  canMutate: boolean;
 };
 
-function WorktreeRow({ worktree, isMobile, isBusy, onOpen, onMerge, onRemove }: WorktreeRowProps) {
+function WorktreeRow({ worktree, isMobile, isBusy, onOpen, onMerge, onRemove, canMutate }: WorktreeRowProps) {
   const branchLabel = worktree.branch
     ?? (worktree.headSha ? `detached @ ${worktree.headSha.slice(0, 7)}` : 'detached');
 
@@ -115,7 +118,7 @@ function WorktreeRow({ worktree, isMobile, isBusy, onOpen, onMerge, onRemove }: 
           <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
         ) : worktree.isCurrent ? (
           <Check className="h-4 w-4 text-primary" />
-        ) : (
+        ) : canMutate ? (
           <>
             <button
               onClick={onOpen}
@@ -149,7 +152,7 @@ function WorktreeRow({ worktree, isMobile, isBusy, onOpen, onMerge, onRemove }: 
               </>
             )}
           </>
-        )}
+        ) : null}
       </div>
     </div>
   );
@@ -166,6 +169,7 @@ export default function WorktreesView({
   localBranches,
   onProjectSelect,
   onProjectsRefresh,
+  canMutateWorktrees = false,
 }: WorktreesViewProps) {
   const {
     worktreeData,
@@ -213,14 +217,16 @@ export default function WorktreesView({
           >
             <RefreshCw className={`h-3.5 w-3.5 ${isLoading ? 'animate-spin' : ''}`} />
           </button>
-          <button
-            onClick={() => setShowNewWorktreeModal(true)}
-            disabled={!worktreeData}
-            className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            New worktree
-          </button>
+          {canMutateWorktrees && (
+            <button
+              onClick={() => setShowNewWorktreeModal(true)}
+              disabled={!worktreeData}
+              className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              New worktree
+            </button>
+          )}
         </div>
       </div>
 
@@ -249,6 +255,7 @@ export default function WorktreesView({
             onOpen={() => void openWorktree(worktree.path)}
             onMerge={() => setMergeTarget(worktree)}
             onRemove={() => setRemoveTarget(worktree)}
+            canMutate={canMutateWorktrees}
           />
         ))}
 
@@ -263,20 +270,22 @@ export default function WorktreesView({
                 sessions side by side and merge the results back when they're ready.
               </p>
             </div>
-            <button
-              onClick={() => setShowNewWorktreeModal(true)}
-              disabled={!worktreeData}
-              className="flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              Create your first worktree
-            </button>
+            {canMutateWorktrees && (
+              <button
+                onClick={() => setShowNewWorktreeModal(true)}
+                disabled={!worktreeData}
+                className="flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Create your first worktree
+              </button>
+            )}
           </div>
         )}
       </div>
 
       <NewWorktreeModal
-        isOpen={showNewWorktreeModal}
+        isOpen={canMutateWorktrees && showNewWorktreeModal}
         baseBranch={worktreeData?.baseBranch ?? null}
         localBranches={localBranches}
         repositoryRoot={worktreeData?.repositoryRoot ?? ''}
@@ -286,7 +295,7 @@ export default function WorktreesView({
       />
 
       <MergeWorktreeModal
-        worktree={mergeTarget}
+        worktree={canMutateWorktrees ? mergeTarget : null}
         baseBranch={worktreeData?.baseBranch ?? null}
         isMerging={mergeTarget !== null && busyWorktreePath === mergeTarget.path}
         onClose={() => setMergeTarget(null)}
@@ -294,7 +303,7 @@ export default function WorktreesView({
       />
 
       <RemoveWorktreeModal
-        worktree={removeTarget}
+        worktree={canMutateWorktrees ? removeTarget : null}
         isRemoving={removeTarget !== null && busyWorktreePath === removeTarget.path}
         onClose={() => setRemoveTarget(null)}
         onRemove={removeWorktree}

@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 type TaskHelpModalProps = {
   isOpen: boolean;
   onClose: () => void;
+  canMutate?: boolean;
   onCreatePrd: () => void;
 };
 
@@ -15,7 +16,7 @@ type HelpStep = {
 };
 
 /** Rendered by TaskBoard to walk through the PRD-to-tasks workflow. */
-export default function TaskHelpModal({ isOpen, onClose, onCreatePrd }: TaskHelpModalProps) {
+export default function TaskHelpModal({ isOpen, onClose, canMutate = false, onCreatePrd }: TaskHelpModalProps) {
   const { t } = useTranslation('tasks');
 
   if (!isOpen) {
@@ -83,7 +84,7 @@ export default function TaskHelpModal({ isOpen, onClose, onCreatePrd }: TaskHelp
                   <h4 className="mb-2 font-medium text-gray-900 dark:text-white">{step.title}</h4>
                   <p className="text-sm text-gray-700 dark:text-gray-300">{step.description}</p>
 
-                  {step.index === 1 && (
+                  {step.index === 1 && canMutate && (
                     <button
                       onClick={() => {
                         onCreatePrd();

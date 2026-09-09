@@ -6,6 +6,8 @@ import type { ScheduledMessage } from '@/shared/types';
 type ScheduledMessageListProps = {
   scheduledMessages: ScheduledMessage[];
   onCancel: (id: string) => void;
+  /** Hide cancellation controls when scheduling is read-only/disabled. */
+  canCancel?: boolean;
 };
 
 /**
@@ -15,7 +17,7 @@ type ScheduledMessageListProps = {
  * Failed ones are shown too: a message that did not go is exactly the thing a
  * user needs to know about, and the server records why.
  */
-export function ScheduledMessageList({ scheduledMessages, onCancel }: ScheduledMessageListProps) {
+export function ScheduledMessageList({ scheduledMessages, onCancel, canCancel = false }: ScheduledMessageListProps) {
   const { t } = useTranslation('chat');
   const visible = scheduledMessages.filter(
     (message) => message.status === 'pending' || message.status === 'failed',
@@ -52,7 +54,7 @@ export function ScheduledMessageList({ scheduledMessages, onCancel }: ScheduledM
               </p>
               <p className="mt-0.5 truncate text-foreground">{message.content}</p>
             </div>
-            {!isFailed && (
+            {!isFailed && canCancel && (
               <button
                 type="button"
                 onClick={() => onCancel(message.id)}

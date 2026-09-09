@@ -27,7 +27,7 @@ export const projectsDb = {
             ON CONFLICT(project_path) DO UPDATE SET
             isArchived = 0
             WHERE projects.isArchived = 1
-            RETURNING project_id, project_path, custom_project_name, isStarred, isArchived
+            RETURNING project_id, project_path, custom_project_name, isStarred, isArchived, isSessionWorkspace
         `).get(attemptedId, normalizedProjectPath, normalizedProjectName) as ProjectRepositoryRow | undefined;
 
         if (row) {
@@ -48,7 +48,7 @@ export const projectsDb = {
         const db = getConnection();
         const normalizedProjectPath = normalizeProjectPath(projectPath);
         const row = db.prepare(`
-            SELECT project_id, project_path, custom_project_name, isStarred, isArchived
+            SELECT project_id, project_path, custom_project_name, isStarred, isArchived, isSessionWorkspace
             FROM projects
             WHERE project_path = ?
         `).get(normalizedProjectPath) as ProjectRepositoryRow | undefined;
@@ -59,7 +59,7 @@ export const projectsDb = {
     getProjectById(projectId: string): ProjectRepositoryRow | null {
         const db = getConnection();
         const row = db.prepare(`
-            SELECT project_id, project_path, custom_project_name, isStarred, isArchived
+            SELECT project_id, project_path, custom_project_name, isStarred, isArchived, isSessionWorkspace
             FROM projects
             WHERE project_id = ?
         `).get(projectId) as ProjectRepositoryRow | undefined;
@@ -89,9 +89,9 @@ export const projectsDb = {
     getProjectPaths(): ProjectRepositoryRow[] {
         const db = getConnection();
         return db.prepare(`
-            SELECT project_id, project_path, custom_project_name, isStarred, isArchived
+            SELECT project_id, project_path, custom_project_name, isStarred, isArchived, isSessionWorkspace
             FROM projects
-            WHERE isArchived = 0
+            WHERE isArchived = 0 AND isSessionWorkspace = 0
         `).all() as ProjectRepositoryRow[];
     },
 
@@ -102,9 +102,9 @@ export const projectsDb = {
     getArchivedProjectPaths(): ProjectRepositoryRow[] {
         const db = getConnection();
         return db.prepare(`
-            SELECT project_id, project_path, custom_project_name, isStarred, isArchived
+            SELECT project_id, project_path, custom_project_name, isStarred, isArchived, isSessionWorkspace
             FROM projects
-            WHERE isArchived = 1
+            WHERE isArchived = 1 AND isSessionWorkspace = 0
         `).all() as ProjectRepositoryRow[];
     },
 
@@ -118,6 +118,35 @@ export const projectsDb = {
         `).get(normalizedProjectPath) as Pick<ProjectRepositoryRow, 'custom_project_name'> | undefined;
 
         return row?.custom_project_name ?? null;
+    },
+
+    /**
+     * Creates the hidden project record used by file-tree and Git APIs for one
+     * isolated session runtime. Hidden rows never appear as sidebar projects.
+     */
+    createSessionWorkspacePath(
+        projectPath: string,
+        customProjectName: string,
+    ): ProjectRepositoryRow {
+        const db = getConnection();
+        const normalizedProjectPath = normalizeProjectPath(projectPath);
+        const row = db.prepare(`
+            INSERT INTO projects (
+                project_id,
+                project_path,
+                custom_project_name,
+                isStarred,
+                isArchived,
+                isSessionWorkspace
+            ) VALUES (?, ?, ?, 0, 0, 1)
+            ON CONFLICT(project_path) DO UPDATE SET
+                custom_project_name = excluded.custom_project_name,
+                isArchived = 0,
+                isSessionWorkspace = 1
+            RETURNING project_id, project_path, custom_project_name, isStarred, isArchived, isSessionWorkspace
+        `).get(randomUUID(), normalizedProjectPath, customProjectName) as ProjectRepositoryRow;
+
+        return row;
     },
 
     updateCustomProjectName(projectPath: string, customProjectName: string | null): void {

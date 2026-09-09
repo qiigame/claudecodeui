@@ -470,6 +470,37 @@ const seedOpenCodeSession = async (
   }
 };
 
+test('OpenCode synchronizer does not borrow another provider app row on native-id collision', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-collision-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const sharedId = 'shared-native-id';
+    await seedOpenCodeSession(tempRoot, workspacePath, {
+      sessionId: sharedId,
+      title: 'OpenCode generated title',
+      firstUserText: 'Collision should not be indexed',
+    });
+
+    await withIsolatedDatabase(async () => {
+      // The OpenCode native id is already occupied as another provider's app
+      // id. Returning null avoids borrowing its title or silently no-op'ing
+      // the provider-guarded sessions upsert.
+      sessionsDb.createAppSession(sharedId, 'claude', workspacePath, 'Claude owner');
+
+      const processed = await new OpenCodeSessionSynchronizer().synchronize();
+
+      assert.equal(processed, 0);
+      assert.equal(sessionsDb.getSessionById(sharedId)?.provider, 'claude');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('OpenCode synchronizer preserves the title assigned when CloudCLI creates a session', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-session-sync-app-'));
   const workspacePath = path.join(tempRoot, 'workspace');

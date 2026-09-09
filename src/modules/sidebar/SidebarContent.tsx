@@ -122,7 +122,6 @@ type SidebarContentProps = {
   restartRequired: boolean;
   releaseInfo: ReleaseInfo | null;
   latestVersion: string | null;
-  currentVersion: string;
   onShowVersionModal: () => void;
   onShowSettings: () => void;
   projectListProps: SidebarProjectListProps;
@@ -169,7 +168,6 @@ export default function SidebarContent({
   restartRequired,
   releaseInfo,
   latestVersion,
-  currentVersion,
   onShowVersionModal,
   onShowSettings,
   projectListProps,
@@ -183,6 +181,9 @@ export default function SidebarContent({
   const groupedArchivedSessions = groupArchivedSessionsByProject(archivedSessions);
   const visibleArchivedItemsCount = archivedProjects.length + archivedSessions.length;
   const isRenamingOnMobile = isMobile && projectListProps.activeRename !== null;
+  const canMutateProjects = projectListProps.canMutateProjects === true;
+  const canWriteSessions = projectListProps.canWriteSessions === true;
+  const canWriteSessionFiles = projectListProps.canWriteSessionFiles === true;
 
   return (
     <div
@@ -523,7 +524,7 @@ export default function SidebarContent({
                           {project.fullPath}
                         </p>
                       </div>
-                      <button
+                      {canMutateProjects && <button
                         className="flex h-7 flex-shrink-0 items-center gap-1.5 rounded-lg border border-emerald-600/15 bg-emerald-500/10 px-2 text-[10px] font-medium text-emerald-700 transition-all hover:border-emerald-600/25 hover:bg-emerald-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 dark:text-emerald-300"
                         onClick={() => onRestoreArchivedProject(project.projectId)}
                         title={t('archived.restoreProject', 'Restore workspace')}
@@ -531,7 +532,7 @@ export default function SidebarContent({
                       >
                         <RotateCcw className="h-3 w-3" />
                         {t('archived.restoreAction', 'Restore')}
-                      </button>
+                      </button>}
                     </div>
                     {projectSessions.length > 0 && (
                       <div className="border-t border-border/45 bg-muted/[0.08]">
@@ -655,22 +656,24 @@ export default function SidebarContent({
                           </div>
                         </button>
                         <div className="flex flex-shrink-0 items-center gap-0.5">
-                          <button
-                            className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-emerald-500/10 hover:text-emerald-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 dark:hover:text-emerald-300"
-                            onClick={() => onRestoreArchivedSession(session.sessionId)}
-                            title={t('archived.restore', 'Restore session')}
-                            aria-label={`${t('archived.restore', 'Restore session')}: ${session.sessionTitle}`}
-                          >
-                            <RotateCcw className="h-3.5 w-3.5" />
-                          </button>
-                          <button
+                          {canWriteSessions && (
+                            <button
+                              className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-emerald-500/10 hover:text-emerald-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 dark:hover:text-emerald-300"
+                              onClick={() => onRestoreArchivedSession(session.sessionId)}
+                              title={t('archived.restore', 'Restore session')}
+                              aria-label={`${t('archived.restore', 'Restore session')}: ${session.sessionTitle}`}
+                            >
+                              <RotateCcw className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                          {canWriteSessionFiles && <button
                             className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground/60 transition-colors hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/40"
                             onClick={() => onDeleteArchivedSession(session)}
                             title={t('archived.deletePermanently', 'Delete permanently')}
                             aria-label={`${t('archived.deletePermanently', 'Delete permanently')}: ${session.sessionTitle}`}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
-                          </button>
+                          </button>}
                         </div>
                       </div>
                     ))}
@@ -690,7 +693,6 @@ export default function SidebarContent({
           restartRequired={restartRequired}
           releaseInfo={releaseInfo}
           latestVersion={latestVersion}
-          currentVersion={currentVersion}
           onShowVersionModal={onShowVersionModal}
           onShowSettings={onShowSettings}
           t={t}

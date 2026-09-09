@@ -6,6 +6,8 @@ import { useProjectPrdFiles } from '@/modules/task-master/hooks/useProjectPrdFil
 import type { PrdFile, TaskMasterTask, TaskSelection } from '@/shared/types';
 import TaskBoard from '@/modules/task-master/TaskBoard';
 import TaskDetailModal from '@/modules/task-master/modals/TaskDetailModal';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type TaskMasterPanelProps = {
   isVisible: boolean;
@@ -16,6 +18,11 @@ const PRD_SAVE_MESSAGE = 'PRD saved successfully!';
 /** Exported through the task-master barrel; the project-workspace module renders it as the workspace's Tasks tab. */
 export default function TaskMasterPanel({ isVisible }: TaskMasterPanelProps) {
   const { tasks, currentProject, refreshTasks } = useTaskMaster();
+  const { authMode, user } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const canMutateTasks = can('project.mutate')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
 
   const [selectedTask, setSelectedTask] = useState<TaskMasterTask | null>(null);
   const [isTaskDetailOpen, setIsTaskDetailOpen] = useState(false);
@@ -104,6 +111,7 @@ export default function TaskMasterPanel({ isVisible }: TaskMasterPanelProps) {
       <TaskDetailModal
         task={selectedTask}
         isOpen={isTaskDetailOpen}
+        canMutate={canMutateTasks}
         onClose={() => {
           setIsTaskDetailOpen(false);
           setSelectedTask(null);
@@ -128,6 +136,7 @@ export default function TaskMasterPanel({ isVisible }: TaskMasterPanelProps) {
             content: selectedPrd?.content || '',
             isExisting: selectedPrd?.isExisting,
           }}
+          readOnly={!canMutateTasks}
           onSave={async () => {
             setIsPrdEditorOpen(false);
             setSelectedPrd(null);

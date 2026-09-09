@@ -4,6 +4,10 @@ import { useTheme } from '@/shared/context/ThemeContext';
 import { api } from '@/shared/api';
 import { usePlugins } from '@/modules/plugins/context/PluginsContext';
 import type { Project, ProjectSession } from '@/shared/types';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+
+import { isProductQaReadOnlyPlugin } from './pluginAccess';
 
 type PluginTabContentProps = {
   pluginName: string;
@@ -51,14 +55,19 @@ export default function PluginTabContent({
   const containerRef = useRef<HTMLDivElement>(null);
   const { isDarkMode } = useTheme();
   const { plugins } = usePlugins();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const { authMode, user } = useAuth();
+  const plugin = plugins.find(p => p.name === pluginName);
+  const canUsePlugin = (can('plugin.read') && isProductQaReadOnlyPlugin(plugin))
+    || (can('plugin.use')
+      && !isReadOnly
+      && !isManagedIdentityRestricted(authMode, user));
 
   // Stable refs so effects don't need context values in their dep arrays
   const contextRef = useRef<PluginContext>(buildContext(isDarkMode, selectedProject, selectedSession));
   const contextCallbacksRef = useRef<Set<(ctx: PluginContext) => void>>(new Set());
 
   const moduleRef = useRef<any>(null);
-
-  const plugin = plugins.find(p => p.name === pluginName);
 
   // Keep contextRef current and notify the mounted plugin on every context change
   useEffect(() => {
@@ -71,7 +80,10 @@ export default function PluginTabContent({
   }, [isDarkMode, selectedProject, selectedSession]);
 
   useEffect(() => {
-    if (!containerRef.current || !plugin?.enabled) return;
+    // Generic bundles require plugin.use. The operator-installed coordination
+    // mirror is the sole product/QA exception and its server RPC is separately
+    // constrained to three GET-only paths by the backend.
+    if (!canUsePlugin || !containerRef.current || !plugin?.enabled) return;
 
     let active = true;
     const container = containerRef.current;
@@ -134,7 +146,19 @@ export default function PluginTabContent({
       contextCallbacks.clear();
       moduleRef.current = null;
     };
-  }, [pluginName, plugin?.entry, plugin?.enabled]); // re-mount when plugin or enabled state changes
+  }, [canUsePlugin, pluginName, plugin?.entry, plugin?.enabled]); // re-mount when policy or plugin state changes
+
+  if (!canUsePlugin) {
+    return (
+      <div
+        ref={containerRef}
+        className="flex h-full w-full items-center justify-center p-6 text-sm text-muted-foreground"
+        data-plugin-execution-disabled="true"
+      >
+        Plugin execution is disabled for this deployment.
+      </div>
+    );
+  }
 
   return <div ref={containerRef} className="h-full w-full overflow-auto" />;
 }

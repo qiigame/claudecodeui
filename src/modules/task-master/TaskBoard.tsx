@@ -11,6 +11,8 @@ import TaskEmptyState from '@/modules/task-master/TaskEmptyState';
 import CreateTaskModal from '@/modules/task-master/modals/CreateTaskModal';
 import TaskHelpModal from '@/modules/task-master/modals/TaskHelpModal';
 import TaskMasterSetupModal from '@/modules/task-master/modals/TaskMasterSetupModal';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type TaskBoardProps = {
   tasks?: TaskMasterTask[];
@@ -39,6 +41,11 @@ export default function TaskBoard({
   onRefreshPRDs = null,
 }: TaskBoardProps) {
   const { projectTaskMaster, refreshTasks, setCurrentProject } = useTaskMaster();
+  const { authMode, user } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const canMutateTasks = can('project.mutate')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showHelpModal, setShowHelpModal] = useState(false);
@@ -113,9 +120,14 @@ export default function TaskBoard({
         <TaskEmptyState
           className={className}
           hasTaskMasterDirectory={hasTaskMasterDirectory}
+          canMutate={canMutateTasks}
           existingPrds={existingPRDs}
-          onOpenSetupModal={() => setShowSetupModal(true)}
-          onCreatePrd={() => onShowPRDEditor?.()}
+          onOpenSetupModal={() => {
+            if (canMutateTasks) setShowSetupModal(true);
+          }}
+          onCreatePrd={() => {
+            if (canMutateTasks) onShowPRDEditor?.();
+          }}
           onOpenPrd={(prd) => {
             void loadPrdAndOpenEditor(prd);
           }}
@@ -124,6 +136,7 @@ export default function TaskBoard({
         <TaskMasterSetupModal
           isOpen={showSetupModal}
           project={currentProject}
+          canMutate={canMutateTasks}
           onClose={() => setShowSetupModal(false)}
           onAfterClose={refreshAfterSetup}
         />
@@ -136,6 +149,7 @@ export default function TaskBoard({
       <TaskBoardToolbar
         hasProject={Boolean(currentProject)}
         hasTaskMasterConfigured={hasTaskMasterDirectory}
+        canMutate={canMutateTasks}
         totalTaskCount={tasks.length}
         filteredTaskCount={filteredTasks.length}
         searchTerm={searchTerm}
@@ -159,12 +173,16 @@ export default function TaskBoard({
         priorities={priorities}
         onClearFilters={clearFilters}
         existingPrds={existingPRDs}
-        onCreatePrd={() => onShowPRDEditor?.()}
+        onCreatePrd={() => {
+          if (canMutateTasks) onShowPRDEditor?.();
+        }}
         onOpenPrd={(prd) => {
           void loadPrdAndOpenEditor(prd);
         }}
         onOpenHelp={() => setShowHelpModal(true)}
-        onOpenCreateTask={() => setShowCreateModal(true)}
+        onOpenCreateTask={() => {
+          if (canMutateTasks) setShowCreateModal(true);
+        }}
       />
 
       <TaskBoardContent
@@ -177,7 +195,7 @@ export default function TaskBoard({
       />
 
       <CreateTaskModal
-        isOpen={showCreateModal}
+        isOpen={canMutateTasks && showCreateModal}
         onClose={() => {
           setShowCreateModal(false);
           onTaskCreated?.();
@@ -187,12 +205,16 @@ export default function TaskBoard({
       <TaskHelpModal
         isOpen={showHelpModal}
         onClose={() => setShowHelpModal(false)}
-        onCreatePrd={() => onShowPRDEditor?.()}
+        canMutate={canMutateTasks}
+        onCreatePrd={() => {
+          if (canMutateTasks) onShowPRDEditor?.();
+        }}
       />
 
       <TaskMasterSetupModal
         isOpen={showSetupModal}
         project={currentProject}
+        canMutate={canMutateTasks}
         onClose={() => setShowSetupModal(false)}
         onAfterClose={refreshAfterSetup}
       />

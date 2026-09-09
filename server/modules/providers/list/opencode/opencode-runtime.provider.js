@@ -9,7 +9,13 @@ import {
   normalizeAttachmentDescriptors
 } from '@/shared/image-attachments.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
-import { createCompleteMessage, createNormalizedMessage, flattenPromptForWindowsShell, getOpenCodeDatabasePath } from '@/shared/utils.js';
+import {
+  createCompleteMessage,
+  createNormalizedMessage,
+  filterProviderEnvironmentForReadOnly,
+  flattenPromptForWindowsShell,
+  getOpenCodeDatabasePath,
+} from '@/shared/utils.js';
 
 // cross-spawn resolves .cmd shims/PATHEXT on Windows and delegates to
 // child_process.spawn everywhere else.
@@ -124,6 +130,18 @@ function readOpenCodeTokenUsage(sessionId) {
 }
 
 async function spawnOpenCode(command, options = {}, ws, context) {
+  // OpenCode has no server-enforced read-only tool/sandbox contract.  The
+  // Chat gateway rejects it for product/QA deployments, but this runtime is
+  // also reachable from legacy/internal callers; fail closed before the
+  // Promise executor can resolve models or spawn a child process.
+  if (options?.deploymentReadOnly === true) {
+    const error = new Error(
+      'Provider "opencode" does not expose a safe read-only runtime in this deployment.',
+    );
+    error.code = 'PROVIDER_READ_ONLY_UNSUPPORTED';
+    return Promise.reject(error);
+  }
+
   return new Promise((resolve, reject) => {
     const {
       sessionId,
@@ -281,16 +299,26 @@ async function spawnOpenCode(command, options = {}, ws, context) {
         // opencode is a .cmd shim on Windows, so the whole argument must be
         // newline-free or cmd.exe silently truncates it at the first newline.
         const promptWithAttachments = appendFilesInputTag(
-          appendImagesInputTag(command?.trim() || '', images),
-          files
+          appendImagesInputTag(command?.trim() || '', images, workingDir),
+          files,
+          workingDir,
         );
         args.push(flattenPromptForWindowsShell(promptWithAttachments));
       }
 
+      const opencodeEnvironment = {
+        ...process.env,
+        ...permissionOptions.env,
+        ...(options.executionEnvironment && typeof options.executionEnvironment === 'object'
+          ? options.executionEnvironment
+          : {}),
+      };
       opencodeProcess = spawnFunction('opencode', args, {
         cwd: workingDir,
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, ...permissionOptions.env },
+        env: options.deploymentReadOnly === true
+          ? filterProviderEnvironmentForReadOnly(opencodeEnvironment)
+          : opencodeEnvironment,
       });
 
       activeOpenCodeProcesses.set(processKey, opencodeProcess);

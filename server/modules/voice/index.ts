@@ -1,2 +1,3 @@
-// voiceRoutes: used by the server entrypoint to mount authenticated STT/TTS endpoints.
-export { voiceRoutes } from './voice.module.js';
+// voiceRoutes: used by standalone consumers/tests to mount authenticated STT/TTS endpoints.
+// createVoiceModule: used by the server composition root to inject deployment capability guards.
+export { createVoiceModule, voiceRoutes } from './voice.module.js';

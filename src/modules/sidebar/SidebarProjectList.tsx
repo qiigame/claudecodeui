@@ -44,6 +44,9 @@ export default function SidebarProjectList({
   onStartEditingSession,
   onCancelEditingSession,
   onSaveEditingSession,
+  canMutateProjects = false,
+  canWriteSessions = false,
+  canWriteSessionFiles = false,
   t,
 }: SidebarProjectListProps) {
   const pageTitle = getPageTitle(selectedProject, selectedSession);
@@ -119,6 +122,9 @@ export default function SidebarProjectList({
                 onStartEditingSession={onStartEditingSession}
                 onCancelEditingSession={onCancelEditingSession}
                 onSaveEditingSession={onSaveEditingSession}
+                canMutateProjects={canMutateProjects}
+                canWriteSessions={canWriteSessions}
+                canWriteSessionFiles={canWriteSessionFiles}
                 t={t}
               />
             );

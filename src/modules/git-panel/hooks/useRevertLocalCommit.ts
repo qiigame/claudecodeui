@@ -7,6 +7,8 @@ type UseRevertLocalCommitOptions = {
   // DB primary key for the project; forwarded to the git API via the
   // `project` body param.
   projectId: string | null;
+  /** Server-authorized Git mutation capability. */
+  canMutate?: boolean;
   onSuccess?: () => void;
 };
 
@@ -14,11 +16,14 @@ async function readJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function useRevertLocalCommit({ projectId, onSuccess }: UseRevertLocalCommitOptions) {
+export function useRevertLocalCommit({ projectId, canMutate = false, onSuccess }: UseRevertLocalCommitOptions) {
   const [isRevertingLocalCommit, setIsRevertingLocalCommit] = useState(false);
 
   const revertLatestLocalCommit = useCallback(async () => {
-    if (!projectId) {
+    // Keep the capability check in the hook so a stale confirmation callback
+    // cannot issue a destructive Git request after the deployment policy
+    // changes to read-only.
+    if (!canMutate || !projectId) {
       return;
     }
 
@@ -38,7 +43,7 @@ export function useRevertLocalCommit({ projectId, onSuccess }: UseRevertLocalCom
     } finally {
       setIsRevertingLocalCommit(false);
     }
-  }, [onSuccess, projectId]);
+  }, [canMutate, onSuccess, projectId]);
 
   return {
     isRevertingLocalCommit,

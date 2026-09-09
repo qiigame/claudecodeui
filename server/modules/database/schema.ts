@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS projects (
     project_path TEXT NOT NULL UNIQUE,
     custom_project_name TEXT DEFAULT NULL,
     isStarred BOOLEAN DEFAULT 0,
-    isArchived BOOLEAN DEFAULT 0
+    isArchived BOOLEAN DEFAULT 0,
+    isSessionWorkspace BOOLEAN DEFAULT 0
 );
 `;
 
@@ -142,6 +143,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- normally. Informational only: a fork is a fully independent provider
     -- session, and deleting the source does not affect it.
     forked_from_session_id TEXT,
+    -- The isolated filesystem root used by provider and terminal runtimes.
+    -- project_path remains the stable sidebar/project owner.
+    runtime_path TEXT,
     isArchived BOOLEAN DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -149,6 +153,174 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (project_path) REFERENCES projects(project_path)
     ON DELETE SET NULL
     ON UPDATE CASCADE
+);
+`;
+
+/**
+ * Isolated session workspaces and their exact Git worktree provenance.
+ *
+ * A session keeps its original project_path for grouping while runtime_path
+ * points at the hidden workspace project. Repository rows bind every linked
+ * worktree to the fetched remote commit it started from.
+ */
+export const SESSION_WORKSPACES_TABLES_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS session_workspaces (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    source_project_id TEXT NOT NULL,
+    source_project_path TEXT NOT NULL,
+    workspace_project_id TEXT NOT NULL UNIQUE,
+    workspace_path TEXT NOT NULL UNIQUE,
+    branch_prefix TEXT NOT NULL,
+    created_by_user_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (source_project_id) REFERENCES projects(project_id),
+    FOREIGN KEY (workspace_project_id) REFERENCES projects(project_id),
+    FOREIGN KEY (created_by_user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS session_workspace_repositories (
+    session_id TEXT NOT NULL,
+    repository_key TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    worktree_path TEXT NOT NULL UNIQUE,
+    branch_name TEXT NOT NULL,
+    remote_name TEXT NOT NULL,
+    base_branch TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session_id, repository_key),
+    FOREIGN KEY (session_id) REFERENCES session_workspaces(session_id) ON DELETE CASCADE
+);
+`;
+
+/**
+ * DingTalk identities and per-session collaboration attribution.
+ *
+ * Projects and sessions intentionally remain global in this shared-workspace
+ * deployment. These side tables answer who created or last acted on a session
+ * without changing provider-owned session persistence or introducing ACLs.
+ */
+export const COLLABORATION_TABLES_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS collaboration_actors (
+    actor_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL UNIQUE,
+    provider TEXT NOT NULL,
+    provider_key TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    subject_hash TEXT NOT NULL,
+    -- The raw DingTalk stable subject is retained only for administrator-only
+    -- enrollment support. It is never returned in ordinary actor summaries or
+    -- written to reports/logs; subject_hash remains the lookup key.
+    external_subject TEXT,
+    subject_scope TEXT,
+    external_provider_key TEXT,
+    display_name TEXT NOT NULL,
+    badge TEXT NOT NULL,
+    git_email TEXT,
+    person_id TEXT,
+    identity_status TEXT NOT NULL DEFAULT 'legacy',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_login_at DATETIME,
+    UNIQUE(provider, provider_key, subject_hash),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_actor_state (
+    session_id TEXT PRIMARY KEY,
+    created_by_actor_id INTEGER NOT NULL,
+    last_actor_id INTEGER NOT NULL,
+    last_action TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by_actor_id) REFERENCES collaboration_actors(actor_id),
+    FOREIGN KEY (last_actor_id) REFERENCES collaboration_actors(actor_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_participants (
+    session_id TEXT NOT NULL,
+    actor_id INTEGER NOT NULL,
+    first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    action_count INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (session_id, actor_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (actor_id) REFERENCES collaboration_actors(actor_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_actor_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    actor_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (actor_id) REFERENCES collaboration_actors(actor_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS execution_runs (
+    run_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    actor_id INTEGER NOT NULL,
+    person_id TEXT,
+    identity_status TEXT NOT NULL DEFAULT 'legacy',
+    provider TEXT NOT NULL,
+    project_path TEXT NOT NULL,
+    expected_git_name TEXT NOT NULL,
+    expected_git_email TEXT,
+    git_identity_mode TEXT NOT NULL DEFAULT 'unknown',
+    receipt_token_hash TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'running',
+    started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    FOREIGN KEY (actor_id) REFERENCES collaboration_actors(actor_id)
+);
+
+CREATE TABLE IF NOT EXISTS commit_receipts (
+    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    commit_sha TEXT NOT NULL,
+    repo_path TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    session_id TEXT,
+    actor_id INTEGER NOT NULL,
+    human_actor TEXT,
+    task_id TEXT,
+    provider TEXT NOT NULL,
+    author_name TEXT NOT NULL,
+    author_email TEXT NOT NULL,
+    committer_name TEXT NOT NULL,
+    committer_email TEXT NOT NULL,
+    verification_status TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(run_id, repo_path, commit_sha),
+    FOREIGN KEY (run_id) REFERENCES execution_runs(run_id),
+    FOREIGN KEY (actor_id) REFERENCES collaboration_actors(actor_id)
+);
+`;
+
+/**
+ * Immutable, revocable conversation snapshots exposed through public links.
+ *
+ * The bearer token itself is never persisted. Public requests resolve a
+ * SHA-256 digest and read the stored snapshot instead of touching live
+ * provider transcripts or workspace files.
+ */
+export const SESSION_SHARE_LINKS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS session_share_links (
+    id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    snapshot_json TEXT NOT NULL,
+    created_by_user_id INTEGER NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL,
+    revoked_at DATETIME,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 `;
 
@@ -289,6 +461,14 @@ ${SESSIONS_TABLE_SCHEMA_SQL}
 CREATE INDEX IF NOT EXISTS idx_session_ids_lookup ON sessions(session_id);
 -- NOTE: This index is created in migrations after sessions is rebuilt to include project_path.
 -- Creating it here can fail on upgraded installs where the legacy sessions table has no project_path.
+
+${SESSION_WORKSPACES_TABLES_SCHEMA_SQL}
+
+${SESSION_SHARE_LINKS_TABLE_SCHEMA_SQL}
+CREATE INDEX IF NOT EXISTS idx_session_share_links_session_id
+ON session_share_links(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_share_links_token_hash
+ON session_share_links(token_hash);
 
 ${LAST_SCANNED_AT_SQL}
 

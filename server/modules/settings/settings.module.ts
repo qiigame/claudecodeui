@@ -9,6 +9,7 @@ import {
   getPublicKey,
   notifyUserIfEnabled,
 } from '@/modules/notifications/index.js';
+import type { DeploymentPolicySource } from '@/modules/deployment-policy/index.js';
 
 import { createSettingsRouter } from './settings.routes.js';
 import { createSettingsService } from './settings.service.js';
@@ -41,10 +42,17 @@ const settingsService = createSettingsService({
   pushSubscriptions: {
     save: (userId, endpoint, p256dh, auth) =>
       pushSubscriptionsDb.saveSubscription(userId, endpoint, p256dh, auth),
-    remove: (endpoint) => pushSubscriptionsDb.removeSubscription(endpoint),
+    remove: (userId, endpoint) => pushSubscriptionsDb.removeSubscriptionForUser(userId, endpoint),
   },
   getVapidPublicKey: getPublicKey,
 });
 
-/** Settings router assembled for the authenticated server mount. */
-export const settingsRoutes = createSettingsRouter(settingsService);
+/** Builds the Settings router with the composition root's startup policy. */
+export function createSettingsModule(
+  deploymentPolicy?: DeploymentPolicySource,
+) {
+  return createSettingsRouter(settingsService, { deploymentPolicy });
+}
+
+/** Settings router assembled for standalone consumers. */
+export const settingsRoutes = createSettingsModule();

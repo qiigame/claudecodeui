@@ -22,6 +22,8 @@ import type { TaskId, TaskMasterTask, TaskReference } from '@/shared/types';
 type TaskDetailModalProps = {
   task: TaskMasterTask | null;
   isOpen?: boolean;
+  /** Hides mutation controls and prevents task API writes in product/QA mode. */
+  canMutate?: boolean;
   className?: string;
   onClose: () => void;
   onEdit?: ((task: TaskMasterTask) => void) | null;
@@ -58,6 +60,7 @@ function getPriorityBadgeClass(priority?: string): string {
 export default function TaskDetailModal({
   task,
   isOpen = true,
+  canMutate = false,
   className = '',
   onClose,
   onEdit = null,
@@ -84,6 +87,9 @@ export default function TaskDetailModal({
   }
 
   const handleSaveChanges = async () => {
+    if (!canMutate) {
+      return;
+    }
     if (!currentProject?.projectId) {
       return;
     }
@@ -127,6 +133,9 @@ export default function TaskDetailModal({
   };
 
   const handleStatusSelect = async (nextStatus: string) => {
+    if (!canMutate) {
+      return;
+    }
     if (!currentProject?.projectId || nextStatus === task.status) {
       return;
     }
@@ -167,7 +176,7 @@ export default function TaskDetailModal({
                 <Copy className="h-3 w-3" />
               </button>
 
-              {isEditMode ? (
+              {canMutate && isEditMode ? (
                 <input
                   type="text"
                   value={editableTask.title}
@@ -181,7 +190,7 @@ export default function TaskDetailModal({
           </div>
 
           <div className="flex items-center gap-2">
-            {isEditMode ? (
+            {canMutate && isEditMode ? (
               <>
                 <button
                   onClick={handleSaveChanges}
@@ -203,7 +212,7 @@ export default function TaskDetailModal({
                   <X className="h-5 w-5" />
                 </button>
               </>
-            ) : (
+            ) : canMutate ? (
               <button
                 onClick={() => setIsEditMode(true)}
                 className="rounded-md p-2 text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800"
@@ -211,7 +220,7 @@ export default function TaskDetailModal({
               >
                 <Edit className="h-5 w-5" />
               </button>
-            )}
+            ) : null}
             <button onClick={onClose} className="rounded-md p-2 text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800" title="Close">
               <X className="h-5 w-5" />
             </button>
@@ -222,19 +231,25 @@ export default function TaskDetailModal({
           <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
             <div className="space-y-2">
               <label className="text-sm font-medium text-gray-700 dark:text-gray-300">Status</label>
-              <select
-                value={task.status ?? 'pending'}
-                onChange={(event) => {
-                  void handleStatusSelect(event.target.value);
-                }}
-                className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-white"
-              >
-                {STATUS_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
+              {canMutate ? (
+                <select
+                  value={task.status ?? 'pending'}
+                  onChange={(event) => {
+                    void handleStatusSelect(event.target.value);
+                  }}
+                  className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-white"
+                >
+                  {STATUS_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <div className="rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300">
+                  {STATUS_OPTIONS.find((option) => option.value === (task.status ?? 'pending'))?.label || task.status || 'Pending'}
+                </div>
+              )}
             </div>
 
             <div className="space-y-2">
@@ -267,7 +282,7 @@ export default function TaskDetailModal({
 
           <div className="space-y-2">
             <label className="text-sm font-medium text-gray-700 dark:text-gray-300">Description</label>
-            {isEditMode ? (
+            {canMutate && isEditMode ? (
               <textarea
                 rows={4}
                 value={editableTask.description ?? ''}

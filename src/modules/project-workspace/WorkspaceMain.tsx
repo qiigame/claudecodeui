@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, type Dispatch, type SetStateAction } from 'react';
+import React, { useCallback, useEffect, useMemo, type Dispatch, type SetStateAction } from 'react';
 
 import { ChatInterface } from '@/modules/chat';
 import { FileTree } from '@/modules/file-tree';
@@ -15,6 +15,9 @@ import { EditorSidebar, useEditorSidebar } from '@/modules/code-editor';
 import WorkspaceHeader from '@/modules/project-workspace/WorkspaceHeader';
 import WorkspaceStateView from '@/modules/project-workspace/WorkspaceStateView';
 import WorkspaceErrorBoundary from '@/modules/project-workspace/WorkspaceErrorBoundary';
+import { ProjectGuide } from '@/modules/collaboration';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type WorkspaceMainProps = {
   selectedProject: Project | null;
@@ -56,8 +59,30 @@ function WorkspaceMain({
   onProjectSelect,
   onProjectsRefresh,
 }: WorkspaceMainProps) {
+  const { authMode, user, canManageSettings: authCanManageSettings } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const managedIdentityRestricted = isManagedIdentityRestricted(authMode, user);
+  const uiReadOnly = isReadOnly || managedIdentityRestricted;
+  const canManageSettings = authCanManageSettings && can('settings.write') && !uiReadOnly;
   const preferences = useUiPreferences();
   const { showRawParameters, showThinking, sendByCtrlEnter } = preferences;
+
+  // The visible project remains the sidebar owner, while a session can attach
+  // a hidden project whose path is the only filesystem root used by runtime,
+  // files, shell, Git, and editor operations.
+  const executionProject = useMemo<Project | null>(() => {
+    const workspace = selectedSession?.workspace;
+    if (!selectedProject || !workspace) {
+      return selectedProject;
+    }
+    return {
+      ...selectedProject,
+      projectId: workspace.projectId,
+      path: workspace.path,
+      fullPath: workspace.path,
+      displayName: `${selectedProject.displayName} · 会话工作区`,
+    };
+  }, [selectedProject, selectedSession?.workspace]);
 
   const { tasksEnabled, isTaskMasterInstalled } = useTasksSettings();
   const browserUseEnabled = useBrowserUseEnabled();
@@ -65,7 +90,17 @@ function WorkspaceMain({
   useTaskMasterProjectSync(selectedProject);
 
   const shouldShowTasksTab = Boolean(tasksEnabled && isTaskMasterInstalled);
-  const shouldShowBrowserTab = browserUseEnabled;
+  const canReadFiles = can('file.read');
+  const canWriteFiles = can('file.write') && !uiReadOnly;
+  // Product/QA read-only deployments may retain git.read for metadata
+  // inspection on the server, but the workspace UI must not expose or mount
+  // the Git panel because it also contains mutation-oriented controls.
+  const canReadGit = !uiReadOnly && can('git.read');
+  const canUseTerminal = !uiReadOnly && (can('terminal.interactive') || can('shell.exec'));
+  const canReadBrowser = can('browser.read');
+  const canReadPlugins = can('plugin.read');
+  const canUsePlugins = !uiReadOnly && can('plugin.use');
+  const shouldShowBrowserTab = browserUseEnabled && canReadBrowser;
 
   const {
     editingFile,
@@ -78,13 +113,13 @@ function WorkspaceMain({
     handleToggleEditorExpand,
     handleResizeStart,
   } = useEditorSidebar({
-    selectedProject,
+    selectedProject: executionProject,
     isMobile,
   });
 
   // Resolves bare/partial file references (e.g. links inside chat messages) to
   // real project files before opening them in the in-app editor.
-  const resolvedFileOpen = useFileOpenResolver(selectedProject, handleFileOpen);
+  const resolvedFileOpen = useFileOpenResolver(executionProject, handleFileOpen);
 
   useEffect(() => {
     if (!shouldShowTasksTab && activeTab === 'tasks') {
@@ -97,6 +132,18 @@ function WorkspaceMain({
       setActiveTab('chat');
     }
   }, [shouldShowBrowserTab, activeTab, setActiveTab]);
+
+  useEffect(() => {
+    const unavailable = (
+      (activeTab === 'files' && !canReadFiles)
+      || (activeTab === 'git' && !canReadGit)
+      || (activeTab === 'shell' && !canUseTerminal)
+      || (activeTab.startsWith('plugin:') && !canReadPlugins)
+    );
+    if (unavailable) {
+      setActiveTab('chat');
+    }
+  }, [activeTab, canReadFiles, canReadGit, canReadPlugins, canUsePlugins, canUseTerminal, setActiveTab]);
 
   // Stable so React.memo(ChatInterface) can bail out: an inline arrow here made
   // every WorkspaceMain render re-render the whole chat tree, including during
@@ -136,6 +183,12 @@ function WorkspaceMain({
         selectedSession={selectedSession}
         shouldShowTasksTab={shouldShowTasksTab}
         shouldShowBrowserTab={shouldShowBrowserTab}
+        canReadFiles={canReadFiles}
+        canReadGit={canReadGit}
+        canUseTerminal={canUseTerminal}
+        canReadBrowser={canReadBrowser}
+        canReadPlugins={canReadPlugins}
+        canUsePlugins={canUsePlugins}
         isMobile={isMobile}
         onMenuClick={onMenuClick}
       />
@@ -146,14 +199,14 @@ function WorkspaceMain({
             <WorkspaceErrorBoundary showDetails>
               <ChatInterface
                 isActive={activeTab === 'chat'}
-                selectedProject={selectedProject}
+                selectedProject={executionProject}
                 selectedSession={selectedSession}
                 ws={ws}
                 sendMessage={sendMessage}
                 onFileOpen={handleFileOpen}
                 onNavigateToSession={onNavigateToSession}
                 onSessionEstablished={onSessionEstablished}
-                onShowSettings={onShowSettings}
+                onShowSettings={canManageSettings ? onShowSettings : undefined}
                 showRawParameters={showRawParameters}
                 showThinking={showThinking}
                 sendByCtrlEnter={sendByCtrlEnter}
@@ -164,16 +217,22 @@ function WorkspaceMain({
             </WorkspaceErrorBoundary>
           </div>
 
-          {activeTab === 'files' && (
+          {activeTab === 'files' && canReadFiles && (
             <div className="h-full overflow-hidden">
-              <FileTree selectedProject={selectedProject} onFileOpen={handleFileOpen} />
+              <FileTree selectedProject={executionProject} onFileOpen={handleFileOpen} />
             </div>
           )}
 
-          {activeTab === 'shell' && (
+          {activeTab === 'guide' && (
+            <div className="h-full overflow-hidden">
+              <ProjectGuide project={selectedProject} />
+            </div>
+          )}
+
+          {activeTab === 'shell' && canUseTerminal && (
             <div className="h-full w-full overflow-hidden">
               <StandaloneShell
-                project={selectedProject}
+                project={executionProject}
                 session={selectedSession}
                 showHeader={false}
                 isActive={activeTab === 'shell'}
@@ -181,10 +240,10 @@ function WorkspaceMain({
             </div>
           )}
 
-          {activeTab === 'git' && (
+          {activeTab === 'git' && canReadGit && (
             <div className="h-full overflow-hidden">
               <GitPanel
-                selectedProject={selectedProject}
+                selectedProject={executionProject}
                 isMobile={isMobile}
                 onFileOpen={handleFileOpen}
                 onProjectSelect={onProjectSelect}
@@ -195,13 +254,16 @@ function WorkspaceMain({
 
           {shouldShowTasksTab && <TaskMasterPanel isVisible={activeTab === 'tasks'} />}
 
-          {shouldShowBrowserTab && activeTab === 'browser' && (
+          {shouldShowBrowserTab && activeTab === 'browser' && canReadBrowser && (
             <div className="h-full overflow-hidden">
-              <BrowserUsePanel isVisible={activeTab === 'browser'} onShowSettings={onShowSettings} />
+              <BrowserUsePanel
+                isVisible={activeTab === 'browser'}
+                onShowSettings={canManageSettings ? onShowSettings : undefined}
+              />
             </div>
           )}
 
-          {activeTab.startsWith('plugin:') && (
+          {activeTab.startsWith('plugin:') && canReadPlugins && (
             <div className="h-full overflow-hidden">
               <PluginTabContent
                 pluginName={activeTab.replace('plugin:', '')}
@@ -212,19 +274,22 @@ function WorkspaceMain({
           )}
         </div>
 
-        <EditorSidebar
-          editingFile={editingFile}
-          isMobile={isMobile}
-          editorExpanded={editorExpanded}
-          editorWidth={editorWidth}
-          hasManualWidth={hasManualWidth}
-          resizeHandleRef={resizeHandleRef}
-          onResizeStart={handleResizeStart}
-          onCloseEditor={handleCloseEditor}
-          onToggleEditorExpand={handleToggleEditorExpand}
-          projectPath={selectedProject.path}
-          fillSpace={activeTab === 'files'}
-        />
+        {activeTab !== 'guide' && (
+          <EditorSidebar
+            editingFile={editingFile}
+            isMobile={isMobile}
+            editorExpanded={editorExpanded}
+            editorWidth={editorWidth}
+            hasManualWidth={hasManualWidth}
+            resizeHandleRef={resizeHandleRef}
+            onResizeStart={handleResizeStart}
+            onCloseEditor={handleCloseEditor}
+            onToggleEditorExpand={handleToggleEditorExpand}
+            projectPath={executionProject?.path}
+            fillSpace={activeTab === 'files'}
+            readOnly={!canWriteFiles}
+          />
+        )}
       </div>
     </div>
   );

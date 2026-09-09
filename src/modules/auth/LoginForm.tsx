@@ -7,6 +7,7 @@ import { useAuth } from '@/modules/auth/context/AuthContext';
 import AuthErrorAlert from '@/modules/auth/AuthErrorAlert';
 import AuthInputField from '@/modules/auth/AuthInputField';
 import AuthScreenLayout from '@/modules/auth/AuthScreenLayout';
+import { api } from '@/shared/api';
 
 type LoginFormState = {
   username: string;
@@ -26,7 +27,18 @@ const initialState: LoginFormState = {
  */
 export default function LoginForm() {
   const { t } = useTranslation('auth');
-  const { error: sessionError, login } = useAuth();
+  const {
+    authMode,
+    dingTalkProviders,
+    error: sessionError,
+    login,
+  } = useAuth();
+  // The server may be in SSO mode while its provider list is temporarily
+  // empty (for example, a malformed/rotating credentials file). Never fall
+  // back to a local password form in that state.
+  const usesDingTalkLogin = authMode === 'dingtalk'
+    || authMode === 'unavailable'
+    || dingTalkProviders.length > 0;
 
   const [formState, setFormState] = useState<LoginFormState>(initialState);
   const [errorMessage, setErrorMessage] = useState('');
@@ -60,50 +72,82 @@ export default function LoginForm() {
   return (
     <AuthScreenLayout
       title={t('login.title')}
-      description={t('login.description')}
-      footerText="Enter your credentials to access CloudCLI"
+      description={usesDingTalkLogin ? t('login.dingTalkDescription') : t('login.description')}
+      footerText={usesDingTalkLogin
+        ? t('login.dingTalkFooter')
+        : 'Enter your credentials to access CloudCLI'}
     >
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <AuthInputField
-          id="username"
-          label={t('login.username')}
-          value={formState.username}
-          onChange={(value) => updateField('username', value)}
-          placeholder={t('login.placeholders.username')}
-          isDisabled={isSubmitting}
-          autoComplete="username"
-          icon={User}
-        />
-
-        <AuthInputField
-          id="password"
-          label={t('login.password')}
-          value={formState.password}
-          onChange={(value) => updateField('password', value)}
-          placeholder={t('login.placeholders.password')}
-          isDisabled={isSubmitting}
-          type="password"
-          autoComplete="current-password"
-          icon={Lock}
-        />
-
-        <AuthErrorAlert errorMessage={errorMessage || sessionError || ''} />
-
-        <button
-          type="submit"
-          disabled={isSubmitting}
-          className="flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 font-medium text-primary-foreground shadow-lg shadow-primary/25 transition-all duration-200 hover:shadow-primary/30 hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:ring-offset-2 focus:ring-offset-card active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {isSubmitting ? (
-            <>
-              <Loader2 className="h-4 w-4 animate-spin" />
-              {t('login.loading')}
-            </>
+      {usesDingTalkLogin ? (
+        <div className="space-y-4">
+          {dingTalkProviders.length > 0 ? (
+            <div className="space-y-3">
+              {dingTalkProviders.map((provider) => (
+                <a
+                  key={provider.key}
+                  href={api.auth.dingTalkStartUrl(
+                    provider.key,
+                    `${window.location.pathname}${window.location.search}${window.location.hash}`,
+                  )}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#1677ff] px-4 py-2.5 font-medium text-white shadow-lg shadow-blue-500/20 transition-all duration-200 hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-blue-400/40 focus:ring-offset-2 focus:ring-offset-card active:scale-[0.99]"
+                >
+                  <span
+                    aria-hidden="true"
+                    className="flex h-5 w-5 items-center justify-center rounded-md bg-white/20 text-sm font-semibold"
+                  >
+                    钉
+                  </span>
+                  钉钉登录 · {provider.name}
+                </a>
+              ))}
+            </div>
           ) : (
-            t('login.submit')
+            <AuthErrorAlert errorMessage="钉钉登录暂不可用，请联系管理员检查组织配置。" />
           )}
-        </button>
-      </form>
+          <AuthErrorAlert errorMessage={sessionError || ''} />
+        </div>
+      ) : (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <AuthInputField
+            id="username"
+            label={t('login.username')}
+            value={formState.username}
+            onChange={(value) => updateField('username', value)}
+            placeholder={t('login.placeholders.username')}
+            isDisabled={isSubmitting}
+            autoComplete="username"
+            icon={User}
+          />
+
+          <AuthInputField
+            id="password"
+            label={t('login.password')}
+            value={formState.password}
+            onChange={(value) => updateField('password', value)}
+            placeholder={t('login.placeholders.password')}
+            isDisabled={isSubmitting}
+            type="password"
+            autoComplete="current-password"
+            icon={Lock}
+          />
+
+          <AuthErrorAlert errorMessage={errorMessage || sessionError || ''} />
+
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 font-medium text-primary-foreground shadow-lg shadow-primary/25 transition-all duration-200 hover:shadow-primary/30 hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:ring-offset-2 focus:ring-offset-card active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isSubmitting ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t('login.loading')}
+              </>
+            ) : (
+              t('login.submit')
+            )}
+          </button>
+        </form>
+      )}
     </AuthScreenLayout>
   );
 }

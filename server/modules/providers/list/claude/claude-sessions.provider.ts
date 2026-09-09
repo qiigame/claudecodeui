@@ -1,5 +1,5 @@
-import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline';
 
@@ -15,16 +15,33 @@ import type {
 import { parseFilesInputTag } from '@/shared/image-attachments.js';
 import { prepareTranscriptMessages } from '@/shared/message-unification.js';
 import {
+  buildClaudeTranscriptFilePath,
+  closeProviderTranscriptReadHandle,
   createNormalizedMessage,
   generateMessageId,
+  normalizeProjectPath,
+  openProviderTranscriptReadHandle,
+  openValidatedProviderTranscript,
   readObjectRecord,
+  readFirstJsonlRecord,
+  resolveClaudeConfigDirectory,
   sliceTailPage,
   truncateSubagentActivity,
+  type ProviderTranscriptPathValidationInput,
+  validateProviderTranscriptPath,
 } from '@/shared/utils.js';
 import { sessionsDb } from '@/modules/database/index.js';
 import { summarizeClaudeTokenUsage } from '@/modules/providers/services/provider-token-usage.service.js';
 
 const PROVIDER = 'claude';
+
+/** Filesystem seams used by Claude history readers and their isolated tests. */
+export type ClaudeSessionsProviderDependencies = {
+  getClaudeConfigDirectory?: () => string;
+  validateTranscriptPath?: (
+    input: ProviderTranscriptPathValidationInput,
+  ) => Promise<string | null>;
+};
 
 /**
  * Upper bound on how much of a subagent's timeline is sent to the client. A
@@ -70,6 +87,32 @@ type ClaudeSubagentTranscript = {
   endedMidToolCall: boolean;
 };
 
+type TranscriptIdentity = { device: number; inode: number };
+
+/**
+ * A Claude transcript that has passed the provider/root/envelope checks.
+ * Production callers keep `handle` open through the complete history read so
+ * a pathname replacement cannot change the bytes being parsed. Test seams may
+ * return only a canonical path; those callers retain the legacy reopen path.
+ */
+type ResolvedClaudeTranscript = {
+  canonicalPath: string;
+  handle?: FileHandle;
+};
+
+type ClaudeSubagentArtifact = {
+  /** Lexical path retained so the final no-follow open can reject parent/leaf symlinks. */
+  transcriptPath: string;
+  transcriptIdentity: TranscriptIdentity;
+  /** Descriptor captured during discovery; kept open through the parse. */
+  transcriptHandle?: FileHandle;
+  /** Empty when the optional metadata sidecar is absent or unsafe. */
+  metaPath: string;
+  metaIdentity?: TranscriptIdentity;
+  /** Descriptor captured during sidecar discovery; kept open through the parse. */
+  metaHandle?: FileHandle;
+};
+
 /**
  * Flattens one subagent transcript into the shared activity timeline.
  *
@@ -77,14 +120,33 @@ type ClaudeSubagentTranscript = {
  * transcript can replay what the agent actually did rather than listing tool
  * names with no narrative.
  */
-async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSubagentTranscript> {
+async function readClaudeSubagentTranscript(
+  filePath: string,
+  expectedIdentity?: TranscriptIdentity,
+  authenticatedHandle?: FileHandle,
+): Promise<ClaudeSubagentTranscript> {
   const activity: SubagentActivity[] = [];
   const transcript: ClaudeSubagentTranscript = { activity, endedMidToolCall: false };
   const toolsById = new Map<string, SubagentActivity>();
 
+  const opened = authenticatedHandle
+    ? { handle: authenticatedHandle }
+    : await openProviderTranscriptReadHandle(filePath, expectedIdentity);
+  if (!opened) {
+    return transcript;
+  }
+
+  const ownsHandle = !authenticatedHandle;
+
+  let fileStream: ReturnType<typeof opened.handle.createReadStream> | undefined;
+  let rl: readline.Interface | undefined;
   try {
-    const fileStream = fs.createReadStream(filePath);
-    const rl = readline.createInterface({
+    fileStream = opened.handle.createReadStream({
+      start: 0,
+      autoClose: false,
+      encoding: 'utf8',
+    });
+    rl = readline.createInterface({
       input: fileStream,
       crlfDelay: Infinity,
     });
@@ -158,6 +220,12 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`Error parsing agent file ${filePath}:`, message);
+  } finally {
+    rl?.close();
+    fileStream?.destroy();
+    if (ownsHandle) {
+      await closeProviderTranscriptReadHandle(opened.handle);
+    }
   }
 
   const lastActivity = activity[activity.length - 1];
@@ -172,15 +240,36 @@ type ClaudeSubagentMeta = {
 };
 
 /** Reads the sidecar `.meta.json` Claude writes next to a subagent transcript. */
-async function readClaudeSubagentMeta(metaPath: string): Promise<ClaudeSubagentMeta> {
+async function readClaudeSubagentMeta(
+  metaPath: string,
+  expectedIdentity?: TranscriptIdentity,
+  authenticatedHandle?: FileHandle,
+): Promise<ClaudeSubagentMeta> {
+  if (!metaPath) {
+    return {};
+  }
+
+  const opened = authenticatedHandle
+    ? { handle: authenticatedHandle }
+    : await openProviderTranscriptReadHandle(metaPath, expectedIdentity);
+  if (!opened) {
+    return {};
+  }
+
+  const ownsHandle = !authenticatedHandle;
+
   try {
-    const parsed = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as AnyRecord;
+    const parsed = JSON.parse(await opened.handle.readFile({ encoding: 'utf8' })) as AnyRecord;
     return {
       agentType: typeof parsed.agentType === 'string' ? parsed.agentType : undefined,
       description: typeof parsed.description === 'string' ? parsed.description : undefined,
     };
   } catch {
     return {};
+  } finally {
+    if (ownsHandle) {
+      await closeProviderTranscriptReadHandle(opened.handle);
+    }
   }
 }
 
@@ -197,17 +286,132 @@ async function findClaudeSubagentTranscript(
   projectDirectory: string,
   providerSessionId: string,
   agentId: string,
-): Promise<{ transcriptPath: string; metaPath: string } | null> {
+): Promise<ClaudeSubagentArtifact | null> {
+  // Both values originate outside this function: the provider session id is
+  // persisted in the local database and the agent id is copied from a JSONL
+  // tool result.  Treat them as path segments, not trusted filenames.  In
+  // particular, `path.join(root, `agent-${id}.jsonl`)` does not make a value
+  // containing `..` safe once it contains enough separators to climb out of
+  // the project directory.
+  const isSafePathSegment = (value: string): boolean => Boolean(
+    value
+      && value !== '.'
+      && value !== '..'
+      && !path.isAbsolute(value)
+      // Reject both POSIX and Windows separators, drive/ADS syntax, NUL, and
+      // control characters even when the server itself runs on POSIX.  Claude
+      // ids are opaque identifiers and never need these characters.
+      && !/[\\/:\0-\x1f\x7f]/.test(value),
+  );
+
+  if (!isSafePathSegment(providerSessionId) || !isSafePathSegment(agentId)) {
+    return null;
+  }
+
+  let canonicalProjectDirectory: string;
+  try {
+    canonicalProjectDirectory = await fsp.realpath(projectDirectory);
+  } catch {
+    return null;
+  }
+
+  const isContainedFile = (candidatePath: string): boolean => {
+    const relative = path.relative(canonicalProjectDirectory, candidatePath);
+    return Boolean(relative)
+      && relative !== '..'
+      && !relative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(relative);
+  };
+
   const candidates = [
     path.join(projectDirectory, providerSessionId, 'subagents', `agent-${agentId}.jsonl`),
     path.join(projectDirectory, `agent-${agentId}.jsonl`),
   ];
 
-  for (const transcriptPath of candidates) {
+  for (const candidatePath of candidates) {
+    let transcriptHandle: FileHandle | undefined;
+    let metaHandle: FileHandle | undefined;
     try {
-      await fsp.access(transcriptPath);
-      return { transcriptPath, metaPath: transcriptPath.replace(/\.jsonl$/, '.meta.json') };
+      // Resolve symlinks before opening the transcript.  A lexical path can
+      // still point outside the project when a subagent directory or file is
+      // replaced with a symlink by another process.
+      const canonicalTranscriptPath = await fsp.realpath(candidatePath);
+      if (!isContainedFile(canonicalTranscriptPath)) {
+        continue;
+      }
+
+      // Open the lexical candidate once with O_NOFOLLOW and fstat. Besides
+      // authenticating the regular-file identity, this rejects a symlink in
+      // either the leaf or a parent component that would disappear after the
+      // realpath check. Keep the descriptor identity for the actual reader so
+      // a replacement after this discovery cannot silently change the child.
+      const transcriptStats = await fsp.stat(canonicalTranscriptPath);
+      if (!transcriptStats.isFile()) {
+        continue;
+      }
+      const openedTranscript = await openProviderTranscriptReadHandle(candidatePath, {
+        device: transcriptStats.dev,
+        inode: transcriptStats.ino,
+      });
+      if (!openedTranscript) {
+        continue;
+      }
+      transcriptHandle = openedTranscript.handle;
+      const transcriptIdentity: TranscriptIdentity = {
+        device: openedTranscript.device,
+        inode: openedTranscript.inode,
+      };
+
+      // Metadata is optional, but a sidecar symlink must not turn the small
+      // metadata read into an escape hatch.  If it is missing or unsafe, pass
+      // an empty path so readClaudeSubagentMeta simply returns an empty object.
+      const metadataCandidate = candidatePath.replace(/\.jsonl$/, '.meta.json');
+      let metaPath = '';
+      let metaIdentity: TranscriptIdentity | undefined;
+      try {
+        const canonicalMetaPath = await fsp.realpath(metadataCandidate);
+        const metadataStats = await fsp.stat(canonicalMetaPath);
+        if (metadataStats.isFile() && isContainedFile(canonicalMetaPath)) {
+          // As with the transcript, use the lexical sidecar path for the
+          // final open. A canonicalized path would hide a newly-created
+          // symlink that still points somewhere inside the provider root.
+          const openedMetadata = await openProviderTranscriptReadHandle(metadataCandidate, {
+            device: metadataStats.dev,
+            inode: metadataStats.ino,
+          });
+          if (openedMetadata) {
+            metaPath = metadataCandidate;
+            metaIdentity = {
+              device: openedMetadata.device,
+              inode: openedMetadata.inode,
+            };
+            metaHandle = openedMetadata.handle;
+          }
+        }
+      } catch {
+        // Sidecar metadata is best effort; do not fail history loading.
+      }
+
+      const artifact: ClaudeSubagentArtifact = {
+        transcriptPath: candidatePath,
+        transcriptIdentity,
+        transcriptHandle,
+        metaPath,
+        metaIdentity,
+        metaHandle,
+      };
+      // Ownership transfers to the caller, which keeps both authenticated
+      // descriptors open through their respective parses.
+      transcriptHandle = undefined;
+      metaHandle = undefined;
+      return artifact;
     } catch {
+      if (metaHandle) {
+        await closeProviderTranscriptReadHandle(metaHandle).catch(() => undefined);
+      }
+      if (transcriptHandle) {
+        await closeProviderTranscriptReadHandle(transcriptHandle).catch(() => undefined);
+      }
       // Try the next layout.
     }
   }
@@ -312,26 +516,170 @@ function replaceAgentToolResultContent(message: AnyRecord, replacement: string):
  * so a conversation is a path through it rather than the whole file. Editing a
  * sent message makes a second path appear alongside the first.
  */
-async function readTranscriptRows(jsonlPath: string, providerSessionId: string): Promise<AnyRecord[]> {
+async function readTranscriptRows(
+  transcript: ResolvedClaudeTranscript,
+  providerSessionId: string,
+): Promise<AnyRecord[]> {
   const rows: AnyRecord[] = [];
-  const fileStream = fs.createReadStream(jsonlPath);
+  const opened = transcript.handle
+    ? { handle: transcript.handle }
+    : await openProviderTranscriptReadHandle(transcript.canonicalPath);
+  if (!opened) {
+    return rows;
+  }
+
+  const ownsHandle = !transcript.handle;
+
+  const fileStream = opened.handle.createReadStream({
+    start: 0,
+    autoClose: false,
+    encoding: 'utf8',
+  });
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
-  for await (const line of rl) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      const entry = JSON.parse(line) as AnyRecord;
-      if (entry.sessionId === providerSessionId) {
-        rows.push(entry);
+  try {
+    for await (const line of rl) {
+      if (!line.trim()) {
+        continue;
       }
-    } catch {
-      // A row can be half-written while the CLI is streaming into the file.
+      try {
+        const entry = JSON.parse(line) as AnyRecord;
+        if (entry.sessionId === providerSessionId) {
+          rows.push(entry);
+        }
+      } catch {
+        // A row can be half-written while the CLI is streaming into the file.
+      }
+    }
+  } finally {
+    rl.close();
+    fileStream.destroy();
+    if (ownsHandle) {
+      await closeProviderTranscriptReadHandle(opened.handle);
     }
   }
 
   return rows;
+}
+
+/**
+ * Locates the transcript before the filesystem watcher has populated
+ * `sessions.jsonl_path`.
+ *
+ * The runtime announces its provider session id as soon as streaming begins,
+ * while the polling watcher can take several seconds to observe the new file.
+ * A page refresh inside that window must still be able to restore history.
+ */
+async function resolveClaudeTranscriptPath(
+  sessionId: string,
+  providerSessionId: string,
+  dependencies: Required<ClaudeSessionsProviderDependencies>,
+  requestedProjectPath?: string | null,
+): Promise<ResolvedClaudeTranscript | null> {
+  const session = sessionsDb.getSessionById(sessionId)
+    ?? sessionsDb.getSessionByProviderSessionId(providerSessionId, PROVIDER);
+  const configDirectory = dependencies.getClaudeConfigDirectory();
+  const projectsRoot = path.join(configDirectory, 'projects');
+  const validatePath = dependencies.validateTranscriptPath;
+
+  // `project_path` is the source/sidebar owner. An isolated session's
+  // provider transcript is keyed by its private `runtime_path`; callers that
+  // do not have a DB row may still provide the effective path explicitly.
+  const runtimePath = typeof session?.runtime_path === 'string' && session.runtime_path.trim()
+    ? session.runtime_path.trim()
+    : null;
+  const requestedPath = typeof requestedProjectPath === 'string' && requestedProjectPath.trim()
+    ? requestedProjectPath.trim()
+    : null;
+  const lookupProjectPath = runtimePath
+    ?? requestedPath
+    ?? (typeof session?.project_path === 'string' && session.project_path.trim()
+      ? session.project_path.trim()
+      : null);
+  // Keep direct adapter callers compatible with older transcripts that do not
+  // expose a cwd when no isolated runtime is known. The service path always
+  // supplies an effective projectPath, so it receives strict binding.
+  const expectedProjectPath = runtimePath
+    ?? (requestedProjectPath !== undefined ? requestedPath : null);
+
+  const validateAndBind = async (
+    candidatePath: string,
+  ): Promise<ResolvedClaudeTranscript | null> => {
+    // Production callers use the shared validator. Keep the authenticated
+    // descriptor alive through the opening-envelope/project binding instead
+    // of validating a path and then reopening it for that same decision.
+    if (validatePath === validateProviderTranscriptPath) {
+      const authenticated = await openValidatedProviderTranscript({
+        provider: 'claude',
+        candidatePath,
+        rootPath: projectsRoot,
+        providerSessionId,
+        expectedProjectPath: expectedProjectPath ?? null,
+      });
+      if (!authenticated) {
+        return null;
+      }
+      try {
+        return {
+          canonicalPath: authenticated.canonicalPath,
+          handle: authenticated.handle,
+        };
+      } catch (error) {
+        await closeProviderTranscriptReadHandle(authenticated.handle);
+        throw error;
+      }
+    }
+
+    // Test/adapter seams may intentionally bypass the deployment root. They
+    // retain their historical behavior; production never takes this branch.
+    const validated = await validatePath({
+      provider: 'claude',
+      candidatePath,
+      rootPath: projectsRoot,
+      providerSessionId,
+    });
+    if (!validated) {
+      return null;
+    }
+    if (!expectedProjectPath) {
+      return { canonicalPath: validated };
+    }
+
+    // The shared validator authenticates the Claude project-key directory and
+    // native session id. Bind the transcript's own cwd to the DB/runtime cwd
+    // as well, so a source checkout's valid transcript cannot satisfy an
+    // isolated session merely because the filename happens to match.
+    const firstRecord = readObjectRecord(await readFirstJsonlRecord(validated));
+    const transcriptCwd = typeof firstRecord?.cwd === 'string'
+      ? firstRecord.cwd.trim()
+      : '';
+    return transcriptCwd
+      && normalizeProjectPath(transcriptCwd) === normalizeProjectPath(expectedProjectPath)
+      ? validated
+      : null;
+  };
+
+  if (session?.jsonl_path) {
+    const validated = await validateAndBind(session.jsonl_path);
+    if (validated) {
+      return validated;
+    }
+  }
+
+  if (!lookupProjectPath) {
+    return null;
+  }
+
+  const candidatePath = buildClaudeTranscriptFilePath(
+    configDirectory,
+    lookupProjectPath,
+    providerSessionId,
+  );
+  if (!candidatePath) {
+    return null;
+  }
+
+    return validateAndBind(candidatePath);
 }
 
 /** True for a row the user typed, as opposed to a tool result or an injected note. */
@@ -410,74 +758,99 @@ async function getSessionMessages(
   providerSessionId: string,
   limit: number | null,
   offset: number,
+  dependencies: Required<ClaudeSessionsProviderDependencies>,
+  requestedProjectPath?: string | null,
 ): Promise<ClaudeHistoryMessagesResult> {
   try {
     // The DB row is keyed by the app-facing session id, while the JSONL rows
     // on disk carry the provider-native id — both ids are needed here.
-    const jsonLPath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
+    const resolvedTranscript = await resolveClaudeTranscriptPath(
+      sessionId,
+      providerSessionId,
+      dependencies,
+      requestedProjectPath,
+    );
 
-    if (!jsonLPath) {
+    if (!resolvedTranscript) {
       return { messages: [], total: 0, hasMore: false };
     }
 
-    const projectDir = path.dirname(jsonLPath);
+    try {
+      const projectDir = path.dirname(resolvedTranscript.canonicalPath);
 
-    const messages = dropSupersededPromptBranches(
-      await readTranscriptRows(jsonLPath, providerSessionId),
-    );
+      const messages = dropSupersededPromptBranches(
+        await readTranscriptRows(resolvedTranscript, providerSessionId),
+      );
 
-    const agentIds = new Set<string>();
-    for (const message of messages) {
-      const agentId = message.toolUseResult?.agentId;
-      if (agentId) {
-        agentIds.add(String(agentId));
+      const agentIds = new Set<string>();
+      for (const message of messages) {
+        const agentId = message.toolUseResult?.agentId;
+        if (agentId) {
+          agentIds.add(String(agentId));
+        }
       }
-    }
 
     // Read each spawned agent's own transcript once, then hang it off every
     // row that references it.
-    const subagentsById = new Map<string, {
-      activity: SubagentActivity[];
-      info: SubagentInfo;
-      endedMidToolCall: boolean;
-    }>();
-    for (const agentId of agentIds) {
-      const located = await findClaudeSubagentTranscript(projectDir, providerSessionId, agentId);
-      if (!located) {
-        continue;
+      const subagentsById = new Map<string, {
+        activity: SubagentActivity[];
+        info: SubagentInfo;
+        endedMidToolCall: boolean;
+      }>();
+      for (const agentId of agentIds) {
+        const located = await findClaudeSubagentTranscript(projectDir, providerSessionId, agentId);
+        if (!located) {
+          continue;
+        }
+
+        try {
+          const [transcript, meta] = await Promise.all([
+            readClaudeSubagentTranscript(
+              located.transcriptPath,
+              located.transcriptIdentity,
+              located.transcriptHandle,
+            ),
+            readClaudeSubagentMeta(
+              located.metaPath,
+              located.metaIdentity,
+              located.metaHandle,
+            ),
+          ]);
+
+          subagentsById.set(agentId, {
+            endedMidToolCall: transcript.endedMidToolCall,
+            activity: transcript.activity
+              .slice(0, MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
+              .map(truncateSubagentActivity),
+            info: {
+              id: agentId,
+              name: meta.agentType,
+              type: meta.agentType,
+              description: meta.description,
+              model: transcript.model,
+              status: 'completed',
+              activityCount: transcript.activity.length,
+            },
+          });
+        } finally {
+          if (located.transcriptHandle) {
+            await closeProviderTranscriptReadHandle(located.transcriptHandle);
+          }
+          if (located.metaHandle) {
+            await closeProviderTranscriptReadHandle(located.metaHandle);
+          }
+        }
       }
-
-      const [transcript, meta] = await Promise.all([
-        readClaudeSubagentTranscript(located.transcriptPath),
-        readClaudeSubagentMeta(located.metaPath),
-      ]);
-
-      subagentsById.set(agentId, {
-        endedMidToolCall: transcript.endedMidToolCall,
-        activity: transcript.activity
-          .slice(0, MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
-          .map(truncateSubagentActivity),
-        info: {
-          id: agentId,
-          name: meta.agentType,
-          type: meta.agentType,
-          description: meta.description,
-          model: transcript.model,
-          status: 'completed',
-          activityCount: transcript.activity.length,
-        },
-      });
-    }
 
     // An async agent's launch result is internal bookkeeping ("Async agent
     // launched successfully…"); its real answer arrives later as a separate
     // `<task-notification>` turn. Folding the notification back onto the tool
     // call that started the agent keeps one card per agent instead of a card,
     // an unrelated status line, and a stray markdown reply.
-    const notificationsByToolUseId = collectTaskNotifications(messages);
-    const foldedNotificationUuids = new Set<string>();
+      const notificationsByToolUseId = collectTaskNotifications(messages);
+      const foldedNotificationUuids = new Set<string>();
 
-    for (const message of messages) {
+      for (const message of messages) {
       const agentId = message.toolUseResult?.agentId;
       if (!agentId) {
         continue;
@@ -520,31 +893,36 @@ async function getSessionMessages(
         // acknowledgement is internal bookkeeping the user must never read.
         replaceAgentToolResultContent(message, '');
       }
-    }
+      }
 
-    const sortedMessages = messages
+      const sortedMessages = messages
       .filter((message) => !foldedNotificationUuids.has(String(message.uuid ?? '')))
       .sort(
       (a, b) => new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime(),
     );
-    const total = sortedMessages.length;
+      const total = sortedMessages.length;
 
-    if (limit === null) {
-      return sortedMessages;
+      if (limit === null) {
+        return sortedMessages;
+      }
+
+      const startIndex = Math.max(0, total - offset - limit);
+      const endIndex = total - offset;
+      const paginatedMessages = sortedMessages.slice(startIndex, endIndex);
+      const hasMore = startIndex > 0;
+
+      return {
+        messages: paginatedMessages,
+        total,
+        hasMore,
+        offset,
+        limit,
+      };
+    } finally {
+      if (resolvedTranscript.handle) {
+        await closeProviderTranscriptReadHandle(resolvedTranscript.handle);
+      }
     }
-
-    const startIndex = Math.max(0, total - offset - limit);
-    const endIndex = total - offset;
-    const paginatedMessages = sortedMessages.slice(startIndex, endIndex);
-    const hasMore = startIndex > 0;
-
-    return {
-      messages: paginatedMessages,
-      total,
-      hasMore,
-      offset,
-      limit,
-    };
   } catch (error) {
     console.error(`Error reading messages for session ${sessionId}:`, error);
     return limit === null ? [] : { messages: [], total: 0, hasMore: false };
@@ -647,6 +1025,17 @@ function stripAnsiFormatting(text: string): string {
 }
 
 export class ClaudeSessionsProvider implements IProviderSessions {
+  private readonly dependencies: Required<ClaudeSessionsProviderDependencies>;
+
+  constructor(dependencyOverrides: ClaudeSessionsProviderDependencies = {}) {
+    this.dependencies = {
+      getClaudeConfigDirectory: dependencyOverrides.getClaudeConfigDirectory
+        ?? resolveClaudeConfigDirectory,
+      validateTranscriptPath: dependencyOverrides.validateTranscriptPath
+        ?? validateProviderTranscriptPath,
+    };
+  }
+
   /**
    * Normalizes one Claude JSONL entry or live SDK stream event into the shared
    * message shape consumed by REST and WebSocket clients.
@@ -984,40 +1373,55 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     anchorId: string,
   ): Promise<{ found: boolean; resumeThroughId: string | null }> {
     const session = sessionsDb.getSessionById(sessionId);
-    const jsonlPath = session?.jsonl_path;
     const providerSessionId = session?.provider_session_id;
-    if (!jsonlPath || !providerSessionId) {
+    if (!providerSessionId) {
       return { found: false, resumeThroughId: null };
     }
 
-    const rows = await readTranscriptRows(jsonlPath, providerSessionId);
-    const byUuid = new Map<string, AnyRecord>();
-    for (const row of rows) {
-      if (typeof row.uuid === 'string') {
-        byUuid.set(row.uuid, row);
-      }
-    }
-
-    const target = byUuid.get(anchorId);
-    if (!target) {
+    const resolvedTranscript = await resolveClaudeTranscriptPath(
+      sessionId,
+      providerSessionId,
+      this.dependencies,
+      session?.runtime_path ?? undefined,
+    );
+    if (!resolvedTranscript) {
       return { found: false, resumeThroughId: null };
     }
 
-    const visited = new Set<string>([anchorId]);
-    let parentUuid: unknown = target.parentUuid;
-    while (typeof parentUuid === 'string' && !visited.has(parentUuid)) {
-      visited.add(parentUuid);
-      const parent = byUuid.get(parentUuid);
-      if (!parent) {
-        break;
+    try {
+      const rows = await readTranscriptRows(resolvedTranscript, providerSessionId);
+      const byUuid = new Map<string, AnyRecord>();
+      for (const row of rows) {
+        if (typeof row.uuid === 'string') {
+          byUuid.set(row.uuid, row);
+        }
       }
-      if (parent.type === 'assistant') {
-        return { found: true, resumeThroughId: parentUuid };
-      }
-      parentUuid = parent.parentUuid;
-    }
 
-    return { found: true, resumeThroughId: null };
+      const target = byUuid.get(anchorId);
+      if (!target) {
+        return { found: false, resumeThroughId: null };
+      }
+
+      const visited = new Set<string>([anchorId]);
+      let parentUuid: unknown = target.parentUuid;
+      while (typeof parentUuid === 'string' && !visited.has(parentUuid)) {
+        visited.add(parentUuid);
+        const parent = byUuid.get(parentUuid);
+        if (!parent) {
+          break;
+        }
+        if (parent.type === 'assistant') {
+          return { found: true, resumeThroughId: parentUuid };
+        }
+        parentUuid = parent.parentUuid;
+      }
+
+      return { found: true, resumeThroughId: null };
+    } finally {
+      if (resolvedTranscript.handle) {
+        await closeProviderTranscriptReadHandle(resolvedTranscript.handle);
+      }
+    }
   }
 
   /**
@@ -1035,7 +1439,14 @@ export class ClaudeSessionsProvider implements IProviderSessions {
     try {
       // Load full history first so `total` reflects frontend-normalized messages,
       // not raw JSONL records.
-      result = await getSessionMessages(sessionId, providerSessionId, null, 0);
+      result = await getSessionMessages(
+        sessionId,
+        providerSessionId,
+        null,
+        0,
+        this.dependencies,
+        options.projectPath,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[ClaudeProvider] Failed to load session ${sessionId}:`, message);

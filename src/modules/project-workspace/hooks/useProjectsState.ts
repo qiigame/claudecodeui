@@ -18,6 +18,8 @@ type UseProjectsStateArgs = {
   subscribe: (listener: (event: ServerEvent) => void) => () => void;
   isMobile: boolean;
   isSessionProcessing: IsSessionProcessing;
+  /** AuthContext's server-authoritative settings permission; omitted callers fail closed. */
+  canManageSettings?: boolean;
 };
 
 /**
@@ -52,6 +54,7 @@ type RegisterOptimisticSessionArgs = {
   provider: LLMProvider;
   project: Project;
   summary?: string | null;
+  workspace?: ProjectSession['workspace'] | null;
 };
 
 /**
@@ -66,6 +69,7 @@ type SessionDetailsApiPayload = {
     summary?: string;
     createdAt?: string | null;
     lastActivity?: string | null;
+    workspace?: ProjectSession['workspace'];
     project?: {
       projectId?: string;
       path?: string;
@@ -346,16 +350,29 @@ const removeSessionFromProject = (project: Project, sessionIdToDelete: string): 
   return updatedProject;
 };
 
-const VALID_TABS: Set<string> = new Set(['chat', 'files', 'shell', 'git', 'tasks', 'browser']);
+// Files and Source Control remain available to internal file-preview flows, but
+// must not be restored as user-facing navigation after their tabs are hidden.
+// Files and Git are read-only views in product/QA deployments, so preserve
+// them across reloads just like the existing workspace tabs. Capability
+// gating in WorkspaceMain will redirect a persisted tab that is unavailable.
+const PERSISTABLE_TABS: Set<string> = new Set([
+  'chat',
+  'guide',
+  'files',
+  'shell',
+  'git',
+  'tasks',
+  'browser',
+]);
 
-const isValidTab = (tab: string): tab is AppTab => {
-  return VALID_TABS.has(tab) || tab.startsWith('plugin:');
+const isPersistableTab = (tab: string): tab is AppTab => {
+  return PERSISTABLE_TABS.has(tab) || tab.startsWith('plugin:');
 };
 
 const readPersistedTab = (): AppTab => {
   try {
     const stored = localStorage.getItem('activeTab');
-    if (stored && isValidTab(stored)) {
+    if (stored && isPersistableTab(stored)) {
       return stored as AppTab;
     }
   } catch {
@@ -370,6 +387,7 @@ export function useProjectsState({
   subscribe,
   isMobile,
   isSessionProcessing,
+  canManageSettings = false,
 }: UseProjectsStateArgs) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -434,14 +452,14 @@ export function useProjectsState({
    */
   const selectedSessionRef = useRef(selectedSession);
   selectedSessionRef.current = selectedSession;
-  const selectedProjectRef = useRef(selectedProject);
-  selectedProjectRef.current = selectedProject;
   const projectsRef = useRef(projects);
   projectsRef.current = projects;
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
   /** URL session id whose backend lookup already ran (or is in flight) — one attempt per id. */
   const sessionLookupRef = useRef<string | null>(null);
+  /** Distinguishes repeated URL ids (A -> B -> A) so an old lookup cannot win the ABA race. */
+  const sessionLookupEpochRef = useRef(0);
   /**
    * Generation of the newest `/api/projects` request. Several independent
    * triggers call refreshProjectsSilently (a rename, a service-worker
@@ -454,6 +472,7 @@ export function useProjectsState({
 
   useEffect(() => {
     sessionLookupRef.current = null;
+    sessionLookupEpochRef.current += 1;
   }, [sessionId]);
 
   const markSessionAttention = useCallback((targetSessionId?: string | null) => {
@@ -571,6 +590,7 @@ export function useProjectsState({
     provider,
     project,
     summary,
+    workspace,
   }: RegisterOptimisticSessionArgs) => {
     if (!newSessionId || !project?.projectId) {
       return;
@@ -587,6 +607,7 @@ export function useProjectsState({
       lastActivity: now,
       __provider: provider,
       __projectId: project.projectId,
+      ...(workspace ? { workspace } : {}),
     };
     // A purely local record that reuses the wire shape to feed
     // `upsertSessionIntoProject`; it is never dispatched onto the socket. It
@@ -674,9 +695,12 @@ export function useProjectsState({
   }, []);
 
   const openSettings = useCallback((tab = 'tools') => {
+    if (!canManageSettings) {
+      return;
+    }
     setSettingsInitialTab(tab);
     setShowSettings(true);
-  }, []);
+  }, [canManageSettings]);
 
   useEffect(() => {
     if (mountFetchStartedRef.current) {
@@ -883,10 +907,15 @@ export function useProjectsState({
     for (const project of projects) {
       const match = project.sessions?.find((session) => session.id === sessionId);
       if (match) {
-        const normalizedSession = normalizeSessionProvider(match);
+        const normalizedSession = {
+          ...normalizeSessionProvider(match),
+          __projectId: project.projectId,
+        };
         const shouldUpdateProject = selectedProject?.projectId !== project.projectId;
         const shouldUpdateSession =
-          selectedSession?.id !== sessionId || selectedSession.__provider !== normalizedSession.__provider;
+          selectedSession?.id !== sessionId
+          || selectedSession.__provider !== normalizedSession.__provider
+          || selectedSession.__projectId !== project.projectId;
 
         if (shouldUpdateProject) {
           setSelectedProject(project);
@@ -896,10 +925,6 @@ export function useProjectsState({
         }
         return;
       }
-    }
-
-    if (selectedSession?.id === sessionId) {
-      return;
     }
 
     // Session id is in the URL but not present on any loaded project payload.
@@ -912,6 +937,21 @@ export function useProjectsState({
       return;
     }
     sessionLookupRef.current = sessionId;
+    const lookupEpoch = sessionLookupEpochRef.current;
+
+    // Do not keep a previous session/project pair live while a different URL
+    // is being resolved. For a search result that already carries a project
+    // hint, retain the visible project only when the two ids agree; the backend
+    // lookup below is still the authority and may replace it.
+    if (selectedSession?.id !== sessionId) {
+      setSelectedSession(null);
+      setSelectedProject(null);
+    } else if (
+      !selectedSession.__projectId
+      || selectedProject?.projectId !== selectedSession.__projectId
+    ) {
+      setSelectedProject(null);
+    }
 
     void (async () => {
       let details: SessionDetailsApiPayload['data'] | null = null;
@@ -926,26 +966,21 @@ export function useProjectsState({
       }
 
       // The user navigated elsewhere while the lookup was in flight.
-      if (sessionIdRef.current !== sessionId) {
+      if (
+        sessionIdRef.current !== sessionId
+        || sessionLookupEpochRef.current !== lookupEpoch
+      ) {
         return;
       }
 
       if (!details) {
-        // Unknown session id (or lookup failed). Fall back to the legacy
-        // behavior: host a placeholder under the currently selected project so
-        // chat state stays alive (without a `selectedSession`, chat clears
-        // `currentSessionId` and stops reading the session store).
-        const fallbackProject = selectedProjectRef.current;
-        if (!fallbackProject || selectedSessionRef.current?.id === sessionId) {
-          return;
-        }
-
-        setSelectedSession({
-          id: sessionId,
-          __provider: readSelectedProvider(),
-          __projectId: fallbackProject.projectId,
-          summary: '',
-        });
+        // Unknown session id (or a failed lookup) must never be hosted under
+        // the currently selected project. Doing that would let an arbitrary
+        // deep link inherit the visible project's filesystem/session context.
+        // Leave the project selected for the user, but return to the explicit
+        // new-session route so any later write is an intentional action.
+        setSelectedSession(null);
+        navigate('/', { replace: true });
         return;
       }
 
@@ -956,33 +991,56 @@ export function useProjectsState({
         return;
       }
 
-      const resolvedProjectId = details.project?.projectId;
-      if (resolvedProjectId) {
-        setSelectedProject((previousProject) => {
-          if (previousProject?.projectId === resolvedProjectId) {
-            return previousProject;
-          }
+      const projectDetails = details.project;
+      const resolvedProjectId = typeof projectDetails?.projectId === 'string'
+        ? projectDetails.projectId.trim()
+        : '';
+      const resolvedProjectPath = (
+        typeof projectDetails?.fullPath === 'string' && projectDetails.fullPath.trim()
+          ? projectDetails.fullPath
+          : typeof projectDetails?.path === 'string'
+            ? projectDetails.path
+            : ''
+      ).trim();
 
-          const loadedProject = projectsRef.current.find(
-            (candidate) => candidate.projectId === resolvedProjectId,
-          );
-          if (loadedProject) {
-            return loadedProject;
-          }
-
-          // Owning project is not in the active project list (e.g. archived):
-          // synthesize a minimal entry so the chat view still gets its paths.
-          return {
-            projectId: resolvedProjectId,
-            path: details.project?.path ?? details.project?.fullPath ?? '',
-            fullPath: details.project?.fullPath ?? details.project?.path ?? '',
-            displayName: details.project?.displayName ?? '',
-            isStarred: Boolean(details.project?.isStarred),
-            sessions: [],
-            sessionMeta: { hasMore: false, total: 0 },
-          };
-        });
+      // Sessions whose project was deleted are retained by the database with a
+      // null project_path. They cannot safely borrow whichever project happens
+      // to be selected in the UI, so treat them as unavailable until the
+      // backend can return an owning project and a usable filesystem root.
+      if (!projectDetails || !resolvedProjectId || !resolvedProjectPath) {
+        setSelectedSession(null);
+        setSelectedProject(null);
+        navigate('/', { replace: true });
+        return;
       }
+
+      const resolvedProject: Project = {
+        projectId: resolvedProjectId,
+        path: typeof projectDetails.path === 'string' && projectDetails.path.trim()
+          ? projectDetails.path
+          : resolvedProjectPath,
+        fullPath: resolvedProjectPath,
+        displayName: typeof projectDetails.displayName === 'string' && projectDetails.displayName.trim()
+          ? projectDetails.displayName
+          : resolvedProjectId,
+        isStarred: Boolean(projectDetails.isStarred),
+        sessions: [],
+        sessionMeta: { hasMore: false, total: 0 },
+      };
+
+      setSelectedProject((previousProject) => {
+        const loadedProject = projectsRef.current.find(
+          (candidate) => candidate.projectId === resolvedProjectId,
+        );
+        const existingProject = loadedProject
+          ?? (previousProject?.projectId === resolvedProjectId ? previousProject : null);
+
+        // Keep loaded session/task metadata, but let the authoritative details
+        // endpoint refresh identity and path metadata for this exact owner.
+        return existingProject
+          ? mergeProjectSelectionMetadata(existingProject, resolvedProject)
+          : resolvedProject;
+      });
 
       const resolvedSession: ProjectSession = {
         id: sessionId,
@@ -994,6 +1052,7 @@ export function useProjectsState({
             ? (details.provider as LLMProvider)
             : readSelectedProvider(),
         __projectId: resolvedProjectId,
+        ...(details.workspace ? { workspace: details.workspace } : {}),
       };
 
       setSelectedSession((previousSession) =>
@@ -1002,7 +1061,15 @@ export function useProjectsState({
           : resolvedSession,
       );
     })();
-  }, [navigate, sessionId, projects, selectedProject, selectedSession?.id, selectedSession?.__provider]);
+  }, [
+    navigate,
+    sessionId,
+    projects,
+    selectedProject,
+    selectedSession?.id,
+    selectedSession?.__provider,
+    selectedSession?.__projectId,
+  ]);
 
   const handleProjectSelect = useCallback(
     (project: Project) => {
@@ -1022,7 +1089,7 @@ export function useProjectsState({
       clearSessionAttention(session.id);
       setSelectedSession(session);
 
-      if (activeTab === 'tasks' || activeTab === 'browser') {
+      if (activeTab === 'guide' || activeTab === 'tasks' || activeTab === 'browser') {
         setActiveTab('chat');
       }
 
@@ -1197,14 +1264,15 @@ export function useProjectsState({
       isLoading: isLoadingProjects,
       loadingProgress,
       onRefresh: handleSidebarRefresh,
-      onShowSettings: () => setShowSettings(true),
-      showSettings,
+      onShowSettings: openSettings,
+      showSettings: canManageSettings && showSettings,
       settingsInitialTab,
       onCloseSettings: () => setShowSettings(false),
       isMobile,
     }),
     [
       attentionSessionIds,
+      canManageSettings,
       handleNewSession,
       handleProjectDelete,
       handleProjectSelect,
@@ -1216,6 +1284,7 @@ export function useProjectsState({
       isMobile,
       loadingProgress,
       projects,
+      openSettings,
       settingsInitialTab,
       selectedProject,
       selectedSession,
@@ -1231,7 +1300,7 @@ export function useProjectsState({
     sidebarOpen,
     isLoadingProjects,
     loadingProgress,
-    showSettings,
+    showSettings: canManageSettings && showSettings,
     settingsInitialTab,
     externalMessageUpdate,
     newSessionTrigger,

@@ -22,33 +22,20 @@ function createDependencies(overrides: Partial<UserDependencies> = {}): UserDepe
       saveDraft: () => undefined,
       deleteDraft: () => undefined,
     },
-    readSystemGitConfig: async () => ({ git_name: null, git_email: null }),
-    applyGlobalGitConfig: async () => undefined,
-    logInfo: () => undefined,
-    logError: () => undefined,
     ...overrides,
   };
 }
 
-test('getGitConfig imports system configuration when the repository is empty', async () => {
-  const updates: unknown[][] = [];
-  const service = createUserService(createDependencies({
-    users: {
-      getGitConfig: () => undefined,
-      updateGitConfig: (...args) => updates.push(args),
-      completeOnboarding: () => undefined,
-      hasCompletedOnboarding: () => false,
-    },
-    readSystemGitConfig: async () => ({ git_name: 'Alice', git_email: 'alice@example.com' }),
-  }));
+test('getGitConfig does not import the shared host Git identity', async () => {
+  const service = createUserService(createDependencies());
 
   const result = await service.getGitConfig(7);
 
-  assert.equal(result.gitName, 'Alice');
-  assert.deepEqual(updates, [[7, 'Alice', 'alice@example.com']]);
+  assert.equal(result.gitName, null);
+  assert.equal(result.gitEmail, null);
 });
 
-test('updateGitConfig persists valid input and invokes the Git adapter', async () => {
+test('updateGitConfig persists only the authenticated user identity', async () => {
   const operations: string[] = [];
   const service = createUserService(createDependencies({
     users: {
@@ -57,16 +44,10 @@ test('updateGitConfig persists valid input and invokes the Git adapter', async (
       completeOnboarding: () => undefined,
       hasCompletedOnboarding: () => false,
     },
-    applyGlobalGitConfig: async (name, email) => {
-      operations.push(`git:${name}:${email}`);
-    },
   }));
 
   await service.updateGitConfig(1, 'Alice', 'alice@example.com');
-  assert.deepEqual(operations, [
-    'persist:Alice:alice@example.com',
-    'git:Alice:alice@example.com',
-  ]);
+  assert.deepEqual(operations, ['persist:Alice:alice@example.com']);
 });
 
 test('savePreferences forwards only the keys the client sent', () => {

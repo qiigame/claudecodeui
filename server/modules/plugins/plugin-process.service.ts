@@ -4,6 +4,11 @@ import path from 'path';
 // cross-spawn: drop-in spawn with Windows .cmd/PATHEXT resolution.
 import spawn from 'cross-spawn';
 
+import {
+  hasPluginExecutionCapability,
+  type DeploymentPolicy,
+} from '@/modules/deployment-policy/index.js';
+
 import { scanPlugins, getPluginsConfig, getPluginDir } from './plugin-registry.service.js';
 
 // Map<pluginName, { process, port }>
@@ -194,10 +199,38 @@ export function stopAllPlugins() {
 }
 
 /**
- * Start servers for all enabled plugins that have a server entry.
- * Called once on host server boot.
+ * Returns whether the host is allowed to launch plugin subprocesses.
+ *
+ * Plugin manifests and their enabled flags are persisted outside the app
+ * database, so merely scanning them at boot is not a read-only operation:
+ * launching a server executes third-party code. Requiring the immutable
+ * deployment policy here (in addition to the route/WebSocket guards) keeps a
+ * product/QA process safe even if a future composition root forgets to gate
+ * the startup call. `plugin.write` remains a backwards-compatible execution
+ * grant for older installations; new deployments can grant the narrower
+ * `plugin.use` capability without exposing management operations.
  */
-export async function startEnabledPluginServers() {
+export function canStartEnabledPluginServers(policy: DeploymentPolicy | undefined): boolean {
+  return Boolean(
+    policy
+      && policy.profile !== 'product-qa-readonly'
+      && hasPluginExecutionCapability(policy),
+  );
+}
+
+/**
+ * Start servers for all enabled plugins that have a server entry.
+ * Called once on host server boot. An explicit policy is required; an omitted
+ * policy fails closed rather than inheriting a stale local plugin config.
+ */
+export async function startEnabledPluginServers(
+  deploymentPolicy?: DeploymentPolicy,
+) {
+  if (!canStartEnabledPluginServers(deploymentPolicy)) {
+    console.log('[Plugins] Plugin server startup skipped by deployment policy');
+    return;
+  }
+
   const plugins = scanPlugins();
   const config = getPluginsConfig();
 

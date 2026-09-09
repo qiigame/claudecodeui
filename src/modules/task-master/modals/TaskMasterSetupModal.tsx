@@ -9,16 +9,24 @@ import type { TaskMasterProject } from '@/shared/types';
 type TaskMasterSetupModalProps = {
   isOpen: boolean;
   project: TaskMasterProject | null;
+  /** TaskMaster init writes `.taskmaster` state and starts a shell process. */
+  canMutate?: boolean;
   onClose: () => void;
   onAfterClose?: (() => void) | null;
 };
 
 /** Rendered by TaskBoard and NextTaskBanner to run TaskMaster initialisation for a project in an embedded shell. */
-export default function TaskMasterSetupModal({ isOpen, project, onClose, onAfterClose = null }: TaskMasterSetupModalProps) {
+export default function TaskMasterSetupModal({
+  isOpen,
+  project,
+  canMutate = false,
+  onClose,
+  onAfterClose = null,
+}: TaskMasterSetupModalProps) {
   const { t } = useTranslation('tasks');
   const [isTaskMasterComplete, setIsTaskMasterComplete] = useState(false);
 
-  if (!isOpen || !project) {
+  if (!isOpen || !project || !canMutate) {
     return null;
   }
 
@@ -60,7 +68,7 @@ export default function TaskMasterSetupModal({ isOpen, project, onClose, onAfter
             <Shell
               selectedProject={project}
               selectedSession={null}
-              initialCommand="npx task-master init"
+              initialCommand="task-master init"
               isPlainShell
               isActive
               onProcessComplete={(exitCode) => {

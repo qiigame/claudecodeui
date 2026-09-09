@@ -4,6 +4,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 
 import { resetUserPreferences, writeUserPreference } from '@/shared/userSettings';
+import type { ProjectSession } from '@/shared/types';
 
 /**
  * The four per-provider default models used to be four useState slots with four
@@ -18,6 +19,11 @@ const okJson = (data: unknown) => Promise.resolve({
   json: async () => data,
 });
 
+const providerModelsRequest = vi.fn((_provider: string) => okJson({
+  success: true,
+  data: null,
+}));
+
 vi.mock('@/shared/api', () => ({
   api: {
     // The preference store PATCHes through api.user; it is stubbed rather than
@@ -27,7 +33,7 @@ vi.mock('@/shared/api', () => ({
       savePreferences: () => okJson({ success: true, preferences: {} }),
     },
     providers: {
-      models: () => okJson({ success: true, data: null }),
+      models: (provider: string) => providerModelsRequest(provider),
       capabilities: () => okJson({ success: true, data: null }),
       sessionActiveModel: () => okJson({ success: true, data: null }),
       setSessionActiveModel: () => okJson({ success: true, data: null }),
@@ -39,17 +45,21 @@ vi.mock('@/shared/api', () => ({
   },
 }));
 
-const renderProviderState = async () => {
+const renderProviderState = async (
+  readOnly = false,
+  selectedSession: Pick<ProjectSession, 'id' | 'provider' | '__provider'> | null = null,
+) => {
   const { useChatProviderState } = await import(
     '@/modules/chat/hooks/useChatProviderState'
   );
   return renderHook(() =>
-    useChatProviderState({ selectedSession: null, selectedProject: null }),
+    useChatProviderState({ selectedSession, selectedProject: null, readOnly }),
   );
 };
 
 beforeEach(() => {
   localStorage.clear();
+  providerModelsRequest.mockClear();
   // The preference store is a module-level singleton, so its in-memory copy
   // outlives localStorage.clear() and would leak one test's writes into the next.
   resetUserPreferences();
@@ -145,4 +155,55 @@ test('the active provider’s model is what currentProviderModel reports', async
     assert.equal(result.current.provider, 'cursor');
   });
   assert.equal(result.current.currentProviderModel, 'cursor-active');
+});
+
+test('a read-only deployment falls back from an unsafe persisted provider for new chats', async () => {
+  writeUserPreference('selectedProvider', 'cursor');
+
+  const { result } = await renderProviderState(true);
+
+  await waitFor(() => {
+    assert.ok(['codex', 'claude'].includes(result.current.provider));
+  });
+  assert.equal(result.current.availablePermissionModes.length, 0);
+});
+
+test('a read-only deployment loads catalogs only for its proven runtime providers', async () => {
+  await renderProviderState(true);
+
+  await waitFor(() => {
+    assert.equal(providerModelsRequest.mock.calls.length, 2);
+  });
+  assert.deepEqual(
+    providerModelsRequest.mock.calls.map(([provider]) => provider).sort(),
+    ['claude', 'codex'],
+  );
+});
+
+test('a writable deployment retains all provider catalogs', async () => {
+  await renderProviderState(false);
+
+  await waitFor(() => {
+    assert.equal(providerModelsRequest.mock.calls.length, 4);
+  });
+  assert.deepEqual(
+    providerModelsRequest.mock.calls.map(([provider]) => provider).sort(),
+    ['claude', 'codex', 'cursor', 'opencode'],
+  );
+});
+
+test('session provider fallback also honors the public provider field in read-only mode', async () => {
+  writeUserPreference('selectedProvider', 'codex');
+
+  const { result } = await renderProviderState(true, {
+    id: 'legacy-opencode-session',
+    provider: 'opencode',
+  });
+
+  await waitFor(() => {
+    assert.equal(result.current.provider, 'opencode');
+  });
+  // The transcript remains readable, but the provider hook must not silently
+  // replace the server-owned session provider with the browser default.
+  assert.equal(result.current.availablePermissionModes.length, 0);
 });

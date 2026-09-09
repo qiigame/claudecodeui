@@ -6,6 +6,7 @@ import type { ProviderSkillSource } from '@/shared/types.js';
 import {
   addUniqueProviderSkillSource,
   findTopmostGitRoot,
+  resolveCodexHomeDirectory,
 } from '@/shared/utils.js';
 
 export class CodexSkillsProvider extends SkillsProvider {
@@ -46,7 +47,7 @@ export class CodexSkillsProvider extends SkillsProvider {
     });
     addUniqueProviderSkillSource(sources, seenRootDirs, {
       scope: 'user',
-      rootDir: path.join(os.homedir(), '.codex', 'skills'),
+      rootDir: path.join(resolveCodexHomeDirectory(), 'skills'),
       commandPrefix: '$',
     });
     addUniqueProviderSkillSource(sources, seenRootDirs, {
@@ -56,7 +57,7 @@ export class CodexSkillsProvider extends SkillsProvider {
     });
     addUniqueProviderSkillSource(sources, seenRootDirs, {
       scope: 'system',
-      rootDir: path.join(os.homedir(), '.codex', 'skills', '.system'),
+      rootDir: path.join(resolveCodexHomeDirectory(), 'skills', '.system'),
       commandPrefix: '$',
     });
 
@@ -66,6 +67,8 @@ export class CodexSkillsProvider extends SkillsProvider {
   protected async getGlobalSkillSource(): Promise<ProviderSkillSource> {
     return {
       scope: 'user',
+      // `.agents/skills` is a Codex-wide shared skill directory and remains
+      // anchored to the host home; only `.codex` storage is instance-specific.
       rootDir: path.join(os.homedir(), '.agents', 'skills'),
       commandPrefix: '$',
     };

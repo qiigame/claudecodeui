@@ -2,6 +2,7 @@ import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { AuthenticatedUserMenu } from '@/modules/auth';
 import type { AppTab, Project, ProjectSession } from '@/shared/types';
 import { cn } from '@/shared/utils';
 import MobileMenuButton from '@/modules/project-workspace/MobileMenuButton';
@@ -15,6 +16,12 @@ type WorkspaceHeaderProps = {
   selectedSession: ProjectSession | null;
   shouldShowTasksTab: boolean;
   shouldShowBrowserTab: boolean;
+  canReadFiles: boolean;
+  canReadGit: boolean;
+  canUseTerminal: boolean;
+  canReadBrowser: boolean;
+  canReadPlugins: boolean;
+  canUsePlugins: boolean;
   isMobile: boolean;
   onMenuClick: () => void;
 };
@@ -27,6 +34,12 @@ export default function WorkspaceHeader({
   selectedSession,
   shouldShowTasksTab,
   shouldShowBrowserTab,
+  canReadFiles,
+  canReadGit,
+  canUseTerminal,
+  canReadBrowser,
+  canReadPlugins,
+  canUsePlugins,
   isMobile,
   onMenuClick,
 }: WorkspaceHeaderProps) {
@@ -93,8 +106,8 @@ export default function WorkspaceHeader({
 
   return (
     <header className="pwa-header-safe flex-shrink-0 border-b border-border/60 bg-background/95 px-3 py-1.5 backdrop-blur-sm sm:px-4 sm:py-2">
-      <div className="flex min-w-0 flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-3">
-        <div className="flex min-w-0 items-center gap-2 sm:max-w-[min(34%,24rem)] sm:flex-[1_1_18rem]">
+      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1.5 sm:grid-cols-[minmax(12rem,24rem)_minmax(0,1fr)_auto] sm:gap-3">
+        <div className="col-start-1 row-start-1 flex min-w-0 items-center gap-2">
           {isMobile && <MobileMenuButton onMenuClick={onMenuClick} />}
           <WorkspaceTitle
             activeTab={activeTab}
@@ -104,7 +117,7 @@ export default function WorkspaceHeader({
           />
         </div>
 
-        <div className="-mx-3 min-w-0 sm:mx-0 sm:flex-1">
+        <div className="col-span-2 col-start-1 row-start-2 -mx-3 min-w-0 sm:col-span-1 sm:col-start-2 sm:row-start-1 sm:mx-0">
           <div className="relative ml-auto w-fit max-w-full">
             {canScrollLeft && (
               <div className="pointer-events-none absolute inset-y-0 left-0 z-10 w-12 bg-gradient-to-r from-background via-background/90 to-transparent" />
@@ -122,6 +135,12 @@ export default function WorkspaceHeader({
                 setActiveTab={setActiveTab}
                 shouldShowTasksTab={shouldShowTasksTab}
                 shouldShowBrowserTab={shouldShowBrowserTab}
+                canReadFiles={canReadFiles}
+                canReadGit={canReadGit}
+                canUseTerminal={canUseTerminal}
+                canReadBrowser={canReadBrowser}
+                canReadPlugins={canReadPlugins}
+                canUsePlugins={canUsePlugins}
               />
             </div>
             {canScrollRight && (
@@ -149,6 +168,10 @@ export default function WorkspaceHeader({
               </button>
             )}
           </div>
+        </div>
+
+        <div className="col-start-2 row-start-1 min-w-0 justify-self-end sm:col-start-3">
+          <AuthenticatedUserMenu />
         </div>
       </div>
     </header>

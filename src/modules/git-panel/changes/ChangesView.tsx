@@ -25,6 +25,8 @@ type ChangesViewProps = {
   onCommitChanges: (message: string, files: string[]) => Promise<boolean>;
   onRequestConfirmation: (request: ConfirmationRequest) => void;
   onExpandedFilesChange: (hasExpandedFiles: boolean) => void;
+  /** Enables staging, discard and commit controls for writable deployments. */
+  canMutateGit?: boolean;
 };
 
 /** Rendered by GitPanel for the Changes tab, listing working-tree changes and hosting the commit composer. */
@@ -46,6 +48,7 @@ export default function ChangesView({
   onCommitChanges,
   onRequestConfirmation,
   onExpandedFilesChange,
+  canMutateGit = false,
 }: ChangesViewProps) {
   const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
@@ -111,6 +114,7 @@ export default function ChangesView({
   // index in sync and the final status refresh re-syncs once the queue drains.
   const toggleFileSelected = useCallback(
     (filePath: string) => {
+      if (!canMutateGit) return;
       const isStaged = selectedFiles.has(filePath);
       setSelectedFiles((previous) => {
         const next = new Set(previous);
@@ -123,11 +127,17 @@ export default function ChangesView({
       });
       enqueueStageOp(() => (isStaged ? onUnstageFiles([filePath]) : onStageFiles([filePath])));
     },
-    [enqueueStageOp, onStageFiles, onUnstageFiles, selectedFiles],
+    [canMutateGit, enqueueStageOp, onStageFiles, onUnstageFiles, selectedFiles],
   );
 
   const requestFileAction = useCallback(
     (filePath: string, status: FileStatusCode) => {
+      // Keep the callback fail-closed as well as hiding row controls. This
+      // matters when a policy/identity change happens while a diff row is
+      // mounted and a stale click handler is still queued in the browser.
+      if (!canMutateGit) {
+        return;
+      }
       if (status === 'U') {
         onRequestConfirmation({
           type: 'delete',
@@ -147,7 +157,7 @@ export default function ChangesView({
         },
       });
     },
-    [onDeleteFile, onDiscardFile, onRequestConfirmation],
+    [canMutateGit, onDeleteFile, onDiscardFile, onRequestConfirmation],
   );
 
   const commitSelectedFiles = useCallback(
@@ -164,14 +174,16 @@ export default function ChangesView({
 
   return (
     <>
-      <CommitComposer
-        isMobile={isMobile}
-        projectPath={projectPath}
-        selectedFileCount={selectedFiles.size}
-        isHidden={hasExpandedFiles}
-        onCommit={commitSelectedFiles}
-        onRequestConfirmation={onRequestConfirmation}
-      />
+      {canMutateGit && (
+        <CommitComposer
+          isMobile={isMobile}
+          projectPath={projectPath}
+          selectedFileCount={selectedFiles.size}
+          isHidden={hasExpandedFiles}
+          onCommit={commitSelectedFiles}
+          onRequestConfirmation={onRequestConfirmation}
+        />
+      )}
 
       {!gitStatus?.error && <FileStatusLegend isMobile={isMobile} />}
 
@@ -189,9 +201,10 @@ export default function ChangesView({
             <p className="mb-6 max-w-md text-sm text-muted-foreground">
               This repository doesn&apos;t have any commits yet. Create your first commit to start tracking changes.
             </p>
-            <button
-              onClick={() => void onCreateInitialCommit()}
-              disabled={isCreatingInitialCommit}
+            {canMutateGit ? (
+              <button
+                onClick={() => void onCreateInitialCommit()}
+                disabled={isCreatingInitialCommit}
               className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {isCreatingInitialCommit ? (
@@ -205,7 +218,10 @@ export default function ChangesView({
                   <span>Create Initial Commit</span>
                 </>
               )}
-            </button>
+              </button>
+            ) : (
+              <p className="text-sm text-muted-foreground">This deployment is read-only.</p>
+            )}
           </div>
         ) : !gitStatus || !hasChangedFiles(gitStatus) ? (
           <div className="flex h-32 flex-col items-center justify-center text-muted-foreground">
@@ -219,7 +235,7 @@ export default function ChangesView({
               <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 Staged ({selectedFiles.size})
               </span>
-              {selectedFiles.size > 0 && (
+              {canMutateGit && selectedFiles.size > 0 && (
                 <button
                   onClick={() => {
                     const filesToUnstage = Array.from(selectedFiles);
@@ -248,6 +264,7 @@ export default function ChangesView({
                 onOpenFile={(filePath) => { void onOpenFile(filePath); }}
                 onToggleWrapText={() => onWrapTextChange(!wrapText)}
                 onRequestFileAction={requestFileAction}
+                canMutateGit={canMutateGit}
               />
             )}
 
@@ -256,7 +273,7 @@ export default function ChangesView({
               <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 Changes ({unstagedFiles.size})
               </span>
-              {unstagedFiles.size > 0 && (
+              {canMutateGit && unstagedFiles.size > 0 && (
                 <button
                   onClick={() => {
                     const filesToStage = Array.from(unstagedFiles);
@@ -285,6 +302,7 @@ export default function ChangesView({
                 onOpenFile={(filePath) => { void onOpenFile(filePath); }}
                 onToggleWrapText={() => onWrapTextChange(!wrapText)}
                 onRequestFileAction={requestFileAction}
+                canMutateGit={canMutateGit}
               />
             )}
           </div>

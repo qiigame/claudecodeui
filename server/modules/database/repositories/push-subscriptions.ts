@@ -41,7 +41,18 @@ export const pushSubscriptionsDb = {
       .all(userId) as PushSubscriptionLookupRow[];
   },
 
-  /** Deletes one subscription by endpoint. */
+  /** Deletes one subscription only when it belongs to the given user. */
+  deletePushSubscriptionForUser(userId: number, endpoint: string): void {
+    const db = getConnection();
+    db.prepare('DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?').run(userId, endpoint);
+  },
+
+  /**
+   * Legacy unscoped delete retained for non-HTTP embedders that still call the
+   * old repository API. Authenticated settings flows must use the scoped
+   * method below; keeping this alias avoids an unrelated breaking change while
+   * ensuring the application route no longer reaches it.
+   */
   deletePushSubscription(endpoint: string): void {
     const db = getConnection();
     db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(endpoint);
@@ -71,10 +82,14 @@ export const pushSubscriptionsDb = {
     return pushSubscriptionsDb.getPushSubscriptions(userId);
   },
   removeSubscription(endpoint: string): void {
+    // Kept as a compatibility alias for non-HTTP embedders. New authenticated
+    // callers must use removeSubscriptionForUser, which enforces ownership.
     pushSubscriptionsDb.deletePushSubscription(endpoint);
+  },
+  removeSubscriptionForUser(userId: number, endpoint: string): void {
+    pushSubscriptionsDb.deletePushSubscriptionForUser(userId, endpoint);
   },
   removeAllForUser(userId: number): void {
     pushSubscriptionsDb.deletePushSubscriptionsForUser(userId);
   },
 };
-

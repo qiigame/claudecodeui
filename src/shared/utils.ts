@@ -11,6 +11,20 @@ import type { Project, ProjectSession } from '@/shared/types';
  */
 export const IS_PLATFORM = import.meta.env?.VITE_IS_PLATFORM === 'true';
 
+/**
+ * Whether this build presents coding-agent runtimes instead of exposing their
+ * model catalogs. The environment-derived value is opt-in so standard
+ * CloudCLI builds keep their existing model-selection experience.
+ */
+export const comicRuntimeOnly = import.meta.env?.VITE_COMIC_RUNTIME_ONLY === 'true';
+
+/**
+ * Whether the optional TaskMaster product surface is available in this build.
+ * It defaults on for upstream-compatible builds and can be disabled per
+ * deployment without uninstalling the CLI or deleting project task data.
+ */
+export const taskMasterUiEnabled = import.meta.env?.VITE_TASKMASTER_UI_ENABLED !== 'false';
+
 // ---------------------------
 
 //----------------- TAILWIND CLASS COMPOSITION ------------

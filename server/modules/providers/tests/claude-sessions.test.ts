@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -31,6 +31,14 @@ async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promis
 const SESSION_ID = 'claude-session-1';
 const AGENT_ID = 'a1b2c3d4e5f60718';
 const AGENT_TOOL_USE_ID = 'toolu_agent_1';
+
+// These tests intentionally place transcripts in temporary directories rather
+// than a real Claude config root. Production history readers use the strict
+// canonical-root/metadata validator; this explicit seam keeps the behavior
+// tests focused on message normalization and branch handling.
+const createFixtureProvider = (): ClaudeSessionsProvider => new ClaudeSessionsProvider({
+  validateTranscriptPath: async ({ candidatePath }) => candidatePath,
+});
 
 /**
  * Writes the transcript pair current Claude versions produce for one async
@@ -153,7 +161,7 @@ test('Claude history attaches a subagent transcript stored under the session dir
       const now = new Date().toISOString();
       sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Subagent session', now, now, parentPath);
 
-      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+      const history = await createFixtureProvider().fetchHistory(SESSION_ID, {
         providerSessionId: SESSION_ID,
       });
       const agentRow = history.messages.find(
@@ -178,6 +186,85 @@ test('Claude history attaches a subagent transcript stored under the session dir
   }
 });
 
+test('Claude history does not read a subagent transcript outside the project directory', { concurrency: false }, async () => {
+  const containerRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-subagent-path-boundary-'));
+  const projectDirectory = path.join(containerRoot, 'project');
+  await mkdir(projectDirectory);
+
+  try {
+    const parentPath = await writeClaudeSubagentSession(projectDirectory);
+    await dropTaskNotification(parentPath);
+
+    // The old path construction accepted enough `..` segments to make the
+    // legacy sibling layout resolve into the parent of the project directory.
+    const escapedAgentId = '../../../outside-agent';
+    const parentRaw = await readFile(parentPath, 'utf8');
+    await writeFile(parentPath, parentRaw.split(AGENT_ID).join(escapedAgentId), 'utf8');
+    await writeFile(
+      path.join(containerRoot, 'outside-agent.jsonl'),
+      `${JSON.stringify({
+        message: { role: 'assistant', content: [{ type: 'text', text: 'secret outside transcript' }] },
+      })}\n`,
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      const now = new Date().toISOString();
+      sessionsDb.createSession(SESSION_ID, 'claude', projectDirectory, 'Subagent session', now, now, parentPath);
+
+      const history = await createFixtureProvider().fetchHistory(SESSION_ID, {
+        providerSessionId: SESSION_ID,
+      });
+      const serializedHistory = JSON.stringify(history);
+      assert.equal(serializedHistory.includes('secret outside transcript'), false);
+      const agentRow = history.messages.find(
+        (message) => message.kind === 'tool_use' && message.toolId === AGENT_TOOL_USE_ID,
+      );
+      assert.equal(agentRow?.subagentTools, undefined);
+    });
+  } finally {
+    await rm(containerRoot, { recursive: true, force: true });
+  }
+});
+
+test('Claude history does not follow a subagent transcript symlink outside the project directory', { concurrency: false }, async () => {
+  const containerRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-subagent-symlink-boundary-'));
+  const projectDirectory = path.join(containerRoot, 'project');
+
+  try {
+    const parentPath = await writeClaudeSubagentSession(projectDirectory);
+    const outsideTranscript = path.join(containerRoot, 'outside-agent.jsonl');
+    await writeFile(
+      outsideTranscript,
+      `${JSON.stringify({
+        message: { role: 'assistant', content: [{ type: 'text', text: 'secret symlink transcript' }] },
+      })}\n`,
+      'utf8',
+    );
+
+    const agentPath = path.join(projectDirectory, SESSION_ID, 'subagents', `agent-${AGENT_ID}.jsonl`);
+    await rm(agentPath);
+    await symlink(outsideTranscript, agentPath);
+
+    await withIsolatedDatabase(async () => {
+      const now = new Date().toISOString();
+      sessionsDb.createSession(SESSION_ID, 'claude', projectDirectory, 'Subagent session', now, now, parentPath);
+
+      const history = await createFixtureProvider().fetchHistory(SESSION_ID, {
+        providerSessionId: SESSION_ID,
+      });
+      const serializedHistory = JSON.stringify(history);
+      assert.equal(serializedHistory.includes('secret symlink transcript'), false);
+      const agentRow = history.messages.find(
+        (message) => message.kind === 'tool_use' && message.toolId === AGENT_TOOL_USE_ID,
+      );
+      assert.equal(agentRow?.subagentTools, undefined);
+    });
+  } finally {
+    await rm(containerRoot, { recursive: true, force: true });
+  }
+});
+
 test('Claude history folds an agent task notification into the call that spawned it', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-notification-'));
 
@@ -188,7 +275,7 @@ test('Claude history folds an agent task notification into the call that spawned
       const now = new Date().toISOString();
       sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Subagent session', now, now, parentPath);
 
-      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+      const history = await createFixtureProvider().fetchHistory(SESSION_ID, {
         providerSessionId: SESSION_ID,
       });
       const agentRow = history.messages.find(
@@ -230,7 +317,7 @@ test('Claude history reads a missing notification off the agent\'s own transcrip
       const now = new Date().toISOString();
       sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Subagent session', now, now, parentPath);
 
-      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+      const history = await createFixtureProvider().fetchHistory(SESSION_ID, {
         providerSessionId: SESSION_ID,
       });
       const agentRow = history.messages.find(
@@ -269,7 +356,7 @@ test('Claude history keeps an agent running when its transcript stops mid tool c
       const now = new Date().toISOString();
       sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Subagent session', now, now, parentPath);
 
-      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+      const history = await createFixtureProvider().fetchHistory(SESSION_ID, {
         providerSessionId: SESSION_ID,
       });
       const agentRow = history.messages.find(
@@ -313,7 +400,7 @@ test('Claude history trims a subagent timeline down to a preview', { concurrency
       const now = new Date().toISOString();
       sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Subagent session', now, now, parentPath);
 
-      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+      const history = await createFixtureProvider().fetchHistory(SESSION_ID, {
         providerSessionId: SESSION_ID,
       });
       const agentRow = history.messages.find(
@@ -386,7 +473,7 @@ test('an edited prompt replaces the one it superseded instead of stacking on it'
       const now = new Date().toISOString();
       sessionsDb.createSession(EDIT_SESSION_ID, 'claude', tempRoot, 'Edited session', now, now, transcriptPath);
 
-      const history = await new ClaudeSessionsProvider().fetchHistory(EDIT_SESSION_ID, {
+      const history = await createFixtureProvider().fetchHistory(EDIT_SESSION_ID, {
         providerSessionId: EDIT_SESSION_ID,
       });
       const texts = history.messages.map((message) => message.content);
@@ -443,7 +530,7 @@ test('parallel tool calls are not mistaken for an edit', { concurrency: false },
       const now = new Date().toISOString();
       sessionsDb.createSession(sessionId, 'claude', tempRoot, 'Parallel tools', now, now, transcriptPath);
 
-      const history = await new ClaudeSessionsProvider().fetchHistory(sessionId, {
+      const history = await createFixtureProvider().fetchHistory(sessionId, {
         providerSessionId: sessionId,
       });
 
@@ -469,7 +556,7 @@ test('resolving an edit anchor returns the assistant turn before it', { concurre
     await withIsolatedDatabase(async () => {
       const now = new Date().toISOString();
       sessionsDb.createSession(EDIT_SESSION_ID, 'claude', tempRoot, 'Edited session', now, now, transcriptPath);
-      const provider = new ClaudeSessionsProvider();
+      const provider = createFixtureProvider();
 
       // Resuming is inclusive of the row it names, so replacing `u2b` must
       // resume through `a1` — naming `u2b` itself would leave the prompt being
@@ -505,7 +592,7 @@ test('user turns carry the transcript uuid so they can be edited', { concurrency
       const now = new Date().toISOString();
       sessionsDb.createSession(EDIT_SESSION_ID, 'claude', tempRoot, 'Edited session', now, now, transcriptPath);
 
-      const history = await new ClaudeSessionsProvider().fetchHistory(EDIT_SESSION_ID, {
+      const history = await createFixtureProvider().fetchHistory(EDIT_SESSION_ID, {
         providerSessionId: EDIT_SESSION_ID,
       });
 
@@ -563,7 +650,7 @@ test('resolving an edit anchor skips rows that are not conversation turns', { co
       sessionsDb.createSession(sessionId, 'claude', tempRoot, 'Anchor skip', now, now, transcriptPath);
 
       assert.deepEqual(
-        await new ClaudeSessionsProvider().resolveEditAnchor(sessionId, 'su2'),
+        await createFixtureProvider().resolveEditAnchor(sessionId, 'su2'),
         { found: true, resumeThroughId: 'sa1' },
       );
     });

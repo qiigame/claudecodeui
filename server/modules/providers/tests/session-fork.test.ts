@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { parseDeploymentPolicy } from '@/modules/deployment-policy/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import type { IProviderFork } from '@/shared/interfaces.js';
@@ -161,6 +162,41 @@ test('a provider without the capability is refused rather than silently ignored'
     },
     { disableFork: true },
   );
+});
+
+test('product QA read-only policy refuses a provider fork before invoking the adapter', async () => {
+  await withForkableClaude(async ({ calls, directory }) => {
+    seedSource(directory);
+
+    await assert.rejects(
+      () => sessionsService.forkSessionById(
+        SOURCE_ID,
+        {},
+        parseDeploymentPolicy({ CLOUDCLI_DEPLOYMENT_PROFILE: 'product-qa-readonly' }),
+      ),
+      (error: Error & { code?: string; statusCode?: number }) => (
+        error.code === 'DEPLOYMENT_CAPABILITY_DENIED' && error.statusCode === 403
+      ),
+    );
+    assert.equal(calls.length, 0);
+    assert.ok(sessionsDb.getSessionById(SOURCE_ID));
+  });
+});
+
+test('product QA read-only policy refuses transcript rewind before provider dispatch', async () => {
+  await withForkableClaude(async ({ directory }) => {
+    seedSource(directory);
+
+    assert.throws(
+      () => sessionsService.providerRewindsForEdit(
+        SOURCE_ID,
+        parseDeploymentPolicy({ CLOUDCLI_DEPLOYMENT_PROFILE: 'product-qa-readonly' }),
+      ),
+      (error: Error & { code?: string; statusCode?: number }) => (
+        error.code === 'DEPLOYMENT_CAPABILITY_DENIED' && error.statusCode === 403
+      ),
+    );
+  });
 });
 
 test('forking a session that does not exist is a 404', async () => {

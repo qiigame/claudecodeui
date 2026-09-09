@@ -96,113 +96,113 @@ export default function FileContextMenu({
 
   const menuActions = useMemo<ContextMenuAction[]>(() => {
     if (item?.type === 'file') {
-      return [
-        {
+      const actions: ContextMenuAction[] = [];
+      if (onRename) actions.push({
           key: 'rename',
           icon: Pencil,
           label: t('fileTree.context.rename', 'Rename'),
-          onSelect: () => onRename?.(item),
-        },
-        {
+          onSelect: () => onRename(item),
+        });
+      if (onDelete) actions.push({
           key: 'delete',
           icon: Trash2,
           label: t('fileTree.context.delete', 'Delete'),
-          onSelect: () => onDelete?.(item),
+          onSelect: () => onDelete(item),
           isDanger: true,
-        },
-        {
+        });
+      if (onCopyPath) actions.push({
           key: 'copyPath',
           icon: Copy,
           label: t('fileTree.context.copyPath', 'Copy Path'),
-          onSelect: () => onCopyPath?.(item),
-          showDividerBefore: true,
-        },
-        {
+          onSelect: () => onCopyPath(item),
+          showDividerBefore: actions.length > 0,
+        });
+      if (onDownload) actions.push({
           key: 'download',
           icon: Download,
           label: t('fileTree.context.download', 'Download'),
-          onSelect: () => onDownload?.(item),
-        },
-      ];
+          onSelect: () => onDownload(item),
+        });
+      return actions;
     }
 
     if (item?.type === 'directory') {
-      return [
-        {
+      const actions: ContextMenuAction[] = [];
+      if (onNewFile) actions.push({
           key: 'newFile',
           icon: FileText,
           label: t('fileTree.context.newFile', 'New File'),
-          onSelect: () => onNewFile?.(item.path),
-        },
-        {
+          onSelect: () => onNewFile(item.path),
+        });
+      if (onNewFolder) actions.push({
           key: 'newFolder',
           icon: FolderPlus,
           label: t('fileTree.context.newFolder', 'New Folder'),
-          onSelect: () => onNewFolder?.(item.path),
-        },
-        {
+          onSelect: () => onNewFolder(item.path),
+        });
+      if (onUpload) actions.push({
           key: 'upload',
           icon: Upload,
           label: t('fileTree.context.upload', 'Upload Files'),
-          onSelect: () => onUpload?.(item.path),
-        },
-        {
+          onSelect: () => onUpload(item.path),
+        });
+      if (onRename) actions.push({
           key: 'rename',
           icon: Pencil,
           label: t('fileTree.context.rename', 'Rename'),
-          onSelect: () => onRename?.(item),
-          showDividerBefore: true,
-        },
-        {
+          onSelect: () => onRename(item),
+          showDividerBefore: actions.length > 0,
+        });
+      if (onDelete) actions.push({
           key: 'delete',
           icon: Trash2,
           label: t('fileTree.context.delete', 'Delete'),
-          onSelect: () => onDelete?.(item),
+          onSelect: () => onDelete(item),
           isDanger: true,
-        },
-        {
+        });
+      if (onCopyPath) actions.push({
           key: 'copyPath',
           icon: Copy,
           label: t('fileTree.context.copyPath', 'Copy Path'),
-          onSelect: () => onCopyPath?.(item),
-          showDividerBefore: true,
-        },
-        {
+          onSelect: () => onCopyPath(item),
+          showDividerBefore: actions.length > 0,
+        });
+      if (onDownload) actions.push({
           key: 'download',
           icon: Download,
           label: t('fileTree.context.download', 'Download'),
-          onSelect: () => onDownload?.(item),
-        },
-      ];
+          onSelect: () => onDownload(item),
+        });
+      return actions;
     }
 
-    return [
-      {
+    const actions: ContextMenuAction[] = [];
+    if (onNewFile) actions.push({
         key: 'newFile',
         icon: FileText,
         label: t('fileTree.context.newFile', 'New File'),
-        onSelect: () => onNewFile?.(''),
-      },
-      {
+        onSelect: () => onNewFile(''),
+      });
+    if (onNewFolder) actions.push({
         key: 'newFolder',
         icon: FolderPlus,
         label: t('fileTree.context.newFolder', 'New Folder'),
-        onSelect: () => onNewFolder?.(''),
-      },
-      {
+        onSelect: () => onNewFolder(''),
+      });
+    if (onUpload) actions.push({
         key: 'upload',
         icon: Upload,
         label: t('fileTree.context.upload', 'Upload Files'),
-        onSelect: () => onUpload?.(''),
-      },
-      {
+        onSelect: () => onUpload(''),
+      });
+    if (onRefresh) actions.push({
         key: 'refresh',
         icon: RefreshCw,
         label: t('fileTree.context.refresh', 'Refresh'),
         onSelect: onRefresh,
-        showDividerBefore: true,
-      },
-    ];
+        showDividerBefore: actions.length > 0,
+      });
+    return actions;
   }, [item, onCopyPath, onDelete, onDownload, onNewFile, onNewFolder, onRefresh, onRename, onUpload, t]);
 
   useEffect(() => {

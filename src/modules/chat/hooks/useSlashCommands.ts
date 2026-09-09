@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Dispatch, KeyboardEvent, RefObject, SetStateAction } from 'react';
 
 import { api } from '@/shared/api';
+import { comicRuntimeOnly } from '@/shared/utils';
 import { safeLocalStorage } from '@/modules/chat/utils/chatStorage';
 import type { LLMProvider, Project, SlashCommand } from '@/shared/types';
 
@@ -11,6 +12,9 @@ const COMMAND_QUERY_DEBOUNCE_MS = 150;
 type UseSlashCommandsOptions = {
   selectedProject: Project | null;
   provider: LLMProvider;
+  canManageSettings: boolean;
+  /** Server-authorized capability for executing slash/custom commands. */
+  canExecuteCommands?: boolean;
   input: string;
   setInput: Dispatch<SetStateAction<string>>;
   textareaRef: RefObject<HTMLTextAreaElement>;
@@ -129,6 +133,10 @@ const filterSlashCommands = (
 export function useSlashCommands({
   selectedProject,
   provider,
+  canManageSettings,
+  // Command discovery and execution can invoke provider/tool side effects.
+  // Require the composition root to explicitly grant this capability.
+  canExecuteCommands = false,
   input,
   setInput,
   textareaRef,
@@ -162,7 +170,7 @@ export function useSlashCommands({
     let cancelled = false;
 
     const fetchCommands = async () => {
-      if (!selectedProject) {
+      if (!selectedProject || !canExecuteCommands) {
         setSlashCommands([]);
         setFilteredCommands([]);
         return;
@@ -170,7 +178,12 @@ export function useSlashCommands({
 
       try {
         const workspacePath = selectedProject.fullPath || selectedProject.path || '';
-        const response = await api.commands.list(workspacePath || selectedProject.path);
+        const response = await api.commands.list({
+          projectId: selectedProject.projectId,
+          ...(workspacePath || selectedProject.path
+            ? { projectPath: workspacePath || selectedProject.path }
+            : {}),
+        });
 
         if (!response.ok) {
           throw new Error('Failed to fetch commands');
@@ -194,9 +207,13 @@ export function useSlashCommands({
             type: 'custom',
           })),
         ];
+        const visibleCommands = allCommands.filter((command) => (
+          (!comicRuntimeOnly || command.name !== '/models')
+          && (canManageSettings || command.name !== '/config')
+        ));
 
         const parsedHistory = readCommandHistory(selectedProject.projectId);
-        const sortedCommands = [...allCommands].sort((commandA, commandB) => {
+        const sortedCommands = [...visibleCommands].sort((commandA, commandB) => {
           const commandAUsage = parsedHistory[commandA.name] || 0;
           const commandBUsage = parsedHistory[commandB.name] || 0;
           return commandBUsage - commandAUsage;
@@ -217,7 +234,7 @@ export function useSlashCommands({
     return () => {
       cancelled = true;
     };
-  }, [selectedProject, provider]);
+  }, [canExecuteCommands, canManageSettings, selectedProject, provider]);
 
   useEffect(() => {
     if (!showCommandMenu) {
@@ -226,11 +243,15 @@ export function useSlashCommands({
   }, [showCommandMenu]);
 
   useEffect(() => {
+    if (!canExecuteCommands) {
+      setFilteredCommands([]);
+      return;
+    }
     setFilteredCommands(filterSlashCommands(slashCommands, commandQuery));
-  }, [commandQuery, slashCommands]);
+  }, [canExecuteCommands, commandQuery, slashCommands]);
 
   const frequentCommands = useMemo(() => {
-    if (!selectedProject || slashCommands.length === 0) {
+    if (!canExecuteCommands || !selectedProject || slashCommands.length === 0) {
       return [];
     }
 
@@ -244,11 +265,11 @@ export function useSlashCommands({
       .filter((command) => command.usageCount > 0)
       .sort((commandA, commandB) => commandB.usageCount - commandA.usageCount)
       .slice(0, 5);
-  }, [selectedProject, slashCommands]);
+  }, [canExecuteCommands, selectedProject, slashCommands]);
 
   const trackCommandUsage = useCallback(
     (command: SlashCommand) => {
-      if (!selectedProject) {
+      if (!canExecuteCommands || !selectedProject) {
         return;
       }
 
@@ -256,11 +277,14 @@ export function useSlashCommands({
       parsedHistory[command.name] = (parsedHistory[command.name] || 0) + 1;
       saveCommandHistory(selectedProject.projectId, parsedHistory);
     },
-    [selectedProject],
+    [canExecuteCommands, selectedProject],
   );
 
   const insertCommandIntoInput = useCallback(
     (command: SlashCommand) => {
+      if (!canExecuteCommands) {
+        return;
+      }
       const currentTextarea = textareaRef.current;
       const insertionStart = slashPosition >= 0
         ? slashPosition
@@ -283,11 +307,14 @@ export function useSlashCommands({
         currentTextarea?.setSelectionRange(nextCursorPosition, nextCursorPosition);
       });
     },
-    [input, resetCommandMenuState, setInput, slashPosition, textareaRef],
+    [canExecuteCommands, input, resetCommandMenuState, setInput, slashPosition, textareaRef],
   );
 
   const executeNonSkillCommand = useCallback(
     (command: SlashCommand) => {
+      if (!canExecuteCommands) {
+        return;
+      }
       const executionResult = onExecuteCommand(command);
       if (isPromiseLike(executionResult)) {
         executionResult.then(
@@ -303,11 +330,14 @@ export function useSlashCommands({
         resetCommandMenuState();
       }
     },
-    [onExecuteCommand, resetCommandMenuState],
+    [canExecuteCommands, onExecuteCommand, resetCommandMenuState],
   );
 
   const selectCommandFromKeyboard = useCallback(
     (command: SlashCommand) => {
+      if (!canExecuteCommands) {
+        return;
+      }
       if (isSkillCommand(command)) {
         insertCommandIntoInput(command);
         return;
@@ -315,12 +345,12 @@ export function useSlashCommands({
 
       executeNonSkillCommand(command);
     },
-    [executeNonSkillCommand, insertCommandIntoInput],
+    [canExecuteCommands, executeNonSkillCommand, insertCommandIntoInput],
   );
 
   const handleCommandSelect = useCallback(
     (command: SlashCommand | null, index: number, isHover: boolean) => {
-      if (!command || !selectedProject) {
+      if (!canExecuteCommands || !command || !selectedProject) {
         return;
       }
 
@@ -337,10 +367,14 @@ export function useSlashCommands({
 
       executeNonSkillCommand(command);
     },
-    [selectedProject, trackCommandUsage, insertCommandIntoInput, executeNonSkillCommand],
+    [canExecuteCommands, selectedProject, trackCommandUsage, insertCommandIntoInput, executeNonSkillCommand],
   );
 
   const handleToggleCommandMenu = useCallback(() => {
+    if (!canExecuteCommands) {
+      return;
+    }
+
     const isOpening = !showCommandMenu;
     setShowCommandMenu(isOpening);
     setCommandQuery('');
@@ -351,10 +385,15 @@ export function useSlashCommands({
     }
 
     textareaRef.current?.focus();
-  }, [showCommandMenu, slashCommands, textareaRef]);
+  }, [canExecuteCommands, showCommandMenu, slashCommands, textareaRef]);
 
   const handleCommandInputChange = useCallback(
     (newValue: string, cursorPos: number) => {
+      if (!canExecuteCommands) {
+        resetCommandMenuState();
+        return;
+      }
+
       if (!newValue.trim()) {
         resetCommandMenuState();
         return;
@@ -391,12 +430,12 @@ export function useSlashCommands({
         setCommandQuery(query);
       }, COMMAND_QUERY_DEBOUNCE_MS);
     },
-    [resetCommandMenuState, clearCommandQueryTimer],
+    [canExecuteCommands, resetCommandMenuState, clearCommandQueryTimer],
   );
 
   const handleCommandMenuKeyDown = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>): boolean => {
-      if (!showCommandMenu) {
+      if (!canExecuteCommands || !showCommandMenu) {
         return false;
       }
 
@@ -443,7 +482,7 @@ export function useSlashCommands({
 
       return false;
     },
-    [showCommandMenu, filteredCommands, resetCommandMenuState, selectCommandFromKeyboard, selectedCommandIndex],
+    [canExecuteCommands, showCommandMenu, filteredCommands, resetCommandMenuState, selectCommandFromKeyboard, selectedCommandIndex],
   );
 
   useEffect(

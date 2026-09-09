@@ -20,6 +20,8 @@ type UsePrdSaveArgs = {
   projectId?: string;
   existingPrds: ExistingPrdFile[];
   isExistingFile: boolean;
+  /** Server-authorized capability for writing PRD/task-master files. */
+  canMutate?: boolean;
   onAfterSave?: () => Promise<void>;
 };
 
@@ -33,6 +35,11 @@ export function usePrdSave({
   projectId,
   existingPrds,
   isExistingFile,
+  // Mutation hooks fail closed when a caller has not supplied an explicit
+  // server-authorized capability. The normal PRDEditor path passes the
+  // developer/managed policy result; omitted callers must not regain write
+  // access merely because they mounted this hook directly.
+  canMutate = false,
   onAfterSave,
 }: UsePrdSaveArgs): UsePrdSaveResult {
   const [saving, setSaving] = useState<boolean>(false);
@@ -49,6 +56,13 @@ export function usePrdSave({
 
   const savePrd = useCallback(
     async ({ content, fileName, allowOverwrite = false }: SavePrdInput): Promise<SavePrdResult> => {
+      // Keep this guard at the API boundary as well as in PRDEditor's UI. A
+      // delayed keyboard shortcut or stale callback must not turn a read-only
+      // TaskMaster/QA view into a write request after policy changes.
+      if (!canMutate) {
+        return { status: 'failed', message: 'PRD editing is disabled in this deployment.' };
+      }
+
       if (!content.trim()) {
         return { status: 'failed', message: 'Please add content before saving.' };
       }
@@ -110,7 +124,7 @@ export function usePrdSave({
         setSaving(false);
       }
     },
-    [existingPrds, isExistingFile, onAfterSave, projectId],
+    [canMutate, existingPrds, isExistingFile, onAfterSave, projectId],
   );
 
   return {

@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { closeConnection, initializeDatabase, scheduledMessagesDb, sessionDraftsDb, sessionsDb, userDb } from '@/modules/database/index.js';
+import { parseDeploymentPolicy } from '@/modules/deployment-policy/index.js';
 import { dispatchDueScheduledMessages, dispatchQueuedMessages } from '@/modules/scheduled-messages/services/scheduled-message-dispatcher.service.js';
 import { scheduledMessagesService } from '@/modules/scheduled-messages/services/scheduled-messages.service.js';
 import { chatRunRegistry } from '@/modules/websocket/index.js';
@@ -69,6 +70,63 @@ test('a message due in the past is sent on the next pass, not skipped', async ()
   });
 });
 
+test('a read-only deployment dispatcher does not claim or execute due messages', async () => {
+  await withIsolatedDatabase(async (userId) => {
+    scheduledMessagesService.schedule({
+      userId,
+      sessionId: SESSION_ID,
+      content: 'must remain pending',
+      scheduledFor: new Date(Date.now() - 1_000).toISOString(),
+    });
+
+    const runs: RunCall[] = [];
+    const readonlyPolicy = parseDeploymentPolicy({
+      CLOUDCLI_DEPLOYMENT_PROFILE: 'product-qa-readonly',
+    });
+    assert.equal(
+      await dispatchDueScheduledMessages(createRuntime(runs), new Date(), readonlyPolicy),
+      0,
+    );
+    assert.equal(await dispatchQueuedMessages(createRuntime(runs), readonlyPolicy), 0);
+    assert.equal(runs.length, 0);
+    assert.equal(scheduledMessagesDb.listForSession(userId, SESSION_ID)[0].status, 'pending');
+  });
+});
+
+test('a pending or ambiguous actor cannot execute a scheduled provider turn', async () => {
+  await withIsolatedDatabase(async (userId) => {
+    const policy = parseDeploymentPolicy({ CLOUDCLI_DEPLOYMENT_PROFILE: 'developer' });
+    const runs: RunCall[] = [];
+
+    for (const status of ['pending', 'ambiguous'] as const) {
+      const sessionId = `${SESSION_ID}-${status}`;
+      sessionsDb.createAppSession(
+        sessionId,
+        'claude',
+        path.dirname(process.env.DATABASE_PATH as string),
+        `Scheduled ${status}`,
+      );
+      scheduledMessagesService.schedule({
+        userId,
+        sessionId,
+        content: `must not run while ${status}`,
+        scheduledFor: new Date(Date.now() - 1_000).toISOString(),
+      });
+
+      await dispatchDueScheduledMessages(createRuntime(runs), new Date(), policy, {
+        requireVerifiedDingTalkActor: true,
+        isActorVerified: () => false,
+      });
+
+      const row = scheduledMessagesDb.listForSession(userId, sessionId)[0];
+      assert.equal(row.status, 'pending');
+      assert.equal(row.failure_reason, null);
+    }
+
+    assert.equal(runs.length, 0);
+  });
+});
+
 test('a queued message is sent by the server without a browser connection', async () => {
   await withIsolatedDatabase(async (userId) => {
     sessionDraftsDb.saveDraft(userId, SESSION_ID, {
@@ -109,6 +167,29 @@ test('a queued message stays pending while its session is busy', async () => {
     assert.equal(runs.length, 0);
     assert.deepEqual(sessionDraftsDb.getDrafts(userId)[0]?.queuedMessage, {
       content: 'send after this run',
+    });
+  });
+});
+
+test('a queued message is retained when identity admission is pending', async () => {
+  await withIsolatedDatabase(async (userId) => {
+    sessionDraftsDb.saveDraft(userId, SESSION_ID, {
+      text: '',
+      queuedMessage: { content: 'retry after enrollment' },
+    });
+
+    const runs: RunCall[] = [];
+    const policy = parseDeploymentPolicy({ CLOUDCLI_DEPLOYMENT_PROFILE: 'developer' });
+    assert.equal(
+      await dispatchQueuedMessages(createRuntime(runs), policy, {
+        requireVerifiedDingTalkActor: true,
+        isActorVerified: () => false,
+      }),
+      1,
+    );
+    assert.equal(runs.length, 0);
+    assert.deepEqual(sessionDraftsDb.getDrafts(userId)[0]?.queuedMessage, {
+      content: 'retry after enrollment',
     });
   });
 });

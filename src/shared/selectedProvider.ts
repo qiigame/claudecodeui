@@ -1,4 +1,6 @@
 import type { LLMProvider } from '@/shared/types';
+import { COMIC_RUNTIME_PROVIDERS } from '@/shared/constants';
+import { comicRuntimeOnly } from '@/shared/utils';
 import { readUserPreference, writeUserPreference } from '@/shared/userSettings';
 
 /**
@@ -16,13 +18,15 @@ import { readUserPreference, writeUserPreference } from '@/shared/userSettings';
  * choice both reaches every reader at once and follows the user between devices.
  */
 
-const PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode'];
+const ALL_PROVIDERS: readonly LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode'];
+
+const SELECTABLE_PROVIDERS = comicRuntimeOnly ? COMIC_RUNTIME_PROVIDERS : ALL_PROVIDERS;
 
 const DEFAULT_PROVIDER: LLMProvider = 'claude';
 
 export function readSelectedProvider(): LLMProvider {
   const stored = readUserPreference<string | null>('selectedProvider', null);
-  return PROVIDERS.includes(stored as LLMProvider) ? (stored as LLMProvider) : DEFAULT_PROVIDER;
+  return SELECTABLE_PROVIDERS.includes(stored as LLMProvider) ? (stored as LLMProvider) : DEFAULT_PROVIDER;
 }
 
 export function writeSelectedProvider(provider: LLMProvider): void {

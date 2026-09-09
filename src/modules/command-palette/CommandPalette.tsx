@@ -1,15 +1,9 @@
 import * as React from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  ArrowDownToLine,
-  ArrowUpFromLine,
   ChevronRight,
-  FileText,
-  GitCommit,
-  GitMerge,
   MessageSquare,
   MessageSquarePlus,
-  RefreshCw,
   Settings,
   SunMoon,
   X,
@@ -27,24 +21,19 @@ import {
   DialogTitle,
 } from '@/shared/ui';
 import { useTheme } from '@/shared/context/ThemeContext';
-import { usePaletteOps } from '@/modules/command-palette/context/PaletteOpsContext';
 import { SETTINGS_MAIN_TABS } from '@/shared/constants';
+import { taskMasterUiEnabled } from '@/shared/utils';
 import type { AppTab, Project } from '@/shared/types';
 import { useSessionsSource } from '@/modules/command-palette/hooks/useSessionsSource';
-import { useFilesSource } from '@/modules/command-palette/hooks/useFilesSource';
-import { useCommitsSource } from '@/modules/command-palette/hooks/useCommitsSource';
 import { useSessionMessageSearch } from '@/modules/command-palette/hooks/useSessionMessageSearch';
-import { useBranchesSource } from '@/modules/command-palette/hooks/useBranchesSource';
-import { useGitActions } from '@/modules/command-palette/hooks/useGitActions';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
-type Page = 'actions' | 'files' | 'sessions' | 'commits' | 'branches';
+type Page = 'actions' | 'sessions';
 
 const PAGE_LABELS: Record<Page, string> = {
   actions: 'Actions',
-  files: 'Files',
   sessions: 'Sessions',
-  commits: 'Commits',
-  branches: 'Branches',
 };
 
 type CommandPaletteProps = {
@@ -56,13 +45,20 @@ type CommandPaletteProps = {
 
 const NAV_TABS: Array<{ id: AppTab; label: string; keywords: string }> = [
   { id: 'chat', label: 'Go to Chat', keywords: 'chat messages conversation' },
-  { id: 'files', label: 'Go to Files', keywords: 'files file tree explorer' },
+  { id: 'guide', label: 'Go to Guide', keywords: 'guide readme instructions documentation' },
   { id: 'shell', label: 'Go to Shell', keywords: 'shell terminal console' },
-  { id: 'git', label: 'Go to Git', keywords: 'git diff branches' },
   { id: 'tasks', label: 'Go to Tasks', keywords: 'tasks taskmaster' },
 ];
 
-/** Rendered by the project-workspace module to search projects, sessions, files, branches and commits and run their actions. */
+const baseVisibleNavTabs = taskMasterUiEnabled
+  ? NAV_TABS
+  : NAV_TABS.filter(({ id }) => id !== 'tasks');
+
+const visibleSettingsMainTabs = taskMasterUiEnabled
+  ? SETTINGS_MAIN_TABS
+  : SETTINGS_MAIN_TABS.filter(({ id }) => id !== 'tasks');
+
+/** Rendered by the project-workspace module to search sessions and run workspace actions. */
 function CommandPalette({
   selectedProject,
   onStartNewChat,
@@ -73,8 +69,24 @@ function CommandPalette({
   const [search, setSearch] = React.useState('');
   const [pages, setPages] = React.useState<Page[]>([]);
   const { toggleDarkMode } = useTheme();
+  const { authMode, user, canManageSettings: authCanManageSettings } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const managedIdentityRestricted = isManagedIdentityRestricted(authMode, user);
+  const canManageSettings = authCanManageSettings
+    && can('settings.write')
+    && !isReadOnly
+    && !managedIdentityRestricted;
+  // Shell navigation is an execution affordance.  Check the deployment's
+  // explicit read-only bit as well as individual capabilities so an
+  // inconsistent/stale capability map cannot expose the terminal entry.
+  const canUseTerminal = !isReadOnly
+    && !managedIdentityRestricted
+    && (can('terminal.interactive') || can('shell.exec'));
+  const visibleNavTabs = React.useMemo(
+    () => baseVisibleNavTabs.filter(({ id }) => id !== 'shell' || canUseTerminal),
+    [canUseTerminal],
+  );
   const navigate = useNavigate();
-  const ops = usePaletteOps();
 
   const page = pages.at(-1);
 
@@ -100,16 +112,9 @@ function CommandPalette({
 
   const showActions = !page || page === 'actions';
   const showSessions = !page || page === 'sessions';
-  const showFiles = !page || page === 'files';
-  const showCommits = !page || page === 'commits';
-  const showBranches = !page || page === 'branches' || page === 'actions';
 
   const sessions = useSessionsSource(projectId, open && showSessions);
   const messageMatches = useSessionMessageSearch(projectId, search, open && showSessions);
-  const files = useFilesSource(projectId, open && showFiles);
-  const commits = useCommitsSource(projectId, open && showCommits);
-  const branches = useBranchesSource(projectId, open && showBranches);
-  const git = useGitActions(projectId);
 
   const sessionRows = React.useMemo(() => {
     if (!showSessions) return [];
@@ -156,12 +161,11 @@ function CommandPalette({
     }
   }, [search, pages.length, popPage]);
 
-  const startNewChatDisabled = !selectedProject;
+  const startNewChatDisabled = !selectedProject
+    || !can('session.write')
+    || managedIdentityRestricted;
   const browseLimit = 5;
-  const filesShown = page === 'files' ? files : files.slice(0, browseLimit);
-  const commitsShown = page === 'commits' ? commits : commits.slice(0, browseLimit);
   const sessionsShown = page === 'sessions' ? sessionRows : sessionRows.slice(0, browseLimit);
-  const branchesShown = page === 'branches' ? branches : branches.slice(0, browseLimit);
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -208,10 +212,12 @@ function CommandPalette({
                     <span className="text-xs text-muted-foreground">Select a project first</span>
                   )}
                 </CommandItem>
-                <CommandItem value="Open settings" onSelect={() => run(() => onOpenSettings())}>
-                  <Settings className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <span className="flex-1">Open settings</span>
-                </CommandItem>
+                {canManageSettings && (
+                  <CommandItem value="Open settings" onSelect={() => run(() => onOpenSettings())}>
+                    <Settings className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+                    <span className="flex-1">Open settings</span>
+                  </CommandItem>
+                )}
                 <CommandItem value="Toggle theme dark light mode" onSelect={() => run(toggleDarkMode)}>
                   <SunMoon className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
                   <span className="flex-1">Toggle theme</span>
@@ -221,11 +227,19 @@ function CommandPalette({
 
             {showActions && (
               <CommandGroup heading="Navigate">
-                {NAV_TABS.map((tab) => (
+                {visibleNavTabs.map((tab) => (
                   <CommandItem
                     key={tab.id as string}
                     value={`${tab.label} ${tab.keywords}`}
-                    onSelect={() => run(() => onShowTab?.(tab.id))}
+                    onSelect={() => run(() => {
+                      // Keep the callback guarded too: a policy transition can
+                      // happen after the item was rendered but before it is
+                      // selected from the command palette.
+                      if (tab.id === 'shell' && !canUseTerminal) {
+                        return;
+                      }
+                      onShowTab?.(tab.id);
+                    })}
                   >
                     <span className="flex-1">{tab.label}</span>
                   </CommandItem>
@@ -233,35 +247,9 @@ function CommandPalette({
               </CommandGroup>
             )}
 
-            {showActions && projectId && (
-              <CommandGroup heading="Git">
-                <CommandItem
-                  value="Git Fetch remote"
-                  onSelect={() => run(() => { void git.fetch(); onShowTab?.('git'); })}
-                >
-                  <RefreshCw className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <span className="flex-1">Git: Fetch</span>
-                </CommandItem>
-                <CommandItem
-                  value="Git Pull merge upstream"
-                  onSelect={() => run(() => { void git.pull(); onShowTab?.('git'); })}
-                >
-                  <ArrowDownToLine className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <span className="flex-1">Git: Pull</span>
-                </CommandItem>
-                <CommandItem
-                  value="Git Push origin remote"
-                  onSelect={() => run(() => { void git.push(); onShowTab?.('git'); })}
-                >
-                  <ArrowUpFromLine className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <span className="flex-1">Git: Push</span>
-                </CommandItem>
-              </CommandGroup>
-            )}
-
-            {showActions && (
+            {showActions && canManageSettings && (
               <CommandGroup heading="Settings">
-                {SETTINGS_MAIN_TABS.map(({ id, label, keywords, icon: Icon }) => (
+                {visibleSettingsMainTabs.map(({ id, label, keywords, icon: Icon }) => (
                   <CommandItem
                     key={id}
                     value={`Settings ${label} ${keywords}`}
@@ -300,62 +288,6 @@ function CommandPalette({
               </CommandGroup>
             )}
 
-            {showFiles && projectId && filesShown.length > 0 && (
-              <CommandGroup heading="Files">
-                {filesShown.map((f) => (
-                  <CommandItem
-                    key={f.path}
-                    value={f.path}
-                    onSelect={() => run(() => ops.openFile(f.path))}
-                  >
-                    <FileText className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                    <span className="flex-1 truncate">{f.name}</span>
-                    <span className="truncate text-xs text-muted-foreground">{f.path}</span>
-                  </CommandItem>
-                ))}
-                {!page && files.length > browseLimit && (
-                  <BrowseAllItem label={`Browse all files (${files.length})`} onSelect={() => pushPage('files')} />
-                )}
-              </CommandGroup>
-            )}
-
-            {showCommits && projectId && commitsShown.length > 0 && (
-              <CommandGroup heading="Commits">
-                {commitsShown.map((c) => (
-                  <CommandItem
-                    key={c.hash}
-                    value={`${c.message} ${c.author} ${c.shortHash}`}
-                    onSelect={() => run(() => onShowTab?.('git'))}
-                  >
-                    <GitCommit className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                    <span className="font-mono text-xs text-muted-foreground">{c.shortHash}</span>
-                    <span className="flex-1 truncate">{c.message}</span>
-                    <span className="truncate text-xs text-muted-foreground">{c.author}</span>
-                  </CommandItem>
-                ))}
-                {!page && commits.length > browseLimit && (
-                  <BrowseAllItem label={`Browse all commits (${commits.length})`} onSelect={() => pushPage('commits')} />
-                )}
-              </CommandGroup>
-            )}
-
-            {showBranches && projectId && branchesShown.length > 0 && (
-              <CommandGroup heading="Branches">
-                {branchesShown.map((b) => (
-                  <CommandItem
-                    key={`branch-${b.name}`}
-                    value={b.name}
-                    onSelect={() => run(() => { void git.checkout(b.name); onShowTab?.('git'); })}
-                  >
-                    <GitMerge className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
-                    <span className="flex-1 truncate">Switch to: {b.name}</span>
-                  </CommandItem>
-                ))}
-                {!page && branches.length > browseLimit && (
-                  <BrowseAllItem label={`Browse all branches (${branches.length})`} onSelect={() => pushPage('branches')} />
-                )}
-              </CommandGroup>
-            )}
           </CommandList>
         </Command>
       </DialogContent>

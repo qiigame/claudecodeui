@@ -8,6 +8,8 @@ import { getPreviewKind } from '@/modules/code-editor/utils/previewableFile';
 type UseCodeEditorDocumentParams = {
   file: CodeEditorFile;
   projectPath?: string;
+  /** Server-authorized file-write capability; save is rejected when false. */
+  canWriteFiles?: boolean;
 };
 
 const getErrorMessage = (error: unknown) => {
@@ -18,7 +20,10 @@ const getErrorMessage = (error: unknown) => {
   return String(error);
 };
 
-export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocumentParams) => {
+// Fail closed when a caller does not provide an explicit server-authorized
+// write capability. The editor passes the deployment policy deliberately;
+// direct hook consumers should never gain disk-write access by omission.
+export const useCodeEditorDocument = ({ file, projectPath, canWriteFiles = false }: UseCodeEditorDocumentParams) => {
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -94,7 +99,7 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
   const handleSave = useCallback(async () => {
     // Preview-only and binary files have no editable text buffer; never write
     // them back (e.g. via Cmd/Ctrl+S) or we'd corrupt the file on disk.
-    if (previewKind || isBinaryFile(fileName)) {
+    if (!canWriteFiles || previewKind || isBinaryFile(fileName)) {
       return;
     }
 
@@ -131,7 +136,7 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
     } finally {
       setSaving(false);
     }
-  }, [content, filePath, fileProjectId, previewKind, fileName]);
+  }, [canWriteFiles, content, filePath, fileProjectId, previewKind, fileName]);
 
   const handleDownload = useCallback(() => {
     const blob = new Blob([content], { type: 'text/plain' });

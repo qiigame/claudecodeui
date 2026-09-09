@@ -56,6 +56,13 @@ const renderComposer = (selectedSession: ProjectSession | null) => renderHook(
     currentProviderEffort: 'medium',
     isLoading: false,
     canAbortSession: false,
+    // These tests exercise the writable local composer path. Keep that intent
+    // explicit now that omitted server capability decisions fail closed.
+    canExecuteCommands: true,
+    canProvisionWorkspace: true,
+    canUploadAttachments: true,
+    canSendMessages: true,
+    canApproveTools: true,
     tokenBudget: null,
     sendMessage: () => undefined,
     scrollToBottom: () => undefined,
@@ -159,4 +166,154 @@ test('clearing the composer clears that session\'s stored draft', async () => {
   });
 
   assert.equal(readDraftText('session-a'), '');
+});
+
+test('pasting a regular file adds it as an attachment instead of filtering it as a non-image', async () => {
+  const view = renderComposer({ id: 'session-a' });
+  const file = new File(['report'], 'report.pdf', { type: 'application/pdf' });
+  const preventDefault = vi.fn();
+
+  await act(async () => {
+    view.result.current.handlePaste({
+      clipboardData: {
+        items: [{ getAsFile: () => file }],
+        files: [],
+      },
+      preventDefault,
+    } as never);
+  });
+
+  assert.deepEqual(view.result.current.attachedFiles, [file]);
+  assert.equal(preventDefault.mock.calls.length, 1);
+});
+
+test('pasting through the clipboard files fallback accepts ordinary attachments', async () => {
+  const view = renderComposer({ id: 'session-a' });
+  const file = new File(['notes'], 'notes.txt', { type: 'text/plain' });
+  const preventDefault = vi.fn();
+
+  await act(async () => {
+    view.result.current.handlePaste({
+      clipboardData: {
+        items: [],
+        files: [file],
+      },
+      preventDefault,
+    } as never);
+  });
+
+  assert.equal(view.result.current.attachedFiles[0], file);
+  assert.equal(preventDefault.mock.calls.length, 1);
+});
+
+test('does not dispatch a turn when the active provider has no safe read-only runtime', async () => {
+  const sent: unknown[] = [];
+  const view = renderHook(() => useChatComposerState({
+    selectedProject: PROJECT,
+    selectedSession: { id: 'cursor-session', __provider: 'cursor' },
+    currentSessionId: 'cursor-session',
+    provider: 'cursor',
+    permissionMode: 'default',
+    cyclePermissionMode: () => undefined,
+    resolvePermissionModeForProvider: () => 'default' as PermissionMode,
+    currentProviderModel: 'test-model',
+    currentProviderEffort: 'medium',
+    isLoading: false,
+    canAbortSession: false,
+    canSendMessages: false,
+    tokenBudget: null,
+    sendMessage: (message) => sent.push(message),
+    scrollToBottom: () => undefined,
+    addMessage: () => undefined,
+    setIsUserScrolledUp: () => undefined,
+    setPendingPermissionRequests: () => undefined,
+  }));
+
+  await act(async () => {
+    view.result.current.setInput('this must remain a draft');
+  });
+  await act(async () => {
+    await view.result.current.handleSubmit({ preventDefault: () => undefined } as never);
+  });
+
+  assert.deepEqual(sent, []);
+  assert.equal(view.result.current.input, 'this must remain a draft');
+});
+
+test('does not stage pasted attachments when sending is unavailable', async () => {
+  const view = renderHook(() => useChatComposerState({
+    selectedProject: PROJECT,
+    selectedSession: { id: 'opencode-session', __provider: 'opencode' },
+    currentSessionId: 'opencode-session',
+    provider: 'opencode',
+    permissionMode: 'default',
+    cyclePermissionMode: () => undefined,
+    resolvePermissionModeForProvider: () => 'default' as PermissionMode,
+    currentProviderModel: 'test-model',
+    currentProviderEffort: 'medium',
+    isLoading: false,
+    canAbortSession: false,
+    canSendMessages: false,
+    canUploadAttachments: true,
+    tokenBudget: null,
+    sendMessage: () => undefined,
+    scrollToBottom: () => undefined,
+    addMessage: () => undefined,
+    setIsUserScrolledUp: () => undefined,
+    setPendingPermissionRequests: () => undefined,
+  }));
+  const file = new File(['report'], 'report.pdf', { type: 'application/pdf' });
+  const preventDefault = vi.fn();
+
+  await act(async () => {
+    view.result.current.handlePaste({
+      clipboardData: { items: [{ getAsFile: () => file }], files: [] },
+      preventDefault,
+    } as never);
+  });
+
+  assert.deepEqual(view.result.current.attachedFiles, []);
+  assert.equal(preventDefault.mock.calls.length, 0);
+});
+
+test('omitted capability decisions fail closed for direct hook consumers', async () => {
+  const sent: unknown[] = [];
+  const view = renderHook(() => useChatComposerState({
+    selectedProject: PROJECT,
+    selectedSession: { id: 'session-a' },
+    currentSessionId: 'session-a',
+    provider: 'claude',
+    permissionMode: 'default',
+    cyclePermissionMode: () => undefined,
+    resolvePermissionModeForProvider: () => 'default' as PermissionMode,
+    currentProviderModel: 'test-model',
+    currentProviderEffort: 'medium',
+    isLoading: false,
+    canAbortSession: false,
+    tokenBudget: null,
+    sendMessage: (message) => sent.push(message),
+    scrollToBottom: () => undefined,
+    addMessage: () => undefined,
+    setIsUserScrolledUp: () => undefined,
+    setPendingPermissionRequests: () => undefined,
+  }));
+  const file = new File(['report'], 'report.pdf', { type: 'application/pdf' });
+  const preventDefault = vi.fn();
+
+  await act(async () => {
+    view.result.current.setInput('must not send');
+    view.result.current.handlePaste({
+      clipboardData: { items: [{ getAsFile: () => file }], files: [] },
+      preventDefault,
+    } as never);
+    await view.result.current.handleSubmit({ preventDefault: () => undefined } as never);
+  });
+
+  assert.deepEqual(sent, []);
+  assert.deepEqual(view.result.current.attachedFiles, []);
+  assert.equal(preventDefault.mock.calls.length, 0);
+  assert.deepEqual(
+    view.result.current.handleGrantToolPermission({ entry: 'example', toolName: 'Bash' }),
+    { success: false },
+  );
 });

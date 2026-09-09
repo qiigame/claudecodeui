@@ -26,11 +26,13 @@ type PrdEditorHeaderProps = {
   isDarkMode: boolean;
   onToggleTheme: () => void;
   onDownload: () => void;
-  onOpenGenerateTasks: () => void;
+  onOpenGenerateTasks?: () => void;
   canGenerateTasks: boolean;
-  onSave: () => void;
+  onSave?: () => void;
   saving: boolean;
   saveSuccess: boolean;
+  /** Disables content and filename mutations for product/QA deployments. */
+  readOnly?: boolean;
   isFullscreen: boolean;
   onToggleFullscreen: () => void;
   onClose: () => void;
@@ -80,6 +82,7 @@ export default function PrdEditorHeader({
   isFullscreen,
   onToggleFullscreen,
   onClose,
+  readOnly = false,
 }: PrdEditorHeaderProps) {
   const fileNameInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -99,6 +102,7 @@ export default function PrdEditorHeader({
                   type="text"
                   value={fileName}
                   onChange={(event) => onFileNameChange(event.target.value)}
+                  readOnly={readOnly}
                   className="min-w-0 flex-1 border-none bg-transparent text-base font-medium text-gray-900 placeholder-gray-400 outline-none dark:text-white dark:placeholder-gray-500 sm:text-sm"
                   placeholder="Enter PRD filename"
                   maxLength={100}
@@ -108,20 +112,22 @@ export default function PrdEditorHeader({
                 </span>
               </div>
 
-              <button
-                onClick={() => fileNameInputRef.current?.focus()}
-                className="p-1 text-gray-400 transition-colors hover:text-purple-600 dark:hover:text-purple-400"
-                title="Focus filename input"
-              >
-                <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"
-                  />
-                </svg>
-              </button>
+              {!readOnly && (
+                <button
+                  onClick={() => fileNameInputRef.current?.focus()}
+                  className="p-1 text-gray-400 transition-colors hover:text-purple-600 dark:hover:text-purple-400"
+                  title="Focus filename input"
+                >
+                  <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"
+                    />
+                  </svg>
+                </button>
+              )}
             </div>
 
             <div className="flex flex-shrink-0 items-center gap-2">
@@ -131,6 +137,11 @@ export default function PrdEditorHeader({
               {isNewFile && (
                 <span className="whitespace-nowrap rounded bg-green-100 px-2 py-1 text-xs text-green-600 dark:bg-green-900 dark:text-green-300">
                   New
+                </span>
+              )}
+              {readOnly && (
+                <span className="whitespace-nowrap rounded bg-amber-100 px-2 py-1 text-xs text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">
+                  Read only
                 </span>
               )}
             </div>
@@ -175,41 +186,45 @@ export default function PrdEditorHeader({
           icon={<Download className="h-5 w-5 md:h-4 md:w-4" />}
         />
 
-        <button
-          onClick={onOpenGenerateTasks}
-          disabled={!canGenerateTasks}
-          className={cn(
-            'px-3 py-2 rounded-md disabled:opacity-50 flex items-center gap-2 transition-colors text-sm font-medium text-white min-h-[44px] md:min-h-0',
-            'bg-purple-600 hover:bg-purple-700',
-          )}
-          title="Generate tasks from PRD content"
-        >
-          <Sparkles className="h-4 w-4" />
-          <span className="hidden md:inline">Generate Tasks</span>
-        </button>
+        {!readOnly && (
+          <button
+            onClick={onOpenGenerateTasks}
+            disabled={!canGenerateTasks}
+            className={cn(
+              'px-3 py-2 rounded-md disabled:opacity-50 flex items-center gap-2 transition-colors text-sm font-medium text-white min-h-[44px] md:min-h-0',
+              'bg-purple-600 hover:bg-purple-700',
+            )}
+            title="Generate tasks from PRD content"
+          >
+            <Sparkles className="h-4 w-4" />
+            <span className="hidden md:inline">Generate Tasks</span>
+          </button>
+        )}
 
-        <button
-          onClick={onSave}
-          disabled={saving}
-          className={cn(
-            'px-3 py-2 text-white rounded-md disabled:opacity-50 flex items-center gap-2 transition-colors min-h-[44px] md:min-h-0',
-            saveSuccess ? 'bg-green-600 hover:bg-green-700' : 'bg-purple-600 hover:bg-purple-700',
-          )}
-        >
-          {saveSuccess ? (
-            <>
-              <svg className="h-5 w-5 md:h-4 md:w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-              </svg>
-              <span className="hidden sm:inline">Saved!</span>
-            </>
-          ) : (
-            <>
-              <Save className="h-5 w-5 md:h-4 md:w-4" />
-              <span className="hidden sm:inline">{saving ? 'Saving...' : 'Save PRD'}</span>
-            </>
-          )}
-        </button>
+        {!readOnly && onSave && (
+          <button
+            onClick={onSave}
+            disabled={saving}
+            className={cn(
+              'px-3 py-2 text-white rounded-md disabled:opacity-50 flex items-center gap-2 transition-colors min-h-[44px] md:min-h-0',
+              saveSuccess ? 'bg-green-600 hover:bg-green-700' : 'bg-purple-600 hover:bg-purple-700',
+            )}
+          >
+            {saveSuccess ? (
+              <>
+                <svg className="h-5 w-5 md:h-4 md:w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+                <span className="hidden sm:inline">Saved!</span>
+              </>
+            ) : (
+              <>
+                <Save className="h-5 w-5 md:h-4 md:w-4" />
+                <span className="hidden sm:inline">{saving ? 'Saving...' : 'Save PRD'}</span>
+              </>
+            )}
+          </button>
+        )}
 
         <button
           onClick={onToggleFullscreen}

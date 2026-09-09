@@ -70,3 +70,16 @@ test('projectsDb.createProjectPath returns active_conflict for active duplicates
     assert.equal(conflict.project?.isArchived, 0);
   });
 });
+
+test('projectsDb.getProjectPaths excludes archived projects from active consumers', async () => {
+  await withIsolatedDatabase(() => {
+    projectsDb.createProjectPath('/workspace/active-project');
+    projectsDb.createProjectPath('/workspace/archived-project');
+    projectsDb.updateProjectIsArchived('/workspace/archived-project', true);
+
+    assert.deepEqual(
+      projectsDb.getProjectPaths().map((project) => project.project_path),
+      ['/workspace/active-project'],
+    );
+  });
+});

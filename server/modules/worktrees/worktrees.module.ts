@@ -12,6 +12,11 @@ import type {
   WorktreeServices,
 } from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
+import {
+  captureDeploymentPolicy,
+  type DeploymentPolicy,
+  type DeploymentPolicySource,
+} from '@/modules/deployment-policy/index.js';
 import { createWorktree } from '@/modules/worktrees/services/worktree-create.service.js';
 import { createAndOpenWorktree } from '@/modules/worktrees/services/worktree-create-and-open.service.js';
 import { runGitCommand } from '@/modules/worktrees/services/worktree-git.service.js';
@@ -19,7 +24,20 @@ import { listWorktrees } from '@/modules/worktrees/services/worktree-list.servic
 import { mergeWorktree } from '@/modules/worktrees/services/worktree-merge.service.js';
 import { openWorktreeAsProject } from '@/modules/worktrees/services/worktree-open.service.js';
 import { removeWorktree } from '@/modules/worktrees/services/worktree-remove.service.js';
+import {
+  configureSessionWorkspaceDeploymentPolicy,
+  sessionWorkspaceService,
+} from '@/modules/worktrees/services/session-workspace.service.js';
 import { createWorktreesRouter } from '@/modules/worktrees/worktrees.routes.js';
+
+/**
+ * Startup-owned options for the Worktrees HTTP module.  The application
+ * composition root supplies the immutable deployment policy so route guards
+ * do not re-read mutable process environment state for every request.
+ */
+export type WorktreesModuleOptions = {
+  deploymentPolicy?: DeploymentPolicySource;
+};
 
 /**
  * Real filesystem adapter used only by Worktrees production composition.
@@ -86,6 +104,7 @@ const worktreeServices: WorktreeServices = {
 
     return projectPath;
   },
+  planSessionWorkspace: (projectPath) => sessionWorkspaceService.plan(projectPath),
   list: (input) => listWorktrees(input, {
     runGit: runGitCommand,
     getProjectByPath: worktreeProjects.getProjectByPath,
@@ -97,11 +116,27 @@ const worktreeServices: WorktreeServices = {
     removeWorktree: remove,
   }),
   open,
-  merge: (input) => mergeWorktree(input, {
-    runGit: runGitCommand,
-    removeWorktree: remove,
-  }),
-  remove,
+  merge: (input) => {
+    if (sessionWorkspaceService.isManagedWorkspacePath(input.projectPath)) {
+      throw new AppError('Shared session worktrees must be merged through a protected PR or MR.', {
+        code: 'TEAM_WORKTREE_MERGE_DISABLED',
+        statusCode: 409,
+      });
+    }
+    return mergeWorktree(input, {
+      runGit: runGitCommand,
+      removeWorktree: remove,
+    });
+  },
+  remove: (input) => {
+    if (sessionWorkspaceService.isManagedWorkspacePath(input.projectPath)) {
+      throw new AppError('Session workspaces are retained until their safe archive checks pass.', {
+        code: 'TEAM_WORKTREE_REMOVE_DISABLED',
+        statusCode: 409,
+      });
+    }
+    return remove(input);
+  },
 };
 
 /**
@@ -110,4 +145,29 @@ const worktreeServices: WorktreeServices = {
  * It is assembled here so other modules consume only the Worktrees barrel and
  * cannot depend on route or service implementation files.
  */
-export const worktreesRoutes = createWorktreesRouter(worktreeServices);
+/**
+ * Creates the production Worktrees router with an optional startup policy.
+ * Providers and Git share the same session-workspace service, while the
+ * returned router owns only the HTTP capability boundary.
+ */
+export function createWorktreesModule(
+  options: WorktreesModuleOptions = {},
+) {
+  const startupPolicy = captureDeploymentPolicy(options.deploymentPolicy);
+  // Pin the same startup policy used by the HTTP guards into the shared
+  // session-workspace service.  Providers imports that service directly, so
+  // configuring it here closes the gap between route and service callers.
+  // Keep the direct session-workspace service on the same snapshot as the
+  // router, including for the legacy/default singleton. A later production
+  // composition can replace this with its explicitly supplied startup policy.
+  configureSessionWorkspaceDeploymentPolicy(startupPolicy);
+  return createWorktreesRouter(worktreeServices, {
+    deploymentPolicy: startupPolicy,
+  });
+}
+
+/** Legacy router for standalone consumers that do not inject a policy. */
+export const worktreesRoutes = createWorktreesModule();
+
+/** Used by Providers and Git to provision sessions and protect shared baselines. */
+export { sessionWorkspaceService };

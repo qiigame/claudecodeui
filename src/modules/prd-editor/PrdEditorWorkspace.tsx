@@ -13,9 +13,11 @@ type PrdEditorWorkspaceProps = {
   fileName: string;
   onFileNameChange: (nextFileName: string) => void;
   isNewFile: boolean;
+  /** Disables PRD mutations while retaining preview/download/close actions. */
+  readOnly?: boolean;
   saving: boolean;
   saveSuccess: boolean;
-  onSave: () => void;
+  onSave?: () => void;
   onDownload: () => void;
   onClose: () => void;
   loadError: string | null;
@@ -34,6 +36,7 @@ export default function PrdEditorWorkspace({
   onDownload,
   onClose,
   loadError,
+  readOnly = false,
 }: PrdEditorWorkspaceProps) {
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [isDarkMode, setIsDarkMode] = useState<boolean>(true);
@@ -83,14 +86,15 @@ export default function PrdEditorWorkspace({
           isDarkMode={isDarkMode}
           onToggleTheme={() => setIsDarkMode((current) => !current)}
           onDownload={onDownload}
-          onOpenGenerateTasks={handleOpenGenerateTasks}
-          canGenerateTasks={Boolean(content.trim())}
+          onOpenGenerateTasks={readOnly ? undefined : handleOpenGenerateTasks}
+          canGenerateTasks={!readOnly && Boolean(content.trim())}
           onSave={onSave}
           saving={saving}
           saveSuccess={saveSuccess}
           isFullscreen={isFullscreen}
           onToggleFullscreen={() => setIsFullscreen((current) => !current)}
           onClose={onClose}
+          readOnly={readOnly}
         />
 
         <div className="flex-1 overflow-hidden">
@@ -100,17 +104,20 @@ export default function PrdEditorWorkspace({
             previewMode={previewMode}
             isDarkMode={isDarkMode}
             wordWrap={wordWrap}
+            readOnly={readOnly}
           />
         </div>
 
         <PrdEditorFooter content={content} />
       </div>
 
-      <GenerateTasksModal
-        isOpen={showGenerateModal}
-        fileName={ensurePrdExtension(fileName || 'prd')}
-        onClose={() => setShowGenerateModal(false)}
-      />
+      {!readOnly && (
+        <GenerateTasksModal
+          isOpen={showGenerateModal}
+          fileName={ensurePrdExtension(fileName || 'prd')}
+          onClose={() => setShowGenerateModal(false)}
+        />
+      )}
     </div>
   );
 }

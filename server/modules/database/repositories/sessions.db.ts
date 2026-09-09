@@ -7,6 +7,7 @@ type SessionRow = {
   provider: string;
   provider_session_id: string | null;
   project_path: string | null;
+  runtime_path?: string | null;
   jsonl_path: string | null;
   custom_name: string | null;
   /** Model this session runs with; NULL until the app records one for it. */
@@ -26,7 +27,7 @@ type RecentSessionsPage = {
 };
 
 const SESSION_ROW_COLUMNS =
-  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, forked_from_session_id, isArchived, created_at, updated_at';
+  'session_id, provider, provider_session_id, project_path, runtime_path, jsonl_path, custom_name, model, effort, forked_from_session_id, isArchived, created_at, updated_at';
 
 const SQLITE_UTC_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
@@ -111,7 +112,7 @@ export const sessionsDb = {
         `UPDATE sessions SET
            provider = ?,
            updated_at = COALESCE(?, CURRENT_TIMESTAMP),
-           project_path = ?,
+           project_path = CASE WHEN runtime_path IS NULL THEN ? ELSE project_path END,
            jsonl_path = ?,
            isArchived = 0,
            custom_name = CASE
@@ -135,20 +136,24 @@ export const sessionsDb = {
     // keyed by the provider-native id for both columns. The ON CONFLICT path
     // covers legacy rows that predate the provider_session_id mapping.
     db.prepare(
-      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, isArchived, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, runtime_path, jsonl_path, isArchived, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, NULL, ?, 0, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
        ON CONFLICT(session_id) DO UPDATE SET
          provider = excluded.provider,
          provider_session_id = excluded.provider_session_id,
          updated_at = excluded.updated_at,
-         project_path = excluded.project_path,
+         project_path = CASE
+           WHEN sessions.runtime_path IS NULL THEN excluded.project_path
+           ELSE sessions.project_path
+         END,
          jsonl_path = excluded.jsonl_path,
          isArchived = 0,
          custom_name = CASE
            WHEN sessions.session_id <> sessions.provider_session_id AND sessions.custom_name IS NOT NULL
              THEN sessions.custom_name
            ELSE COALESCE(excluded.custom_name, sessions.custom_name)
-         END`
+         END
+       WHERE sessions.provider = excluded.provider`
     ).run(
       providerSessionId,
       provider,
@@ -177,6 +182,7 @@ export const sessionsDb = {
     provider: string,
     projectPath: string,
     customName?: string,
+    runtimePath?: string | null,
   ): string {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPathForProvider(provider, projectPath);
@@ -184,9 +190,15 @@ export const sessionsDb = {
     projectsDb.createProjectPath(normalizedProjectPath);
 
     db.prepare(
-      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, isArchived, created_at, updated_at)
-       VALUES (?, ?, NULL, ?, ?, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-    ).run(sessionId, provider, customName ?? null, normalizedProjectPath);
+      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, runtime_path, jsonl_path, isArchived, created_at, updated_at)
+       VALUES (?, ?, NULL, ?, ?, ?, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+    ).run(
+      sessionId,
+      provider,
+      customName ?? null,
+      normalizedProjectPath,
+      runtimePath ? normalizeProjectPath(runtimePath) : null,
+    );
 
     return sessionId;
   },
@@ -219,11 +231,15 @@ export const sessionsDb = {
     // id is the provider-native one, which is what this row claims, so replace
     // it rather than leaving two sidebar entries for one conversation.
     db.transaction(() => {
-      db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ?')
-        .run(input.providerSessionId, input.sessionId);
+      // Provider-native ids are scoped to their adapter.  The watcher may
+      // have created a duplicate row with the native id, but an app id with
+      // the same value in another provider is an unrelated conversation and
+      // must never be deleted during this merge.
+      db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ? AND provider = ?')
+        .run(input.providerSessionId, input.sessionId, input.provider);
       db.prepare(
-        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, model, effort, forked_from_session_id, isArchived, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, runtime_path, jsonl_path, model, effort, forked_from_session_id, isArchived, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
       ).run(
         input.sessionId,
         input.provider,
@@ -253,14 +269,28 @@ export const sessionsDb = {
     const db = getConnection();
 
     const merge = db.transaction(() => {
+      // Native ids are scoped to a provider. Derive the target provider from
+      // the app row before looking for a watcher-created duplicate so a
+      // coincident id in another adapter can never be merged or deleted.
+      const owner = db
+        .prepare('SELECT provider FROM sessions WHERE session_id = ? LIMIT 1')
+        .get(sessionId) as { provider: string } | undefined;
+      // If the app row disappeared between admission and this callback, do
+      // not fall back to an unscoped native-id merge that could delete another
+      // provider's row. The caller can retry after the row is recreated.
+      if (!owner?.provider) {
+        return;
+      }
+
       const duplicate = db
         .prepare(
           `SELECT ${SESSION_ROW_COLUMNS} FROM sessions
            WHERE (session_id = ? OR provider_session_id = ?)
              AND session_id <> ?
+             AND provider = ?
            LIMIT 1`
         )
-        .get(providerSessionId, providerSessionId, sessionId) as SessionRow | undefined;
+        .get(providerSessionId, providerSessionId, sessionId, owner.provider) as SessionRow | undefined;
 
       if (duplicate) {
         db.prepare('DELETE FROM sessions WHERE session_id = ?').run(duplicate.session_id);
@@ -306,15 +336,26 @@ export const sessionsDb = {
     const db = getConnection();
 
     db.transaction(() => {
-      db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ?')
-        .run(input.providerSessionId, sessionId);
+      // Provider-native ids are scoped, while app ids are global. Resolve the
+      // source provider before deleting a watcher-created duplicate so a
+      // Codex thread whose id happens to equal another provider's app id can
+      // never remove that unrelated row.
+      const owner = db
+        .prepare('SELECT provider FROM sessions WHERE session_id = ? LIMIT 1')
+        .get(sessionId) as { provider: string } | undefined;
+      if (!owner?.provider) {
+        return;
+      }
+
+      db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ? AND provider = ?')
+        .run(input.providerSessionId, sessionId, owner.provider);
       db.prepare(
         `UPDATE sessions SET
            provider_session_id = ?,
            jsonl_path = ?,
            updated_at = CURRENT_TIMESTAMP
-         WHERE session_id = ?`
-      ).run(input.providerSessionId, input.jsonlPath, sessionId);
+         WHERE session_id = ? AND provider = ?`
+      ).run(input.providerSessionId, input.jsonlPath, sessionId, owner.provider);
     })();
   },
 
@@ -381,16 +422,32 @@ export const sessionsDb = {
    * A conversation edited more than once has lived in more than one file, and
    * the session row only ever points at the newest.
    */
-  getSupersededTranscriptPaths(sessionId: string): string[] {
+  getSupersededTranscriptRecords(sessionId: string): Array<{
+    provider_session_id: string;
+    provider: string;
+    jsonl_path: string;
+  }> {
     const db = getConnection();
-    const rows = db
+    return db
       .prepare(
-        `SELECT jsonl_path FROM superseded_provider_sessions
+        `SELECT provider_session_id, provider, jsonl_path
+         FROM superseded_provider_sessions
          WHERE session_id = ? AND jsonl_path IS NOT NULL`
       )
-      .all(sessionId) as Array<{ jsonl_path: string }>;
+      .all(sessionId) as Array<{
+        provider_session_id: string;
+        provider: string;
+        jsonl_path: string;
+      }>;
+  },
 
-    return rows.map((row) => row.jsonl_path);
+  /**
+   * Compatibility projection retained for older session-deletion callers.
+   * New filesystem-deletion code must use `getSupersededTranscriptRecords`
+   * so provider and native-id validation cannot be bypassed.
+   */
+  getSupersededTranscriptPaths(sessionId: string): string[] {
+    return this.getSupersededTranscriptRecords(sessionId).map((row) => row.jsonl_path);
   },
 
   /**
@@ -465,19 +522,42 @@ export const sessionsDb = {
    *
    * The filesystem watcher only knows provider ids (they come from transcript
    * file names), so it uses this lookup to translate disk artifacts back to
-   * the app-facing session row before broadcasting sidebar updates.
+   * the app-facing session row before broadcasting sidebar updates.  Callers
+   * that already know the provider should pass it: native ids are provider
+   * scoped and two adapters are allowed to use the same opaque value.
    */
-  getSessionByProviderSessionId(providerSessionId: string): SessionRow | null {
+  getSessionByProviderSessionId(providerSessionId: string, provider?: string): SessionRow | null {
     const db = getConnection();
+    if (provider === undefined) {
+      const rows = db
+        .prepare(
+          `SELECT ${SESSION_ROW_COLUMNS}
+           FROM sessions
+           WHERE provider_session_id = ?
+           ORDER BY updated_at DESC, session_id DESC`
+        )
+        .all(providerSessionId) as SessionRow[];
+      // Native ids are opaque and scoped to one provider.  An unscoped caller
+      // (legacy share links and sidebar broadcasts) cannot safely choose a
+      // row when two providers expose the same value; fail closed instead of
+      // returning whichever row was updated last. Duplicate rows within one
+      // provider are still resolved deterministically for migration races.
+      const providers = new Set(rows.map((row) => row.provider));
+      if (providers.size > 1) {
+        return null;
+      }
+      return normalizeSessionRow(rows[0]) ?? null;
+    }
+
     const row = db
       .prepare(
         `SELECT ${SESSION_ROW_COLUMNS}
          FROM sessions
-         WHERE provider_session_id = ?
-         ORDER BY updated_at DESC
+         WHERE provider_session_id = ? AND provider = ?
+         ORDER BY updated_at DESC, session_id DESC
          LIMIT 1`
       )
-      .get(providerSessionId) as SessionRow | undefined;
+      .get(providerSessionId, provider) as SessionRow | undefined;
 
     return normalizeSessionRow(row) ?? null;
   },
@@ -693,22 +773,123 @@ export const sessionsDb = {
   },
 
   /**
+   * Deletes an indexed provider session only when the filesystem check was
+   * performed against the exact row that is still in the database.
+   *
+   * The synchronizer checks provider-owned files asynchronously.  Between
+   * that check and the delete, a watcher can repoint or restore the row (or a
+   * user can attach an isolated workspace).  This method therefore performs a
+   * compare-and-swap delete inside one SQLite transaction, matching every
+   * identity/path/status field captured by the synchronizer.  Runtime-backed,
+   * archived, or workspace-associated sessions are never eligible.  The
+   * superseded-provider mapping is removed in the same transaction so a
+   * successfully pruned row cannot leave a stale native id that blocks a
+   * later rescan.
+   *
+   * Consumed by Providers' session synchronizer only; ordinary user-driven
+   * deletion continues to use `deleteSessionById` plus its explicit transcript
+   * cleanup workflow.
+   */
+  deleteOrphanIfUnchanged(snapshot: {
+    session_id: string;
+    provider: string;
+    provider_session_id: string | null;
+    project_path: string | null;
+    runtime_path: string | null;
+    jsonl_path: string;
+    isArchived: number;
+    updated_at: string | null;
+  }): boolean {
+    const db = getConnection();
+    const deleteOrphan = db.transaction(() => {
+      const result = db.prepare(
+        `DELETE FROM sessions
+         WHERE session_id = ?
+           AND provider = ?
+           AND provider_session_id IS ?
+           AND project_path IS ?
+           AND runtime_path IS ?
+           AND jsonl_path IS ?
+           AND isArchived = ?
+           AND updated_at IS ?
+           AND runtime_path IS NULL
+           AND isArchived = 0
+           AND NOT EXISTS (
+             SELECT 1
+             FROM session_workspaces
+             WHERE session_workspaces.session_id = sessions.session_id
+           )`
+      ).run(
+        snapshot.session_id,
+        snapshot.provider,
+        snapshot.provider_session_id,
+        snapshot.project_path,
+        snapshot.runtime_path,
+        snapshot.jsonl_path,
+        snapshot.isArchived,
+        snapshot.updated_at,
+      );
+
+      if (result.changes === 0) {
+        return false;
+      }
+
+      db.prepare(
+        'DELETE FROM superseded_provider_sessions WHERE session_id = ?',
+      ).run(snapshot.session_id);
+      return true;
+    });
+
+    return deleteOrphan();
+  },
+
+  /**
    * Lists every indexed session that claims a transcript file on disk.
    *
    * Only rows with a `jsonl_path` are returned, which deliberately excludes
-   * app-created sessions still waiting for their first provider write and
-   * OpenCode rows (whose transcripts all live inside one shared sqlite file).
+   * app-created sessions still waiting for their first provider write,
+   * OpenCode rows (whose transcripts all live inside one shared sqlite file),
+   * archived sessions, isolated runtime sessions, and sessions associated
+   * with a session workspace. The latter three classes are never safe for an
+   * automatic orphan cleanup, even if their provider artifact is absent.
    * Used by the session synchronizer to find rows whose transcript has been
-   * deleted underneath the index.
+   * deleted underneath the index; the subsequent delete still repeats every
+   * eligibility condition as a compare-and-swap guard.
    */
-  getSessionsWithTranscriptPath(): Array<{ session_id: string; jsonl_path: string }> {
+  getSessionsWithTranscriptPath(): Array<{
+    session_id: string;
+    provider: string;
+    provider_session_id: string | null;
+    project_path: string | null;
+    runtime_path: string | null;
+    jsonl_path: string;
+    isArchived: number;
+    updated_at: string | null;
+  }> {
     const db = getConnection();
     return db
       .prepare(
-        `SELECT session_id, jsonl_path
+        `SELECT session_id, provider, provider_session_id, project_path,
+                runtime_path, jsonl_path, isArchived, updated_at
          FROM sessions
-         WHERE jsonl_path IS NOT NULL AND jsonl_path <> ''`
+         WHERE jsonl_path IS NOT NULL AND jsonl_path <> ''
+           AND runtime_path IS NULL
+           AND isArchived = 0
+           AND NOT EXISTS (
+             SELECT 1
+             FROM session_workspaces
+             WHERE session_workspaces.session_id = sessions.session_id
+           )`
       )
-      .all() as Array<{ session_id: string; jsonl_path: string }>;
+      .all() as Array<{
+        session_id: string;
+        provider: string;
+        provider_session_id: string | null;
+        project_path: string | null;
+        runtime_path: string | null;
+        jsonl_path: string;
+        isArchived: number;
+        updated_at: string | null;
+      }>;
   },
 };

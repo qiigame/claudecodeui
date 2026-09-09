@@ -144,60 +144,148 @@ export const createProjectRequest = async (payload: CreateProjectPayload) => {
   return data.project;
 };
 
-const buildCloneProgressUrl = ({
+const buildCloneProgressPayload = ({
   workspacePath,
   githubUrl,
   tokenMode,
   selectedGithubToken,
   newGithubToken,
 }: CloneWorkspaceParams) =>
-  api.cloneProjectProgressUrl({
+  ({
     path: workspacePath.trim(),
     githubUrl: githubUrl.trim(),
     githubTokenId: tokenMode === 'stored' ? selectedGithubToken : null,
     newGithubToken: tokenMode === 'new' ? newGithubToken.trim() : null,
   });
 
-export const cloneWorkspaceWithProgress = (
+/** Parse one complete Server-Sent Events record into the clone protocol payload. */
+const parseCloneProgressEvent = (rawEvent: string): CloneProgressEvent | null => {
+  const dataLines = rawEvent
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice('data:'.length).replace(/^ /, ''));
+
+  if (dataLines.length === 0) {
+    return null;
+  }
+
+  return JSON.parse(dataLines.join('\n')) as CloneProgressEvent;
+};
+
+const cloneProgressErrorMessage = async (response: Response): Promise<string> => {
+  try {
+    const payload = (await response.json()) as {
+      error?: unknown;
+      message?: unknown;
+      details?: unknown;
+    };
+    for (const candidate of [payload.error, payload.message, payload.details]) {
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return candidate;
+      }
+    }
+  } catch {
+    // Fall through to the stable generic message when the error body is not
+    // JSON (for example, a proxy-generated HTML response).
+  }
+  return 'Failed to clone repository';
+};
+
+/**
+ * Clone over an authenticated POST and consume the same SSE wire protocol.
+ * EventSource cannot carry an Authorization header, which previously forced
+ * the raw GitHub token into the URL. Fetch keeps credentials in the request
+ * body while preserving progress/complete/error events for the wizard.
+ */
+export const cloneWorkspaceWithProgress = async (
   params: CloneWorkspaceParams,
   handlers: CloneProgressHandlers,
-) =>
-  new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
-    const eventSource = new EventSource(buildCloneProgressUrl(params));
-    let settled = false;
+): Promise<Record<string, unknown> | undefined> => {
+  const response = await api.cloneProjectProgress(buildCloneProgressPayload(params));
+  if (!response.ok) {
+    throw new Error(await cloneProgressErrorMessage(response));
+  }
 
-    const settle = (callback: () => void) => {
-      if (settled) {
+  if (!response.body) {
+    throw new Error('Connection lost during clone');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let completed = false;
+  let project: Record<string, unknown> | undefined;
+
+  const consumeEvent = (rawEvent: string): void => {
+    const payload = parseCloneProgressEvent(rawEvent);
+    if (!payload) {
+      return;
+    }
+
+    if (payload.type === 'progress' && payload.message) {
+      handlers.onProgress(payload.message);
+      return;
+    }
+
+    if (payload.type === 'error') {
+      throw new Error(payload.message || 'Failed to clone repository');
+    }
+
+    if (payload.type === 'complete') {
+      completed = true;
+      project = payload.project;
+    }
+  };
+
+  const consumeBufferedEvents = (flush = false): void => {
+    // SSE permits either LF or CRLF separators. Keep incomplete records in
+    // `buffer` so a token-bearing payload split across network chunks is never
+    // parsed/logged prematurely.
+    while (true) {
+      const separator = /\r?\n\r?\n/.exec(buffer);
+      if (!separator || separator.index === undefined) {
+        break;
+      }
+      const rawEvent = buffer.slice(0, separator.index);
+      buffer = buffer.slice(separator.index + separator[0].length);
+      consumeEvent(rawEvent);
+      if (completed) {
         return;
       }
-      settled = true;
-      eventSource.close();
-      callback();
-    };
+    }
 
-    eventSource.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data) as CloneProgressEvent;
+    if (flush && buffer.trim()) {
+      const trailingEvent = buffer;
+      buffer = '';
+      consumeEvent(trailingEvent);
+    }
+  };
 
-        if (payload.type === 'progress' && payload.message) {
-          handlers.onProgress(payload.message);
-          return;
-        }
-
-        if (payload.type === 'complete') {
-          settle(() => resolve(payload.project));
-          return;
-        }
-
-        if (payload.type === 'error') {
-          settle(() => reject(new Error(payload.message || 'Failed to clone repository')));
-        }
-      } catch (error) {
-        console.error('Error parsing clone progress event:', error);
+  try {
+    while (!completed) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      consumeBufferedEvents(done);
+      if (done) {
+        break;
       }
-    };
+    }
+  } catch (error) {
+    // Match EventSource.close(): if parsing or the transport fails, close the
+    // fetch body so the server's request-close hook can cancel an active clone.
+    try {
+      await reader.cancel();
+    } catch {
+      // Preserve the original protocol/transport error.
+    }
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 
-    eventSource.onerror = () => {
-      settle(() => reject(new Error('Connection lost during clone')));
-    };
-  });
+  if (!completed) {
+    throw new Error('Connection lost during clone');
+  }
+
+  return project;
+};

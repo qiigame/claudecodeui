@@ -1,17 +1,23 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
 import TOML from '@iarna/toml';
 
 import { McpProvider } from '@/modules/providers/shared/mcp/mcp.provider.js';
-import type { McpScope, ProviderMcpServer, UpsertProviderMcpServerInput } from '@/shared/types.js';
+import type {
+  CodexMcpToolsApprovalMode,
+  McpScope,
+  ProviderMcpServer,
+  UpsertProviderMcpServerInput,
+} from '@/shared/types.js';
 import {
   AppError,
+  isCodexMcpToolsApprovalMode,
   readObjectRecord,
   readOptionalString,
   readStringArray,
   readStringRecord,
+  resolveCodexConfigPath,
 } from '@/shared/utils.js';
 
 const readTomlConfig = async (filePath: string): Promise<Record<string, unknown>> => {
@@ -34,6 +40,21 @@ const writeTomlConfig = async (filePath: string, data: Record<string, unknown>):
   await writeFile(filePath, toml, 'utf8');
 };
 
+const validateCodexMcpToolsApprovalMode = (
+  value: unknown,
+): CodexMcpToolsApprovalMode | undefined => {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isCodexMcpToolsApprovalMode(value)) {
+    throw new AppError('Unsupported Codex MCP tool approval mode.', {
+      code: 'INVALID_MCP_TOOLS_APPROVAL_MODE',
+      statusCode: 400,
+    });
+  }
+  return value;
+};
+
 export class CodexMcpProvider extends McpProvider {
   constructor() {
     super('codex', ['user', 'project'], ['stdio', 'http']);
@@ -41,7 +62,7 @@ export class CodexMcpProvider extends McpProvider {
 
   protected async readScopedServers(scope: McpScope, workspacePath: string): Promise<Record<string, unknown>> {
     const filePath = scope === 'user'
-      ? path.join(os.homedir(), '.codex', 'config.toml')
+      ? resolveCodexConfigPath()
       : path.join(workspacePath, '.codex', 'config.toml');
     const config = await readTomlConfig(filePath);
     return readObjectRecord(config.mcp_servers) ?? {};
@@ -53,7 +74,7 @@ export class CodexMcpProvider extends McpProvider {
     servers: Record<string, unknown>,
   ): Promise<void> {
     const filePath = scope === 'user'
-      ? path.join(os.homedir(), '.codex', 'config.toml')
+      ? resolveCodexConfigPath()
       : path.join(workspacePath, '.codex', 'config.toml');
     const config = await readTomlConfig(filePath);
     config.mcp_servers = servers;
@@ -61,6 +82,7 @@ export class CodexMcpProvider extends McpProvider {
   }
 
   protected buildServerConfig(input: UpsertProviderMcpServerInput): Record<string, unknown> {
+    const defaultToolsApprovalMode = validateCodexMcpToolsApprovalMode(input.defaultToolsApprovalMode);
     if (input.transport === 'stdio') {
       if (!input.command?.trim()) {
         throw new AppError('command is required for stdio MCP servers.', {
@@ -75,6 +97,9 @@ export class CodexMcpProvider extends McpProvider {
         env: input.env ?? {},
         env_vars: input.envVars ?? [],
         cwd: input.cwd,
+        ...(defaultToolsApprovalMode
+          ? { default_tools_approval_mode: defaultToolsApprovalMode }
+          : {}),
       };
     }
 
@@ -90,6 +115,9 @@ export class CodexMcpProvider extends McpProvider {
       bearer_token_env_var: input.bearerTokenEnvVar,
       http_headers: input.headers ?? {},
       env_http_headers: input.envHttpHeaders ?? {},
+      ...(defaultToolsApprovalMode
+        ? { default_tools_approval_mode: defaultToolsApprovalMode }
+        : {}),
     };
   }
 
@@ -114,6 +142,9 @@ export class CodexMcpProvider extends McpProvider {
         env: readStringRecord(config.env),
         cwd: readOptionalString(config.cwd),
         envVars: readStringArray(config.env_vars),
+        defaultToolsApprovalMode: isCodexMcpToolsApprovalMode(config.default_tools_approval_mode)
+          ? config.default_tools_approval_mode
+          : undefined,
       };
     }
 
@@ -127,6 +158,9 @@ export class CodexMcpProvider extends McpProvider {
         headers: readStringRecord(config.http_headers),
         bearerTokenEnvVar: readOptionalString(config.bearer_token_env_var),
         envHttpHeaders: readStringRecord(config.env_http_headers),
+        defaultToolsApprovalMode: isCodexMcpToolsApprovalMode(config.default_tools_approval_mode)
+          ? config.default_tools_approval_mode
+          : undefined,
       };
     }
 

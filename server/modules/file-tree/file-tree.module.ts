@@ -7,6 +7,7 @@ import multer from 'multer';
 
 import { projectsDb } from '@/modules/database/index.js';
 import { createFileTreeRouter } from '@/modules/file-tree/file-tree.routes.js';
+import type { RequestHandler } from 'express';
 import { createFileTreeService } from '@/modules/file-tree/file-tree.service.js';
 import type {
   FileTreeFileSystem,
@@ -105,12 +106,25 @@ const fileUploadMiddleware = multer({
  * File Tree router used by the server entrypoint to mount the authenticated
  * browsing, editing, file-management, and upload API under `/api/file-tree`.
  */
-export const fileTreeRoutes = createFileTreeRouter(
-  fileTreeServices,
-  fileUploadMiddleware,
-  {
-    maximumFileSizeMegabytes: MAXIMUM_UPLOAD_SIZE_MEGABYTES,
-    maximumFileCount: MAXIMUM_UPLOAD_FILE_COUNT,
-  },
-  fileTreeLogger,
-);
+/**
+ * Compose File Tree routes with an optional deployment capability resolver.
+ * Keeping the default export below preserves existing callers and tests,
+ * while the server composition root can inject the product/QA read-only
+ * policy for its production instance.
+ */
+export function createFileTreeModule(
+  capabilityGuard?: (operation: string) => RequestHandler,
+) {
+  return createFileTreeRouter(
+    fileTreeServices,
+    fileUploadMiddleware,
+    {
+      maximumFileSizeMegabytes: MAXIMUM_UPLOAD_SIZE_MEGABYTES,
+      maximumFileCount: MAXIMUM_UPLOAD_FILE_COUNT,
+    },
+    fileTreeLogger,
+    capabilityGuard,
+  );
+}
+
+export const fileTreeRoutes = createFileTreeModule();

@@ -287,6 +287,8 @@ const replaceScopedServers = (
 type UseMcpServersArgs = {
   selectedProvider: McpProvider;
   currentProjects: McpProject[];
+  /** Host deployment capability; settings UI passes false for product/QA. */
+  canManage?: boolean;
 };
 
 /**
@@ -299,7 +301,7 @@ type McpServerFormState =
   | { scope: 'global'; editingServer: null }
   | null;
 
-export function useMcpServers({ selectedProvider, currentProjects }: UseMcpServersArgs) {
+export function useMcpServers({ selectedProvider, currentProjects, canManage = false }: UseMcpServersArgs) {
   const [servers, setServers] = useState<ProviderMcpServer[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -414,12 +416,18 @@ export function useMcpServers({ selectedProvider, currentProjects }: UseMcpServe
   }, [cacheKey, projectTargets, selectedProvider]);
 
   const openForm = useCallback((server?: ProviderMcpServer) => {
+    if (!canManage) {
+      return;
+    }
     setServerForm({ scope: 'provider', editingServer: server || null });
-  }, []);
+  }, [canManage]);
 
   const openGlobalForm = useCallback(() => {
+    if (!canManage) {
+      return;
+    }
     setServerForm({ scope: 'global', editingServer: null });
-  }, []);
+  }, [canManage]);
 
   const closeForm = useCallback(() => {
     setServerForm(null);
@@ -427,6 +435,10 @@ export function useMcpServers({ selectedProvider, currentProjects }: UseMcpServe
 
   const submitForm = useCallback(
     async (formData: McpFormState, serverBeingEdited: ProviderMcpServer | null) => {
+      if (!canManage) {
+        throw new Error('MCP configuration is disabled for this deployment.');
+      }
+
       const payload = createMcpPayloadFromForm(selectedProvider, formData);
       if (payload.scope !== 'user' && !payload.workspacePath) {
         throw new Error('Select a project for project-scoped MCP servers');
@@ -443,11 +455,15 @@ export function useMcpServers({ selectedProvider, currentProjects }: UseMcpServe
       setSaveStatus('success');
       closeForm();
     },
-    [cacheKey, closeForm, refreshServers, selectedProvider],
+    [cacheKey, canManage, closeForm, refreshServers, selectedProvider],
   );
 
   const submitGlobalForm = useCallback(
     async (formData: McpFormState) => {
+      if (!canManage) {
+        throw new Error('MCP configuration is disabled for this deployment.');
+      }
+
       const payload = createMcpPayloadFromForm(selectedProvider, formData, {
         supportedTransports: MCP_GLOBAL_SUPPORTED_TRANSPORTS,
         supportsWorkingDirectory: false,
@@ -479,11 +495,15 @@ export function useMcpServers({ selectedProvider, currentProjects }: UseMcpServe
       setSaveStatus('success');
       closeForm();
     },
-    [closeForm, refreshServers, selectedProvider],
+    [canManage, closeForm, refreshServers, selectedProvider],
   );
 
   const deleteServer = useCallback(
     async (server: ProviderMcpServer) => {
+      if (!canManage) {
+        return;
+      }
+
       if (!window.confirm('Are you sure you want to delete this MCP server?')) {
         return;
       }
@@ -499,7 +519,7 @@ export function useMcpServers({ selectedProvider, currentProjects }: UseMcpServe
         setSaveStatus('error');
       }
     },
-    [cacheKey, refreshServers, selectedProvider],
+    [cacheKey, canManage, refreshServers, selectedProvider],
   );
 
   useEffect(() => {

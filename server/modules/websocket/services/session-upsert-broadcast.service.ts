@@ -1,6 +1,7 @@
 import path from 'node:path';
 
-import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { collaborationService } from '@/modules/collaboration/index.js';
+import { projectsDb, sessionsDb, sessionWorkspacesDb } from '@/modules/database/index.js';
 import { generateDisplayName } from '@/modules/projects/index.js';
 import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import type { SessionUpsertedEvent } from '@/shared/types.js';
@@ -36,6 +37,8 @@ async function buildSessionUpsertedEvent(
   const displayName = project?.custom_project_name?.trim()
     ? project.custom_project_name
     : await generateDisplayName(path.basename(projectPath ?? '') || (projectPath ?? ''), projectPath);
+  const attribution = collaborationService.getSessionAttribution(row.session_id);
+  const workspace = sessionWorkspacesDb.getBySessionId(row.session_id);
 
   return {
     kind: 'session_upserted',
@@ -49,6 +52,8 @@ async function buildSessionUpsertedEvent(
       summary: row.custom_name || '',
       messageCount: 0,
       lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
+      ...(attribution ? { attribution } : {}),
+      ...(workspace ? { workspace } : {}),
     },
     project: project
       ? {

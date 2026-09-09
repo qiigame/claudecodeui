@@ -19,6 +19,7 @@
   },
   "tabs": {
     "chat": "Chat",
+    "guide": "Guide",
     "shell": "Shell",
     "files": "Files",
     "git": "Source Control",
@@ -54,6 +55,16 @@
     "next": "Next",
     "previous": "Previous",
     "logout": "Logout"
+  },
+  "identityAccess": {
+    "pendingTitle": "Identifying your project account",
+    "ambiguousTitle": "DingTalk identity needs confirmation",
+    "pendingReason": "This DingTalk login will be matched to the project roster automatically.",
+    "configuredReason": "This DingTalk identity is registered and its automatic mapping is being completed.",
+    "ambiguousReason": "This DingTalk identity matches multiple project members, so a unique identity cannot be confirmed yet.",
+    "readOnlyScope": "Identity mapping does not block normal chat. Until mapping completes, only commits and other operations requiring named attribution remain unavailable.",
+    "contactAdmin": "If a fresh login is still not recognized, confirm that the roster contains one unique matching name.",
+    "acknowledge": "Got it"
   },
   "common": {
     "language": "Language",
@@ -103,7 +114,7 @@
     "simpleView": "Simple view",
     "compactView": "Compact view",
     "detailedView": "Detailed view",
-    "searchPlaceholder": "Search files and folders...",
+    "searchPlaceholder": "Search expanded files and folders...",
     "clearSearch": "Clear search",
     "name": "Name",
     "size": "Size",
@@ -113,7 +124,7 @@
     "checkProjectPath": "Check if the project path is accessible",
     "loadFailed": "Unable to load files",
     "noMatchesFound": "No matches found",
-    "tryDifferentSearch": "Try a different search term or clear the search",
+    "tryDifferentSearch": "Expand more folders, try another term, or clear the search",
     "justNow": "just now",
     "minAgo": "{{count}} min ago",
     "hoursAgo": "{{count}} hours ago",

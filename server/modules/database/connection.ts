@@ -116,6 +116,18 @@ export function getConnection(): Database.Database {
 
   instance = new Database(dbPath);
 
+  // This database contains authentication and actor-attribution material.
+  // Tighten legacy/default-umask files on every open instead of relying on the
+  // account-wide umask to remain private.
+  try {
+    fs.chmodSync(dbPath, 0o600);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    instance.close();
+    instance = null;
+    throw new Error(`Could not secure the database file: ${message}`);
+  }
+
   // app_config must exist immediately — the auth middleware reads
   // the JWT secret at module-load time, before initializeDatabase() runs.
   instance.exec(APP_CONFIG_TABLE_SCHEMA_SQL);

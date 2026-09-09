@@ -1,5 +1,6 @@
 import { api } from '@/shared/api';
 import { CODE_EDITOR_STORAGE_KEYS } from '@/shared/constants';
+import type { UserDataHydrationOptions } from '@/shared/types';
 
 /**
  * The one reader and writer for the settings that used to live in browser
@@ -79,6 +80,9 @@ let preferences: PreferenceRecord = {};
 let pendingServerWrites: PreferenceRecord = {};
 let serverWriteTimer: ReturnType<typeof setTimeout> | null = null;
 let hasHydrated = false;
+// Abort signals are best effort; this generation is the synchronous ownership
+// fence for transports/mocks that still resolve after an account reset.
+let hydrationGeneration = 0;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   Boolean(value) && typeof value === 'object' && !Array.isArray(value)
@@ -277,21 +281,40 @@ function readLegacyCodeEditorSettings(): unknown {
  * seeded from wherever it used to live in localStorage and pushed up, so the
  * settings an existing install already had survive the move.
  */
-export async function hydrateUserPreferences(): Promise<void> {
+export async function hydrateUserPreferences(options: UserDataHydrationOptions = {}): Promise<void> {
+  const requestGeneration = hydrationGeneration;
+  const isCurrent = () => (
+    requestGeneration === hydrationGeneration
+    && !options.signal?.aborted
+    && (options.isCurrent?.() ?? true)
+  );
   let serverPreferences: PreferenceRecord = {};
 
   try {
-    const response = await api.user.preferences();
+    const response = await api.user.preferences({ signal: options.signal });
+    if (!isCurrent()) {
+      return;
+    }
     if (response.ok) {
       const payload = (await response.json()) as { preferences?: unknown };
+      if (!isCurrent()) {
+        return;
+      }
       if (isRecord(payload.preferences)) {
         serverPreferences = payload.preferences as PreferenceRecord;
       }
     }
   } catch (error) {
+    if (!isCurrent()) {
+      return;
+    }
     // Keep whatever the mirror holds; an offline load must still render the
     // user's own theme and language rather than snapping back to defaults.
     console.error('Failed to load user preferences:', error);
+    return;
+  }
+
+  if (!isCurrent()) {
     return;
   }
 
@@ -339,6 +362,7 @@ export function hasHydratedUserPreferences(): boolean {
  * this device does not start out looking at the previous user's settings.
  */
 export function resetUserPreferences(): void {
+  hydrationGeneration += 1;
   preferences = {};
   pendingServerWrites = {};
   hasHydrated = false;

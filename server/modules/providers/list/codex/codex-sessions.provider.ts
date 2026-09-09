@@ -1,5 +1,5 @@
-import fsSync from 'node:fs';
 import fsp from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline';
 
@@ -19,9 +19,15 @@ import type {
 } from '@/shared/types.js';
 import {
   AppError,
+  closeProviderTranscriptReadHandle,
   createNormalizedMessage,
   generateMessageId,
+  normalizeProjectPath,
+  openProviderTranscriptReadHandle,
+  preflightProviderTranscriptPath,
   readObjectRecord,
+  readFirstJsonlRecordFromHandle,
+  resolveCodexHomeDirectory,
   sliceTailPage,
   truncateSubagentActivity,
 } from '@/shared/utils.js';
@@ -51,6 +57,19 @@ type CodexHistoryResult = {
   offset?: number;
   limit?: number | null;
   tokenUsage?: unknown;
+};
+
+/**
+ * A Codex rollout that has passed root, filename, and opening-envelope checks.
+ * The authenticated descriptor is kept open by the history/edit caller until
+ * all bytes needed for that operation have been consumed. This closes the
+ * validate-then-reopen pathname window for the main transcript.
+ */
+type ResolvedCodexTranscript = {
+  canonicalPath: string;
+  handle: FileHandle;
+  device: number;
+  inode: number;
 };
 
 function readNonEmptyString(value: unknown): string | undefined {
@@ -135,25 +154,38 @@ function createCodexTurnTracker() {
  * once when a message is edited, while the reader runs on every history fetch,
  * and both share the one rule for what a live turn is.
  */
-async function readCodexLiveTurnIds(filePath: string): Promise<string[]> {
+async function readCodexLiveTurnIds(
+  transcript: Pick<ResolvedCodexTranscript, 'canonicalPath' | 'handle'>,
+): Promise<string[]> {
   const turns = createCodexTurnTracker();
-  const stream = fsSync.createReadStream(filePath);
+  const stream = transcript.handle.createReadStream({
+    start: 0,
+    autoClose: false,
+    encoding: 'utf8',
+  });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
-  for await (const line of lines) {
-    if (!line.trim()) {
-      continue;
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) {
+        continue;
+      }
+      let entry: AnyRecord;
+      try {
+        entry = JSON.parse(line) as AnyRecord;
+      } catch {
+        continue;
+      }
+      const payload = readObjectRecord(entry.payload);
+      if (payload) {
+        turns.observe(entry.type, payload);
+      }
     }
-    let entry: AnyRecord;
-    try {
-      entry = JSON.parse(line) as AnyRecord;
-    } catch {
-      continue;
-    }
-    const payload = readObjectRecord(entry.payload);
-    if (payload) {
-      turns.observe(entry.type, payload);
-    }
+  } finally {
+    lines.close();
+    stream.destroy();
+    // The caller owns the authenticated descriptor and closes it after this
+    // pass; do not reopen or close it here.
   }
 
   return turns.getLiveTurnIds();
@@ -874,14 +906,26 @@ function parseCodexSubagentMessage(payload: AnyRecord): {
 async function findCodexSubagentRollout(
   parentFilePath: string,
   agentThreadId: string,
-): Promise<string | null> {
+): Promise<ResolvedCodexTranscript | null> {
   const suffix = `-${agentThreadId}.jsonl`;
   let directory = path.dirname(parentFilePath);
 
   for (let level = 0; level <= SUBAGENT_LOOKUP_PARENT_LEVELS; level += 1) {
     const match = await findFileWithSuffix(directory, suffix, level === 0 ? 0 : level);
     if (match) {
-      return match;
+      // A subagent path is discovered from transcript content and therefore
+      // must receive the same canonical-root and metadata validation as a
+      // top-level rollout. Without this check a symlink named like an agent
+      // thread could make history loading read an arbitrary host file.
+      const validated = await validateCodexRolloutPath({
+        candidatePath: match,
+        rootPath: path.join(resolveCodexHomeDirectory(), 'sessions'),
+        providerSessionId: agentThreadId,
+        expectedSubagent: true,
+      });
+      if (validated) {
+        return validated;
+      }
     }
     const parent = path.dirname(directory);
     if (parent === directory) {
@@ -894,7 +938,12 @@ async function findCodexSubagentRollout(
 }
 
 /** Depth-limited search for a file whose name ends with `suffix`. */
-async function findFileWithSuffix(directory: string, suffix: string, depth: number): Promise<string | null> {
+async function findFileWithSuffix<T = string>(
+  directory: string,
+  suffix: string,
+  depth: number,
+  validate?: (candidatePath: string) => Promise<T | null>,
+): Promise<T | null> {
   let entries;
   try {
     entries = await fsp.readdir(directory, { withFileTypes: true });
@@ -909,7 +958,15 @@ async function findFileWithSuffix(directory: string, suffix: string, depth: numb
       continue;
     }
     if (entry.name.endsWith(suffix)) {
-      return path.join(directory, entry.name);
+      const candidatePath = path.join(directory, entry.name);
+      if (validate) {
+        const validatedPath = await validate(candidatePath);
+        if (validatedPath) {
+          return validatedPath;
+        }
+      } else {
+        return candidatePath as T;
+      }
     }
   }
 
@@ -918,7 +975,7 @@ async function findFileWithSuffix(directory: string, suffix: string, depth: numb
   }
 
   for (const subdirectory of subdirectories) {
-    const match = await findFileWithSuffix(subdirectory, suffix, depth - 1);
+    const match = await findFileWithSuffix<T>(subdirectory, suffix, depth - 1, validate);
     if (match) {
       return match;
     }
@@ -941,99 +998,108 @@ type CodexSubagentTranscript = {
  * and patch calls go through the same translation and end up rendered by the
  * same components as the main thread's.
  */
-async function readCodexSubagentTranscript(filePath: string): Promise<CodexSubagentTranscript> {
+async function readCodexSubagentTranscript(
+  resolvedTranscript: Pick<ResolvedCodexTranscript, 'canonicalPath' | 'handle'>,
+): Promise<CodexSubagentTranscript> {
   const activity: SubagentActivity[] = [];
-  const transcript: CodexSubagentTranscript = { activity };
+  const parsedTranscript: CodexSubagentTranscript = { activity };
   const pendingResults = new Map<string, SubagentActivity>();
 
-  let fileStream;
+  let fileStream: ReturnType<typeof resolvedTranscript.handle.createReadStream> | undefined;
+  let rl: readline.Interface | undefined;
+
   try {
-    fileStream = fsSync.createReadStream(filePath);
-  } catch {
-    return transcript;
-  }
+    fileStream = resolvedTranscript.handle.createReadStream({
+      start: 0,
+      autoClose: false,
+      encoding: 'utf8',
+    });
+    const lineReader = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+    rl = lineReader;
 
-  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-
-  for await (const line of rl) {
-    if (!line.trim()) {
-      continue;
-    }
-
-    let entry: AnyRecord;
-    try {
-      entry = JSON.parse(line) as AnyRecord;
-    } catch {
-      continue;
-    }
-
-    const payload = readObjectRecord(entry.payload);
-    if (!payload) {
-      continue;
-    }
-
-    if (entry.type === 'session_meta') {
-      // A resumed rollout writes a second, sparser session_meta; assigning
-      // unconditionally would erase the identity the first one carried.
-      transcript.nickname = readNonEmptyString(payload.agent_nickname) ?? transcript.nickname;
-      transcript.agentPath = readNonEmptyString(payload.agent_path) ?? transcript.agentPath;
-      continue;
-    }
-
-    if (entry.type === 'turn_context') {
-      transcript.model = readNonEmptyString(payload.model) ?? transcript.model;
-      continue;
-    }
-
-    if (entry.type !== 'response_item') {
-      continue;
-    }
-
-    const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
-
-    if (payload.type === 'message' && payload.role === 'assistant') {
-      const content = extractCodexTextContent(payload.content).trim();
-      if (content) {
-        activity.push({ kind: 'text', content, timestamp });
-      }
-      continue;
-    }
-
-    if (payload.type === 'reasoning') {
-      const summary = Array.isArray(payload.summary)
-        ? payload.summary.map((item: AnyRecord) => item?.text).filter(Boolean).join('\n')
-        : '';
-      if (summary.trim()) {
-        activity.push({ kind: 'thinking', content: summary, timestamp });
-      }
-      continue;
-    }
-
-    if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
-      const callId = readNonEmptyString(payload.call_id) ?? generateMessageId('codex-subagent-call');
-      for (const child of translateCodexToolCall(payload, callId)) {
-        const record: SubagentActivity = { ...child, timestamp };
-        activity.push(record);
-        pendingResults.set(callId, record);
-      }
-      continue;
-    }
-
-    if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
-      const callId = readNonEmptyString(payload.call_id);
-      const target = callId ? pendingResults.get(callId) : undefined;
-      if (!target) {
+    for await (const line of lineReader) {
+      if (!line.trim()) {
         continue;
       }
-      const cleaned = cleanCodexShellOutput(extractCodexToolOutput(payload.output));
-      target.toolResult = {
-        content: cleaned.output,
-        isError: cleaned.exitCode !== undefined && cleaned.exitCode !== 0,
-      };
+
+      let entry: AnyRecord;
+      try {
+        entry = JSON.parse(line) as AnyRecord;
+      } catch {
+        continue;
+      }
+
+      const payload = readObjectRecord(entry.payload);
+      if (!payload) {
+        continue;
+      }
+
+      if (entry.type === 'session_meta') {
+        // A resumed rollout writes a second, sparser session_meta; assigning
+        // unconditionally would erase the identity the first one carried.
+        parsedTranscript.nickname = readNonEmptyString(payload.agent_nickname) ?? parsedTranscript.nickname;
+        parsedTranscript.agentPath = readNonEmptyString(payload.agent_path) ?? parsedTranscript.agentPath;
+        continue;
+      }
+
+      if (entry.type === 'turn_context') {
+        parsedTranscript.model = readNonEmptyString(payload.model) ?? parsedTranscript.model;
+        continue;
+      }
+
+      if (entry.type !== 'response_item') {
+        continue;
+      }
+
+      const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
+
+      if (payload.type === 'message' && payload.role === 'assistant') {
+        const content = extractCodexTextContent(payload.content).trim();
+        if (content) {
+          activity.push({ kind: 'text', content, timestamp });
+        }
+        continue;
+      }
+
+      if (payload.type === 'reasoning') {
+        const summary = Array.isArray(payload.summary)
+          ? payload.summary.map((item: AnyRecord) => item?.text).filter(Boolean).join('\n')
+          : '';
+        if (summary.trim()) {
+          activity.push({ kind: 'thinking', content: summary, timestamp });
+        }
+        continue;
+      }
+
+      if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+        const callId = readNonEmptyString(payload.call_id) ?? generateMessageId('codex-subagent-call');
+        for (const child of translateCodexToolCall(payload, callId)) {
+          const record: SubagentActivity = { ...child, timestamp };
+          activity.push(record);
+          pendingResults.set(callId, record);
+        }
+        continue;
+      }
+
+      if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+        const callId = readNonEmptyString(payload.call_id);
+        const target = callId ? pendingResults.get(callId) : undefined;
+        if (!target) {
+          continue;
+        }
+        const cleaned = cleanCodexShellOutput(extractCodexToolOutput(payload.output));
+        target.toolResult = {
+          content: cleaned.output,
+          isError: cleaned.exitCode !== undefined && cleaned.exitCode !== 0,
+        };
+      }
     }
+  } finally {
+    rl?.close();
+    fileStream?.destroy();
   }
 
-  return transcript;
+  return parsedTranscript;
 }
 
 /**
@@ -1154,14 +1220,299 @@ const CODEX_COLLABORATION_CONTROL_TOOLS = new Set([
 // ─── Transcript reader ──────────────────────────────────────────────────────
 
 /**
+ * Returns whether a value can safely be used as one opaque Codex session id
+ * while looking up a rollout filename.  Codex ids are normally UUIDs, but the
+ * value can also come from an older database row; rejecting separators keeps a
+ * malformed/native id from changing the directory being searched.
+ */
+function isSafeCodexSessionId(value: string): boolean {
+  return Boolean(
+    value
+      && value !== '.'
+      && value !== '..'
+      && !path.isAbsolute(value)
+      && !/[\\/:\0-\x1f\x7f]/.test(value)
+      && path.basename(value) === value,
+  );
+}
+
+/**
+ * Applies the shared filesystem checks, then authenticates Codex's first
+ * non-empty JSONL record.  For a Codex rollout that first record is the
+ * authoritative session envelope: a later matching `session_meta` must not
+ * rescue a file whose opening record is malformed or belongs to another
+ * thread.
+ */
+async function validateCodexRolloutPath(input: {
+  candidatePath: string;
+  rootPath: string;
+  providerSessionId: string;
+  expectedSubagent: boolean;
+  expectedProjectPath?: string | null;
+}): Promise<ResolvedCodexTranscript | null> {
+  const preflight = await preflightProviderTranscriptPath({
+    provider: PROVIDER,
+    candidatePath: input.candidatePath,
+    rootPath: input.rootPath,
+    providerSessionId: input.providerSessionId,
+  });
+  if (!preflight) {
+    return null;
+  }
+
+  const opened = await openProviderTranscriptReadHandle(preflight.canonicalPath, {
+    device: preflight.device,
+    inode: preflight.inode,
+  });
+  if (!opened) {
+    return null;
+  }
+
+  let ownsHandle = true;
+  try {
+    const firstRecord = readObjectRecord(
+      await readFirstJsonlRecordFromHandle(opened.handle),
+    );
+    if (!validateProviderTranscriptRecord({
+      provider: PROVIDER,
+      preflight,
+      firstRecord,
+      providerSessionId: input.providerSessionId,
+      expectedSubagent: input.expectedSubagent,
+      expectedProjectPath: input.expectedProjectPath,
+    })) {
+      return null;
+    }
+
+    ownsHandle = false;
+    return {
+      canonicalPath: preflight.canonicalPath,
+      handle: opened.handle,
+      device: opened.device,
+      inode: opened.inode,
+    };
+  } catch {
+    return null;
+  } finally {
+    if (ownsHandle) {
+      await closeProviderTranscriptReadHandle(opened.handle);
+    }
+  }
+}
+
+/**
+ * Looks up a Codex row without allowing an app/native id collision belonging
+ * to another provider to supply its transcript path. App ids are globally
+ * generated, while native ids are only unique inside a provider namespace.
+ */
+type CodexIndexedSession = NonNullable<ReturnType<typeof sessionsDb.getSessionById>>;
+
+type CodexSessionLookup = {
+  session: CodexIndexedSession | null;
+  /** Null means a known app row has not produced a native transcript yet. */
+  providerSessionId: string | null;
+  canonicalSessionId: string;
+  /** True when the supplied app/native pair is internally inconsistent. */
+  blocked: boolean;
+};
+
+/**
+ * Resolves an app id/native id pair without guessing across providers.
+ *
+ * The normal service path supplies an app id and an indexed native id. Legacy
+ * direct callers may supply only one id, so an unknown id still gets a scoped
+ * filesystem fallback. Once an app row is known, however, a NULL native
+ * mapping means "no transcript yet" (never search by the app id), and an
+ * explicitly conflicting native hint is rejected rather than treated as an
+ * alias for a different conversation.
+ */
+function resolveCodexSessionLookup(
+  sessionId: string,
+  providerSessionId: string,
+  providerSessionIdWasExplicit = false,
+): CodexSessionLookup {
+  const byAppId = sessionsDb.getSessionById(sessionId);
+  const byNativeId = sessionsDb.getSessionByProviderSessionId(providerSessionId, PROVIDER);
+
+  if (byAppId?.provider === PROVIDER) {
+    const mappedProviderSessionId = byAppId.provider_session_id;
+    if (mappedProviderSessionId === null) {
+      return {
+        session: byAppId,
+        providerSessionId: null,
+        canonicalSessionId: byAppId.session_id,
+        blocked: providerSessionIdWasExplicit,
+      };
+    }
+
+    if (providerSessionIdWasExplicit && mappedProviderSessionId !== providerSessionId) {
+      return {
+        session: byAppId,
+        providerSessionId: null,
+        canonicalSessionId: byAppId.session_id,
+        blocked: true,
+      };
+    }
+
+    // If an app id also happens to be a native id for another Codex row, the
+    // request is ambiguous. Keep the app-id path for the ordinary case, but
+    // never let a collision silently select whichever row the database returns.
+    if (providerSessionId === sessionId && byNativeId && byNativeId.session_id !== byAppId.session_id) {
+      return {
+        session: byAppId,
+        providerSessionId: null,
+        canonicalSessionId: byAppId.session_id,
+        blocked: true,
+      };
+    }
+
+    if (mappedProviderSessionId !== providerSessionId && providerSessionId !== sessionId) {
+      return {
+        session: byAppId,
+        providerSessionId: null,
+        canonicalSessionId: byAppId.session_id,
+        blocked: true,
+      };
+    }
+
+    return {
+      session: byAppId,
+      providerSessionId: mappedProviderSessionId,
+      canonicalSessionId: byAppId.session_id,
+      blocked: false,
+    };
+  }
+
+  if (byAppId && byAppId.provider !== PROVIDER) {
+    // A known app id owned by another provider is not an unknown native id.
+    // Only an independently indexed Codex mapping can disambiguate it.
+    if (!byNativeId) {
+      return {
+        session: null,
+        providerSessionId: null,
+        canonicalSessionId: sessionId,
+        blocked: true,
+      };
+    }
+  }
+
+  if (byNativeId) {
+    return {
+      session: byNativeId,
+      providerSessionId: byNativeId.provider_session_id,
+      canonicalSessionId: byNativeId.session_id,
+      blocked: byNativeId.provider_session_id === null,
+    };
+  }
+
+  // No row yet: retain the legacy direct-native fallback, but keep the
+  // provider id separate from the app-facing id used in returned messages.
+  return {
+    session: null,
+    providerSessionId,
+    canonicalSessionId: sessionId,
+    blocked: false,
+  };
+}
+
+/**
+ * Resolves one Codex rollout path before the filesystem watcher has indexed
+ * it.  A normal row already has `jsonl_path`; the fallback searches only the
+ * configured Codex sessions root and verifies both containment and the
+ * session_meta id before returning a file.  This covers the short window
+ * between a runtime announcing its native id and the polling watcher writing
+ * the path into SQLite.
+ */
+async function resolveCodexTranscriptPath(
+  sessionId: string,
+  providerSessionId: string,
+  requestedProjectPath?: string | null,
+): Promise<ResolvedCodexTranscript | null> {
+  const lookup = resolveCodexSessionLookup(sessionId, providerSessionId);
+  if (lookup.blocked || lookup.providerSessionId === null) {
+    return null;
+  }
+  const session = lookup.session;
+  const effectiveProviderSessionId = lookup.providerSessionId;
+
+  // The source `project_path` is only the sidebar owner. Prefer the caller's
+  // effective runtime cwd and then the row's private runtime path when
+  // locating a pre-index fallback. A known runtime path is also the value
+  // against which the transcript's opening `session_meta.cwd` is authenticated.
+  const requestedPath = typeof requestedProjectPath === 'string' && requestedProjectPath.trim()
+    ? requestedProjectPath.trim()
+    : null;
+  const runtimePath = typeof session?.runtime_path === 'string' && session.runtime_path.trim()
+    ? session.runtime_path.trim()
+    : null;
+  const expectedProjectPath = runtimePath ?? requestedPath;
+
+  // Both watcher-created rows and app-created rows are persisted data, not a
+  // trust boundary. Validate an indexed path with the same root, symlink and
+  // top-level-thread checks as the fallback path below before opening it. A
+  // stale/malicious SQLite value must not turn history loading into an
+  // arbitrary host-file read, even when the file happens to exist.
+  const sessionsRoot = path.join(resolveCodexHomeDirectory(), 'sessions');
+  const rootRealPath = await fsp.realpath(sessionsRoot).catch(() => null);
+  const validateCandidate = (candidate: string): Promise<ResolvedCodexTranscript | null> =>
+    validateCodexRolloutPath({
+      candidatePath: candidate,
+      rootPath: sessionsRoot,
+      providerSessionId: effectiveProviderSessionId,
+      expectedSubagent: false,
+      expectedProjectPath,
+    });
+
+  if (session?.jsonl_path) {
+    const indexedCandidate = await validateCandidate(session.jsonl_path);
+    if (indexedCandidate) {
+      return indexedCandidate;
+    }
+    // The watcher can leave a stale path while a new rollout is being
+    // materialised; continue with the configured-home fallback below.
+  }
+
+  if (!isSafeCodexSessionId(effectiveProviderSessionId)) {
+    return null;
+  }
+
+  if (!rootRealPath) {
+    return null;
+  }
+
+  // Current Codex uses rollout-<timestamp>-<thread-id>.jsonl under a
+  // year/month/day tree.  Keep a little depth headroom for older layouts and
+  // test fixtures without walking arbitrary files outside that tree.
+  return (await findFileWithSuffix<ResolvedCodexTranscript>(
+    rootRealPath,
+    `-${effectiveProviderSessionId}.jsonl`,
+    5,
+    validateCandidate,
+  )) ?? findFileWithSuffix<ResolvedCodexTranscript>(
+    rootRealPath,
+    `${effectiveProviderSessionId}.jsonl`,
+    5,
+    validateCandidate,
+  );
+}
+
+/**
  * Reads one Codex rollout file and produces the compact per-message records
  * `normalizeHistoryEntry` turns into `NormalizedMessage`s.
  */
-async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryResult> {
-  const sessionFilePath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
+async function getCodexSessionMessages(
+  sessionId: string,
+  providerSessionId: string,
+  requestedProjectPath?: string | null,
+): Promise<CodexHistoryResult> {
+  const resolvedTranscript = await resolveCodexTranscriptPath(
+    sessionId,
+    providerSessionId,
+    requestedProjectPath,
+  );
 
-  if (!sessionFilePath) {
-    console.warn(`Codex session file not found for session ${sessionId}`);
+  if (!resolvedTranscript) {
+    console.warn(`Codex session file not found for session ${providerSessionId}`);
     return { messages: [], total: 0, hasMore: false };
   }
 
@@ -1199,8 +1550,8 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
   /** Turns whose prompt already carries the anchor, so only the first does. */
   const anchoredTurnIds = new Set<string>();
 
-  const fileStream = fsSync.createReadStream(sessionFilePath);
-  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+  let fileStream: ReturnType<typeof resolvedTranscript.handle.createReadStream> | undefined;
+  let rl: readline.Interface | undefined;
 
   /** Emits a tool_result row unless the call already produced one. */
   const pushToolResult = (callId: string, timestamp: string, output: string, isError: boolean) => {
@@ -1211,30 +1562,41 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     messages.push({ type: 'tool_result', timestamp, toolCallId: callId, output, isError });
   };
 
-  for await (const line of rl) {
-    if (!line.trim()) {
-      continue;
-    }
+  try {
+    // Keep descriptor ownership in this function even if stream construction
+    // fails (for example, after a provider process closes the file abruptly).
+    fileStream = resolvedTranscript.handle.createReadStream({
+      start: 0,
+      autoClose: false,
+      encoding: 'utf8',
+    });
+    const lineReader = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+    rl = lineReader;
 
-    let entry: AnyRecord;
-    try {
-      entry = JSON.parse(line) as AnyRecord;
-    } catch {
-      continue;
-    }
+    for await (const line of lineReader) {
+      if (!line.trim()) {
+        continue;
+      }
 
-    const payload = readObjectRecord(entry.payload);
-    if (!payload) {
-      continue;
-    }
-    const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : new Date().toISOString();
+      let entry: AnyRecord;
+      try {
+        entry = JSON.parse(line) as AnyRecord;
+      } catch {
+        continue;
+      }
+
+      const payload = readObjectRecord(entry.payload);
+      if (!payload) {
+        continue;
+      }
+      const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : new Date().toISOString();
     // Before the type-specific branches: a turn is opened and closed by rows
     // that produce no transcript entry of their own, and each of those
     // branches ends in a `continue`.
-    turns.observe(entry.type, payload);
+      turns.observe(entry.type, payload);
 
     // ── event_msg ──────────────────────────────────────────────────────────
-    if (entry.type === 'event_msg') {
+      if (entry.type === 'event_msg') {
       if (payload.type === 'token_count' && payload.info) {
         const info = payload.info as AnyRecord;
         if (info.total_token_usage) {
@@ -1727,7 +2089,7 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     }
   }
 
-  await attachCodexSubagentTranscripts(sessionFilePath, subagentsByCallId);
+  await attachCodexSubagentTranscripts(resolvedTranscript, subagentsByCallId);
 
   // A rollback is recorded after the turns it retires, so a prompt can be
   // anchored and then retired later in the same file. Its rows still render —
@@ -1739,8 +2101,13 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
     }
   }
 
-  messages.sort((a, b) => new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime());
-  return { messages, tokenUsage: tokenUsage ?? undefined };
+    messages.sort((a, b) => new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime());
+    return { messages, tokenUsage: tokenUsage ?? undefined };
+  } finally {
+    rl?.close();
+    fileStream?.destroy();
+    await closeProviderTranscriptReadHandle(resolvedTranscript.handle);
+  }
 }
 
 /**
@@ -1748,7 +2115,7 @@ async function getCodexSessionMessages(sessionId: string): Promise<CodexHistoryR
  * `Task` row that started it.
  */
 async function attachCodexSubagentTranscripts(
-  parentFilePath: string,
+  parentTranscript: Pick<ResolvedCodexTranscript, 'canonicalPath' | 'handle'>,
   subagentsByCallId: Map<string, CodexSubagentRecord>,
 ): Promise<void> {
   for (const record of subagentsByCallId.values()) {
@@ -1770,17 +2137,24 @@ async function attachCodexSubagentTranscripts(
     };
 
     if (record.agentThreadId) {
-      const rolloutPath = await findCodexSubagentRollout(parentFilePath, record.agentThreadId);
-      if (rolloutPath) {
-        const transcript = await readCodexSubagentTranscript(rolloutPath);
-        if (transcript.activity.length > 0) {
-          record.message.subagentTools = transcript.activity
-            .slice(0, MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
-            .map(truncateSubagentActivity);
-          subagent.activityCount = transcript.activity.length;
+      const rollout = await findCodexSubagentRollout(
+        parentTranscript.canonicalPath,
+        record.agentThreadId,
+      );
+      if (rollout) {
+        try {
+          const transcript = await readCodexSubagentTranscript(rollout);
+          if (transcript.activity.length > 0) {
+            record.message.subagentTools = transcript.activity
+              .slice(0, MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
+              .map(truncateSubagentActivity);
+            subagent.activityCount = transcript.activity.length;
+          }
+          subagent.name = transcript.nickname ?? agentName;
+          subagent.model = transcript.model;
+        } finally {
+          await closeProviderTranscriptReadHandle(rollout.handle);
         }
-        subagent.name = transcript.nickname ?? agentName;
-        subagent.model = transcript.model;
       }
     }
 
@@ -1803,21 +2177,33 @@ export class CodexSessionsProvider implements IProviderSessions {
     anchorId: string,
   ): Promise<{ found: boolean; resumeThroughId: string | null }> {
     const session = sessionsDb.getSessionById(sessionId);
-    const jsonlPath = session?.jsonl_path;
-    if (!jsonlPath || !session?.provider_session_id) {
+    if (!session?.provider_session_id || session.provider !== PROVIDER) {
       return { found: false, resumeThroughId: null };
     }
 
-    const liveTurnIds = await readCodexLiveTurnIds(jsonlPath);
-    const anchorIndex = liveTurnIds.indexOf(anchorId);
-    if (anchorIndex < 0) {
+    const resolvedTranscript = await resolveCodexTranscriptPath(
+      sessionId,
+      session.provider_session_id,
+      session.runtime_path ?? undefined,
+    );
+    if (!resolvedTranscript) {
       return { found: false, resumeThroughId: null };
     }
 
-    return {
-      found: true,
-      resumeThroughId: anchorIndex === 0 ? null : liveTurnIds[anchorIndex - 1],
-    };
+    try {
+      const liveTurnIds = await readCodexLiveTurnIds(resolvedTranscript);
+      const anchorIndex = liveTurnIds.indexOf(anchorId);
+      if (anchorIndex < 0) {
+        return { found: false, resumeThroughId: null };
+      }
+
+      return {
+        found: true,
+        resumeThroughId: anchorIndex === 0 ? null : liveTurnIds[anchorIndex - 1],
+      };
+    } finally {
+      await closeProviderTranscriptReadHandle(resolvedTranscript.handle);
+    }
   }
 
   /**
@@ -1853,17 +2239,40 @@ export class CodexSessionsProvider implements IProviderSessions {
       return;
     }
 
-    const fork = await codexAppServer.forkThread({
-      threadId: supersededThreadId,
-      lastTurnId: keepThroughId,
-      cwd: session.project_path ?? '',
-    });
+    // `jsonl_path` is an index and can be stale while the watcher catches up.
+    // Resolve it through the runtime-aware, root-contained lookup before the
+    // app-server is allowed to fork. The source project remains the sidebar
+    // owner; isolated sessions must use their private runtime cwd.
+    const effectiveCwd = session.runtime_path ?? session.project_path ?? '';
+    const sourceTranscript = await resolveCodexTranscriptPath(
+      sessionId,
+      supersededThreadId,
+      effectiveCwd,
+    );
+    if (!sourceTranscript || !effectiveCwd.trim()) {
+      throw new AppError('This session transcript is not ready for editing.', {
+        code: 'EDIT_SOURCE_NOT_READY',
+        statusCode: 409,
+      });
+    }
+
+    let fork: Awaited<ReturnType<typeof codexAppServer.forkThread>>;
+    try {
+      fork = await codexAppServer.forkThread({
+        threadId: supersededThreadId,
+        jsonlPath: sourceTranscript.canonicalPath,
+        lastTurnId: keepThroughId,
+        cwd: effectiveCwd,
+      });
+    } finally {
+      await closeProviderTranscriptReadHandle(sourceTranscript.handle);
+    }
 
     sessionsDb.markProviderSessionSuperseded({
       providerSessionId: supersededThreadId,
       provider: PROVIDER,
       sessionId,
-      jsonlPath: session.jsonl_path ?? null,
+      jsonlPath: sourceTranscript.canonicalPath,
     });
     sessionsDb.repointSessionToProviderSession(sessionId, {
       providerSessionId: fork.threadId,
@@ -2186,13 +2595,13 @@ export class CodexSessionsProvider implements IProviderSessions {
     }
 
     if (raw.type === 'turn_complete') {
-      return [createNormalizedMessage({
-        id: baseId,
-        sessionId,
-        timestamp: ts,
-        provider: PROVIDER,
-        kind: 'complete',
-      })];
+      // `queryCodex()` emits a single authoritative `complete` message after
+      // the SDK stream closes.  `turn.completed` is also forwarded here so
+      // token usage can be recorded, but normalizing it as terminal would make
+      // the Web UI stop processing early and drop the richer final message
+      // (including exitCode/actualSessionId). Keep it as a non-terminal SDK
+      // status event; the caller has no transcript row to render for it.
+      return [];
     }
     if (raw.type === 'turn_failed') {
       return [createNormalizedMessage({
@@ -2217,19 +2626,48 @@ export class CodexSessionsProvider implements IProviderSessions {
     options: FetchHistoryOptions = {},
   ): Promise<FetchHistoryResult> {
     const { limit = null, offset = 0 } = options;
+    // The service normally supplies both ids.  Resolve them here as well so
+    // callers that use the provider adapter directly (for example a legacy
+    // share link or a scheduler) can pass either the app id or Codex's native
+    // id without losing the canonical session identity in returned messages.
+    const requestedProviderSessionId = options.providerSessionId ?? sessionId;
+    const lookup = resolveCodexSessionLookup(
+      sessionId,
+      requestedProviderSessionId,
+      options.providerSessionId !== undefined,
+    );
+    // A known app row with no native id is still an empty conversation. Do
+    // not reinterpret its app id as a provider id and accidentally load a
+    // same-named rollout. Explicit app/native mismatches are equally unsafe.
+    if (lookup.blocked || lookup.providerSessionId === null) {
+      return {
+        messages: [],
+        total: 0,
+        hasMore: false,
+        offset: Math.max(0, offset),
+        limit: limit === null ? null : Math.max(0, limit),
+      };
+    }
+
+    const providerSessionId = lookup.providerSessionId;
+    const canonicalSessionId = lookup.canonicalSessionId;
 
     let result: CodexHistoryResult;
     try {
-      result = await getCodexSessionMessages(sessionId);
+      result = await getCodexSessionMessages(
+        canonicalSessionId,
+        providerSessionId,
+        options.projectPath,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[CodexProvider] Failed to load session ${sessionId}:`, message);
+      console.warn(`[CodexProvider] Failed to load session ${canonicalSessionId}:`, message);
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
     }
 
     const normalized: NormalizedMessage[] = [];
     for (const raw of result.messages) {
-      normalized.push(...this.normalizeHistoryEntry(raw, sessionId));
+      normalized.push(...this.normalizeHistoryEntry(raw, canonicalSessionId));
     }
 
     const toolResultMap = new Map<string, NormalizedMessage>();

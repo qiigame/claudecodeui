@@ -107,3 +107,85 @@ test('legacy provider-keyed rows stay resolvable through both lookups', async ()
     assert.equal(sessionsDb.getSessionByProviderSessionId('legacy-1')?.session_id, 'legacy-1');
   });
 });
+
+test('provider-native lookup can disambiguate equal ids across providers', async () => {
+  await withIsolatedDatabase(() => {
+    // Native ids are opaque and only scoped by provider.  Two adapters may
+    // legitimately expose the same value; the scoped lookup must not return
+    // whichever row happened to be updated most recently.
+    sessionsDb.createAppSession('claude-app-shared-id', 'claude', '/workspace/claude');
+    sessionsDb.assignProviderSessionId('claude-app-shared-id', 'shared-native-id');
+    sessionsDb.createAppSession('codex-app-shared-id', 'codex', '/workspace/codex');
+    sessionsDb.assignProviderSessionId('codex-app-shared-id', 'shared-native-id');
+
+    assert.equal(
+      sessionsDb.getSessionByProviderSessionId('shared-native-id', 'claude')?.session_id,
+      'claude-app-shared-id',
+    );
+    assert.equal(
+      sessionsDb.getSessionByProviderSessionId('shared-native-id', 'codex')?.session_id,
+      'codex-app-shared-id',
+    );
+    assert.equal(
+      sessionsDb.getSessionByProviderSessionId('shared-native-id'),
+      null,
+      'an unscoped native-id lookup must fail closed when providers collide',
+    );
+  });
+});
+
+test('disk discovery never overwrites another provider app row on an id collision', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('shared-app-id', 'claude', '/workspace/claude', 'Keep Claude row');
+    // The Codex native id deliberately equals the existing app id.  The
+    // provider-scoped upsert must fail closed instead of changing Claude into
+    // a Codex session.
+    sessionsDb.createSession('shared-app-id', 'codex', '/workspace/codex', 'Must not replace');
+
+    const row = sessionsDb.getSessionById('shared-app-id');
+    assert.equal(row?.provider, 'claude');
+    assert.equal(row?.provider_session_id, null);
+    assert.equal(row?.custom_name, 'Keep Claude row');
+    assert.equal(sessionsDb.getSessionByProviderSessionId('shared-app-id', 'codex'), null);
+  });
+});
+
+test('repointing a provider session does not delete another provider app row', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('codex-app', 'codex', '/workspace/codex');
+    sessionsDb.createAppSession('shared-native-id', 'claude', '/workspace/claude', 'Keep Claude row');
+
+    sessionsDb.repointSessionToProviderSession('codex-app', {
+      providerSessionId: 'shared-native-id',
+      jsonlPath: '/codex/shared-native-id.jsonl',
+    });
+
+    assert.equal(sessionsDb.getSessionById('shared-native-id')?.provider, 'claude');
+    assert.equal(sessionsDb.getSessionById('shared-native-id')?.custom_name, 'Keep Claude row');
+    assert.equal(sessionsDb.getSessionById('codex-app')?.provider_session_id, 'shared-native-id');
+    assert.equal(sessionsDb.getAllSessions().length, 2);
+  });
+});
+
+test('forking a provider session does not delete another provider app row', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('shared-fork-id', 'claude', '/workspace/claude', 'Keep Claude row');
+
+    sessionsDb.createForkedSession({
+      sessionId: 'codex-fork-app',
+      provider: 'codex',
+      projectPath: '/workspace/codex',
+      customName: 'Codex fork',
+      providerSessionId: 'shared-fork-id',
+      jsonlPath: '/codex/shared-fork-id.jsonl',
+      forkedFromSessionId: 'codex-source',
+      model: null,
+      effort: null,
+    });
+
+    assert.equal(sessionsDb.getSessionById('shared-fork-id')?.provider, 'claude');
+    assert.equal(sessionsDb.getSessionById('shared-fork-id')?.custom_name, 'Keep Claude row');
+    assert.equal(sessionsDb.getSessionById('codex-fork-app')?.provider_session_id, 'shared-fork-id');
+    assert.equal(sessionsDb.getAllSessions().length, 2);
+  });
+});

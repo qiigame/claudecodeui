@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
 
-import { api } from '@/shared/api';
+import { api, consumeSseResponse } from '@/shared/api';
 import { subscribeToUserPreferences } from '@/shared/userSettings';
 import { usePaletteOps } from '@/modules/command-palette';
 import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProjectResult, ConversationSearchResults, LLMProvider, Project, ProjectSession, ProjectSortOrder, RecentConversationListItem, SearchProgress, ActiveSidebarRename, PendingSidebarDeletion, SessionTitleSearchResult, SessionWithProvider, SidebarSearchMode } from '@/shared/types';
@@ -15,6 +15,8 @@ import {
   readLegacyStarredProjectIds,
   readProjectSortOrder,
 } from '@/modules/sidebar/utils/sidebarStoredPreferences';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 
 type ArchivedSessionsApiPayload = {
@@ -79,6 +81,21 @@ export function useSidebarController({
   sidebarVisible,
 }: UseSidebarControllerArgs) {
   const paletteOps = usePaletteOps();
+  const { authMode, user } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const managedIdentityRestricted = isManagedIdentityRestricted(authMode, user);
+  // Project creation, rename, archive/delete and restore all change project
+  // metadata (and some paths).  Keep the deployment-level read-only bit in
+  // this single controller decision so every sidebar entry point and callback
+  // shares the same fail-closed boundary, even if a capability payload is
+  // internally inconsistent.
+  const canMutateProjects = can('project.mutate') && !isReadOnly && !managedIdentityRestricted;
+  const canWriteSessions = can('session.write') && !managedIdentityRestricted;
+  const canManageSettings = can('settings.write') && !isReadOnly && !managedIdentityRestricted;
+  // Session metadata (titles/archive/restore) is safe in product/QA mode,
+  // but forking or permanently deleting a session copies/removes transcripts
+  // and therefore also requires the filesystem-write capability.
+  const canWriteSessionFiles = canWriteSessions && can('file.write') && !isReadOnly;
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   // The one rename the sidebar has open, as a single value so a project and a
   // session cannot both be mid-rename. See ActiveSidebarRename.
@@ -113,7 +130,10 @@ export function useSidebarController({
   const [loadingMoreProjects, setLoadingMoreProjects] = useState<Set<string>>(new Set());
   const searchSeqRef = useRef(0);
   const recentConversationsSeqRef = useRef(0);
-  const eventSourceRef = useRef<EventSource | null>(null);
+  // Fetch-based SSE needs an AbortController because EventSource cannot carry
+  // the authenticated Authorization header. Keeping the controller in a ref
+  // lets a new query cancel the previous stream before it can update state.
+  const conversationSearchAbortRef = useRef<AbortController | null>(null);
   const starToggleSequenceByProjectRef = useRef<Map<string, number>>(new Map());
   const migrationStartedRef = useRef(false);
   const onRefreshRef = useRef(onRefresh);
@@ -283,7 +303,7 @@ export function useSidebarController({
   ]);
 
   useEffect(() => {
-    if (migrationStartedRef.current) {
+    if (!canMutateProjects || migrationStartedRef.current) {
       return;
     }
 
@@ -306,7 +326,7 @@ export function useSidebarController({
     };
 
     void migrateLegacyStars();
-  }, [onRefresh]);
+  }, [canMutateProjects, onRefresh]);
 
   useEffect(() => {
     void fetchArchivedSessions();
@@ -371,10 +391,8 @@ export function useSidebarController({
 
   // Debounced conversation search with SSE streaming
   useEffect(() => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
+    conversationSearchAbortRef.current?.abort();
+    conversationSearchAbortRef.current = null;
 
     const query = debouncedSearchQuery;
     if (searchMode !== 'conversations' || query.length < 2) {
@@ -389,101 +407,116 @@ export function useSidebarController({
     setConversationResults(null);
     setSearchProgress(null);
     const seq = ++searchSeqRef.current;
-
-    if (seq !== searchSeqRef.current) {
-      return;
-    }
-
-    const url = api.searchConversationsUrl(query);
-    const es = new EventSource(url);
-    eventSourceRef.current = es;
+    const abortController = new AbortController();
+    conversationSearchAbortRef.current = abortController;
 
     const accumulated: ConversationProjectResult[] = [];
     let titleResults: SessionTitleSearchResult[] = [];
     let totalMatches = 0;
 
-    es.addEventListener('title-results', (evt) => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
-      try {
-        const data = JSON.parse(evt.data) as { titleResults: SessionTitleSearchResult[] };
-        titleResults = Array.isArray(data.titleResults) ? data.titleResults : [];
-        setConversationResults({
-          results: [...accumulated],
-          titleResults: [...titleResults],
-          totalMatches,
-          query,
-        });
-      } catch {
-        // Ignore malformed SSE data
+    const publishResults = () => {
+      if (seq !== searchSeqRef.current || abortController.signal.aborted) {
+        return;
       }
-    });
-
-    es.addEventListener('result', (evt) => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
-      try {
-        const data = JSON.parse(evt.data) as {
-          projectResult: ConversationProjectResult;
-          totalMatches: number;
-          scannedProjects: number;
-          totalProjects: number;
-        };
-        accumulated.push(data.projectResult);
-        totalMatches = data.totalMatches;
-        setConversationResults({
-          results: [...accumulated],
-          titleResults: [...titleResults],
-          totalMatches,
-          query,
-        });
-        setSearchProgress({ scannedProjects: data.scannedProjects, totalProjects: data.totalProjects });
-      } catch {
-        // Ignore malformed SSE data
-      }
-    });
-
-    es.addEventListener('progress', (evt) => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
-      try {
-        const data = JSON.parse(evt.data) as { totalMatches: number; scannedProjects: number; totalProjects: number };
-        totalMatches = data.totalMatches;
-        setSearchProgress({ scannedProjects: data.scannedProjects, totalProjects: data.totalProjects });
-      } catch {
-        // Ignore malformed SSE data
-      }
-    });
-
-    es.addEventListener('done', () => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
-      es.close();
-      eventSourceRef.current = null;
-      setIsSearching(false);
-      setSearchProgress(null);
       setConversationResults({
         results: [...accumulated],
         titleResults: [...titleResults],
         totalMatches,
         query,
       });
-    });
+    };
 
-    es.addEventListener('error', () => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
-      es.close();
-      eventSourceRef.current = null;
+    const finish = () => {
+      if (seq !== searchSeqRef.current || abortController.signal.aborted) {
+        return;
+      }
       setIsSearching(false);
       setSearchProgress(null);
-      setConversationResults({
-        results: [...accumulated],
-        titleResults: [...titleResults],
-        totalMatches,
-        query,
-      });
-    });
+      publishResults();
+    };
+
+    const consumeSearchEvent = ({ event, data }: { event: string; data: string }) => {
+      if (seq !== searchSeqRef.current || abortController.signal.aborted) {
+        return;
+      }
+
+      try {
+        if (event === 'title-results') {
+          const payload = JSON.parse(data) as { titleResults: SessionTitleSearchResult[] };
+          titleResults = Array.isArray(payload.titleResults) ? payload.titleResults : [];
+          publishResults();
+          return;
+        }
+
+        if (event === 'result') {
+          const payload = JSON.parse(data) as {
+            projectResult: ConversationProjectResult;
+            totalMatches: number;
+            scannedProjects: number;
+            totalProjects: number;
+          };
+          if (payload.projectResult) {
+            accumulated.push(payload.projectResult);
+          }
+          totalMatches = payload.totalMatches;
+          publishResults();
+          setSearchProgress({
+            scannedProjects: payload.scannedProjects,
+            totalProjects: payload.totalProjects,
+          });
+          return;
+        }
+
+        if (event === 'progress') {
+          const payload = JSON.parse(data) as {
+            totalMatches: number;
+            scannedProjects: number;
+            totalProjects: number;
+          };
+          totalMatches = payload.totalMatches;
+          setSearchProgress({
+            scannedProjects: payload.scannedProjects,
+            totalProjects: payload.totalProjects,
+          });
+          return;
+        }
+
+        if (event === 'done') {
+          finish();
+        }
+      } catch {
+        // Ignore malformed SSE data, matching the old EventSource consumer.
+      }
+    };
+
+    const runSearch = async () => {
+      try {
+        const response = await api.searchConversations(query, 50, {
+          signal: abortController.signal,
+        });
+        await consumeSseResponse(response, consumeSearchEvent);
+        // A clean EOF without a `done` event is equivalent to EventSource's
+        // connection error: retain partial results and stop the spinner.
+        finish();
+      } catch (error) {
+        if (abortController.signal.aborted || seq !== searchSeqRef.current) {
+          return;
+        }
+        console.error('[Sidebar] Conversation search failed:', error);
+        finish();
+      } finally {
+        if (conversationSearchAbortRef.current === abortController) {
+          conversationSearchAbortRef.current = null;
+        }
+      }
+    };
+
+    void runSearch();
 
     return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
+      abortController.abort();
+      if (conversationSearchAbortRef.current === abortController) {
+        conversationSearchAbortRef.current = null;
       }
     };
   }, [debouncedSearchQuery, searchMode]);
@@ -521,6 +554,9 @@ export function useSidebarController({
   );
 
   const toggleStarProject = useCallback((projectId: string) => {
+    if (!canMutateProjects) {
+      return;
+    }
     const previousStarState = resolveProjectStarState(projectId);
     const optimisticStarState = !previousStarState;
     const latestSequence = (starToggleSequenceByProjectRef.current.get(projectId) ?? 0) + 1;
@@ -575,7 +611,7 @@ export function useSidebarController({
     };
 
     void updateStar();
-  }, [resolveProjectStarState, t]);
+  }, [canMutateProjects, resolveProjectStarState, t]);
 
   const isProjectStarred = useCallback(
     (projectId: string) => resolveProjectStarState(projectId),
@@ -731,14 +767,20 @@ export function useSidebarController({
   // Keyed by projectId so the rename survives display-name mutations that arrive
   // while the input is open.
   const startEditingProject = useCallback((project: Project) => {
+    if (!canMutateProjects) {
+      return;
+    }
     setActiveRename({ target: 'project', id: project.projectId, draft: project.displayName });
-  }, []);
+  }, [canMutateProjects]);
 
   const startEditingSession = useCallback(
     (projectId: string, sessionId: string, initialName: string) => {
+      if (!canWriteSessions) {
+        return;
+      }
       setActiveRename({ target: 'session', id: sessionId, projectId, draft: initialName });
     },
-    [],
+    [canWriteSessions],
   );
 
   const updateRenameDraft = useCallback((draft: string) => {
@@ -753,6 +795,10 @@ export function useSidebarController({
     // `projectId` is the DB primary key; the rename API resolves the path
     // through the `projects` table before writing the new display name.
     async (projectId: string, nextName: string) => {
+      if (!canMutateProjects) {
+        setActiveRename(null);
+        return;
+      }
       try {
         const response = await api.renameProject(projectId, nextName);
         if (response.ok) {
@@ -766,7 +812,7 @@ export function useSidebarController({
         setActiveRename(null);
       }
     },
-    [paletteOps],
+    [canMutateProjects, paletteOps],
   );
 
   const showDeleteSessionConfirmation = useCallback(
@@ -775,6 +821,9 @@ export function useSidebarController({
       sessionTitle: string,
       options: { isArchived?: boolean } = {},
     ) => {
+      if (!canWriteSessions) {
+        return;
+      }
       setPendingDeletion({
         kind: 'session',
         sessionId,
@@ -782,11 +831,15 @@ export function useSidebarController({
         isArchived: Boolean(options.isArchived),
       });
     },
-    [],
+    [canWriteSessions],
   );
 
   const confirmDeleteSession = useCallback(async (hardDelete = false) => {
-    if (pendingDeletion?.kind !== 'session') {
+    if (
+      !canWriteSessions
+      || (hardDelete && !canWriteSessionFiles)
+      || pendingDeletion?.kind !== 'session'
+    ) {
       return;
     }
 
@@ -811,21 +864,24 @@ export function useSidebarController({
       console.error('[Sidebar] Error deleting session:', error);
       alert(t('messages.deleteSessionError'));
     }
-  }, [fetchArchivedSessions, onSessionDelete, pendingDeletion, t]);
+  }, [canWriteSessionFiles, canWriteSessions, fetchArchivedSessions, onSessionDelete, pendingDeletion, t]);
 
   const requestProjectDelete = useCallback(
     (project: Project) => {
+      if (!canMutateProjects) {
+        return;
+      }
       setPendingDeletion({
         kind: 'project',
         project,
         sessionCount: getProjectSessions(project).length,
       });
     },
-    [getProjectSessions],
+    [canMutateProjects, getProjectSessions],
   );
 
   const confirmDeleteProject = useCallback(async (deleteData = false) => {
-    if (pendingDeletion?.kind !== 'project') {
+    if (!canMutateProjects || pendingDeletion?.kind !== 'project') {
       return;
     }
 
@@ -858,7 +914,7 @@ export function useSidebarController({
         return next;
       });
     }
-  }, [pendingDeletion, onProjectDelete, t]);
+  }, [canMutateProjects, pendingDeletion, onProjectDelete, t]);
 
   const handleProjectSelect = useCallback(
     (project: Project) => {
@@ -894,6 +950,9 @@ export function useSidebarController({
   }, [archivedProjects, handleProjectSelect, onSessionSelect, projects]);
 
   const restoreArchivedProject = useCallback(async (projectId: string) => {
+    if (!canMutateProjects) {
+      return;
+    }
     try {
       const response = await api.restoreProject(projectId);
       if (!response.ok) {
@@ -914,9 +973,12 @@ export function useSidebarController({
       console.error('[Sidebar] Error restoring project:', error);
       alert(t('messages.restoreProjectError', 'Error restoring project. Please try again.'));
     }
-  }, [fetchArchivedSessions, onRefresh, t]);
+  }, [canMutateProjects, fetchArchivedSessions, onRefresh, t]);
 
   const restoreArchivedSession = useCallback(async (sessionId: string) => {
+    if (!canWriteSessions) {
+      return;
+    }
     try {
       const response = await api.restoreSession(sessionId);
       if (!response.ok) {
@@ -937,7 +999,7 @@ export function useSidebarController({
       console.error('[Sidebar] Error restoring session:', error);
       alert(t('messages.restoreSessionError', 'Error restoring session. Please try again.'));
     }
-  }, [fetchArchivedSessions, onRefresh, t]);
+  }, [canWriteSessions, fetchArchivedSessions, onRefresh, t]);
 
   const refreshProjects = useCallback(async () => {
     setIsRefreshing(true);
@@ -958,6 +1020,10 @@ export function useSidebarController({
     // `_projectId` and `_provider` are preserved for compatibility with
     // existing sidebar callback signatures; backend rename only needs sessionId.
     async (_projectId: string, sessionId: string, summary: string, _provider: LLMProvider) => {
+      if (!canWriteSessions) {
+        setActiveRename(null);
+        return;
+      }
       const trimmed = summary.trim();
       if (!trimmed) {
         setActiveRename(null);
@@ -978,7 +1044,7 @@ export function useSidebarController({
         setActiveRename(null);
       }
     },
-    [onRefresh, t],
+    [canWriteSessions, onRefresh, t],
   );
 
   /**
@@ -989,6 +1055,9 @@ export function useSidebarController({
    */
   const forkSession = useCallback(
     async (session: SessionWithProvider) => {
+      if (!canWriteSessionFiles) {
+        return;
+      }
       try {
         const response = await api.forkSession(session.id);
         const payload = await response.json();
@@ -1008,7 +1077,7 @@ export function useSidebarController({
         alert(t('messages.forkSessionError'));
       }
     },
-    [onSessionSelect, t],
+    [canWriteSessionFiles, onSessionSelect, t],
   );
 
   const collapseSidebar = useCallback(() => {
@@ -1019,8 +1088,42 @@ export function useSidebarController({
     setSidebarVisible(true);
   }, [setSidebarVisible]);
 
+  // The header opens this modal from an event callback. Keep the capability
+  // check in the controller as well as in the button so a stale event cannot
+  // reopen project creation after the server policy changes to read-only.
+  const setShowNewProjectGuarded = useCallback((show: boolean) => {
+    if (show && !canMutateProjects) {
+      return;
+    }
+    setShowNewProject(show);
+  }, [canMutateProjects]);
+
+  const setShowVersionModalGuarded = useCallback((show: boolean) => {
+    if (show && !canManageSettings) {
+      return;
+    }
+    setShowVersionModal(show);
+  }, [canManageSettings]);
+
+  // If policy changes while a modal is open (for example, a DingTalk account
+  // switch from a local developer to a product/QA user), close any write-only
+  // affordance immediately instead of leaving a stale callback reachable.
+  useEffect(() => {
+    if (!canMutateProjects) {
+      setShowNewProject(false);
+      setActiveRename((previous) => previous?.target === 'project' ? null : previous);
+      setPendingDeletion((previous) => previous?.kind === 'project' ? null : previous);
+    }
+    if (!canManageSettings) {
+      setShowVersionModal(false);
+    }
+  }, [canManageSettings, canMutateProjects]);
+
   return {
     isSidebarCollapsed,
+    canMutateProjects,
+    canWriteSessions,
+    canWriteSessionFiles,
     expandedProjects,
     activeRename,
     showNewProject,
@@ -1070,7 +1173,7 @@ export function useSidebarController({
     updateSessionSummary,
     collapseSidebar,
     expandSidebar,
-    setShowNewProject,
+    setShowNewProject: setShowNewProjectGuarded,
     searchMode,
     setSearchMode,
     conversationResults,
@@ -1078,16 +1181,14 @@ export function useSidebarController({
     searchProgress,
     clearConversationResults: useCallback(() => {
       searchSeqRef.current += 1;
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
+      conversationSearchAbortRef.current?.abort();
+      conversationSearchAbortRef.current = null;
       setIsSearching(false);
       setSearchProgress(null);
       setConversationResults(null);
     }, []),
     setSearchFilter,
     setPendingDeletion,
-    setShowVersionModal,
+    setShowVersionModal: setShowVersionModalGuarded,
   };
 }

@@ -9,8 +9,9 @@ import type { PendingPermissionRequest, PermissionMode,
   ProviderModelActions,
   ProviderModelOption,
   ProviderModelsDefinition } from '@/shared/types';
-import { DEFAULT_EFFORT_VALUE } from '@/shared/constants';
+import { COMIC_RUNTIME_PROVIDERS, DEFAULT_EFFORT_VALUE } from '@/shared/constants';
 import { readSelectedProvider, writeSelectedProvider } from '@/shared/selectedProvider';
+import { comicRuntimeOnly } from '@/shared/utils';
 
 const FALLBACK_PROVIDER_EFFORT_VALUES: Partial<Record<LLMProvider, readonly string[]>> = {
   // Superset used only before the model catalog loads; `ultracode` belongs to the
@@ -31,7 +32,7 @@ const toProviderEffortOptions = (
 const FALLBACK_DEFAULT_MODEL: Record<LLMProvider, string> = {
   claude: 'default',
   cursor: 'gpt-5.3-codex',
-  codex: 'gpt-5.4',
+  codex: 'gpt-5.6-sol',
   opencode: 'anthropic/claude-sonnet-4-5',
 };
 
@@ -39,6 +40,20 @@ const PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode'];
 
 /** localStorage key holding the user's default model for one provider. */
 const providerModelStorageKey = (provider: LLMProvider): string => `${provider}-model`;
+
+/** Marks which CC-Switch model default has already been adopted by this browser. */
+const providerRuntimeModelDefaultStorageKey = (provider: LLMProvider): string => (
+  `cc-switch-${provider}-model-default`
+);
+
+/** Marks which CC-Switch effort default has already been adopted by this browser. */
+const providerRuntimeEffortDefaultStorageKey = (provider: LLMProvider): string => (
+  `cc-switch-${provider}-effort-default`
+);
+
+const followsCcSwitchDefaults = (provider: LLMProvider): boolean => (
+  comicRuntimeOnly && COMIC_RUNTIME_PROVIDERS.includes(provider)
+);
 
 /**
  * Fallback permission-mode matrix used only until the backend capability
@@ -77,6 +92,13 @@ type ProviderCapabilitiesApiResponse = {
 type UseChatProviderStateArgs = {
   selectedSession: ProjectSession | null;
   selectedProject: Project | null;
+  /**
+   * Product/QA deployments expose only a server-managed, read-only runtime.
+   * The provider capability endpoint still reports the full provider matrix,
+   * so the composer needs this deployment-level signal to hide unsafe mode
+   * choices before that matrix is loaded.
+   */
+  readOnly?: boolean;
 };
 
 type ProviderModelsApiResponse = {
@@ -124,7 +146,11 @@ const getSessionSelectionKey = (provider: LLMProvider, sessionId: string): strin
   `${provider}:${sessionId}`
 );
 
-export function useChatProviderState({ selectedSession, selectedProject: _selectedProject }: UseChatProviderStateArgs) {
+export function useChatProviderState({
+  selectedSession,
+  selectedProject: _selectedProject,
+  readOnly = false,
+}: UseChatProviderStateArgs) {
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
   const [pendingPermissionRequests, setPendingPermissionRequests] = useState<PendingPermissionRequest[]>([]);
   // The provider the composer sends under. Held here rather than read from
@@ -143,7 +169,8 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
   });
   const [providerEfforts, setProviderEfforts] = useState<Partial<Record<LLMProvider, string>>>(() => {
     return PROVIDERS.reduce<Partial<Record<LLMProvider, string>>>((acc, targetProvider) => {
-      acc[targetProvider] = localStorage.getItem(`${targetProvider}-effort`) || DEFAULT_EFFORT_VALUE;
+      acc[targetProvider] = localStorage.getItem(`${targetProvider}-effort`)
+        || (targetProvider === 'codex' ? 'ultra' : DEFAULT_EFFORT_VALUE);
       return acc;
     }, {});
   });
@@ -191,10 +218,15 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     const requestId = providerModelsRequestIdRef.current + 1;
     providerModelsRequestIdRef.current = requestId;
     setProviderModelsLoading(true);
+    // A product/QA deployment can run only the server-proven Claude/Codex
+    // adapters. Historical Cursor/OpenCode transcripts remain readable, but
+    // their provider catalog is not needed to render that read-only history
+    // and must not be probed merely because the chat screen mounted.
+    const catalogProviders = readOnly ? COMIC_RUNTIME_PROVIDERS : PROVIDERS;
 
     try {
       const results = await Promise.all(
-        PROVIDERS.map(async (p) => {
+        catalogProviders.map(async (p) => {
           const response = await api.providers.models(p);
           const body = (await response.json()) as ProviderModelsApiResponse;
           if (!body.success || !body.data?.models) {
@@ -211,7 +243,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
 
       const nextCatalog: Partial<Record<LLMProvider, ProviderModelsDefinition>> = {};
 
-      PROVIDERS.forEach((p, i) => {
+      catalogProviders.forEach((p, i) => {
         const entry = results[i];
         if (!entry) {
           return;
@@ -228,10 +260,18 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
         setProviderModelsLoading(false);
       }
     }
-  }, []);
+  }, [readOnly]);
 
   useEffect(() => {
     void loadProviderModels();
+  }, [loadProviderModels]);
+
+  useEffect(() => {
+    const refreshCcSwitchDefaults = () => {
+      void loadProviderModels();
+    };
+    window.addEventListener('focus', refreshCcSwitchDefaults);
+    return () => window.removeEventListener('focus', refreshCcSwitchDefaults);
   }, [loadProviderModels]);
 
   useEffect(() => {
@@ -287,10 +327,21 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
   }, [providerCapabilities]);
 
   const pickStoredOrCurrent = (
+    targetProvider: LLMProvider,
     storageKey: string,
     current: string,
     def: ProviderModelsDefinition,
   ): string => {
+    if (followsCcSwitchDefaults(targetProvider)) {
+      const markerKey = providerRuntimeModelDefaultStorageKey(targetProvider);
+      const signature = JSON.stringify([def.DEFAULT, def.SERVICE_TIER ?? null]);
+      if (localStorage.getItem(markerKey) !== signature) {
+        localStorage.setItem(markerKey, signature);
+        localStorage.setItem(storageKey, def.DEFAULT);
+        return def.DEFAULT;
+      }
+    }
+
     const stored = localStorage.getItem(storageKey);
     if (stored && def.OPTIONS.some((o) => o.value === stored)) {
       return stored;
@@ -370,7 +421,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
 
       const storageKey = providerModelStorageKey(targetProvider);
       const currentModel = providerModels[targetProvider];
-      const nextModel = pickStoredOrCurrent(storageKey, currentModel, catalog);
+      const nextModel = pickStoredOrCurrent(targetProvider, storageKey, currentModel, catalog);
 
       if (nextModel !== currentModel) {
         reconciledModels[targetProvider] = nextModel;
@@ -391,7 +442,19 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
 
     for (const targetProvider of PROVIDERS) {
       const currentEffort = providerEfforts[targetProvider] ?? DEFAULT_EFFORT_VALUE;
-      const nextEffort = reconcileStoredEffort(targetProvider, providerModels[targetProvider], currentEffort);
+      const catalog = providerModelCatalog[targetProvider];
+      const configuredEffort = catalog?.DEFAULT_EFFORT;
+      const markerKey = providerRuntimeEffortDefaultStorageKey(targetProvider);
+      const signature = JSON.stringify([catalog?.DEFAULT ?? null, configuredEffort ?? null]);
+      const shouldAdoptConfiguredEffort = followsCcSwitchDefaults(targetProvider)
+        && Boolean(configuredEffort)
+        && localStorage.getItem(markerKey) !== signature;
+      const nextEffort = shouldAdoptConfiguredEffort
+        ? configuredEffort as string
+        : reconcileStoredEffort(targetProvider, providerModels[targetProvider], currentEffort);
+      if (shouldAdoptConfiguredEffort) {
+        localStorage.setItem(markerKey, signature);
+      }
       if (nextEffort === currentEffort) {
         continue;
       }
@@ -404,10 +467,18 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     if (hasUpdates) {
       setProviderEfforts((previous) => ({ ...previous, ...nextEfforts }));
     }
-  }, [providerEfforts, providerModels, reconcileStoredEffort]);
+  }, [providerEfforts, providerModelCatalog, providerModels, reconcileStoredEffort]);
 
   useEffect(() => {
     const validModes = getPermissionModesForProvider(provider);
+    if (readOnly) {
+      // The server maps every provider run to its read-only sandbox. Keep the
+      // browser-side payload equally conservative so a stale localStorage
+      // value such as `bypassPermissions` cannot be replayed as metadata.
+      setPermissionMode('default');
+      return;
+    }
+
     const sessionSavedMode = selectedSession?.id
       ? (localStorage.getItem(`permissionMode-${selectedSession.id}`) as PermissionMode | null)
       : null;
@@ -420,16 +491,39 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
       (mode): mode is PermissionMode => Boolean(mode && validModes.includes(mode)),
     );
     setPermissionMode(savedMode ?? getDefaultPermissionModeForProvider(provider));
-  }, [selectedSession?.id, provider, getDefaultPermissionModeForProvider, getPermissionModesForProvider]);
+  }, [readOnly, selectedSession?.id, provider, getDefaultPermissionModeForProvider, getPermissionModesForProvider]);
 
   useEffect(() => {
-    if (!selectedSession?.__provider || selectedSession.__provider === provider) {
+    // API payloads from the current sessions endpoint use `__provider`, while
+    // older/history/search payloads may only expose the public `provider`
+    // field. Treat both as server-owned session identity. Falling back to the
+    // browser preference here lets an unsafe legacy Cursor/OpenCode session
+    // briefly render as Codex/Claude in the read-only deployment.
+    const sessionProvider = selectedSession?.__provider ?? selectedSession?.provider;
+    if (sessionProvider) {
+      if (sessionProvider === provider) {
+        return;
+      }
+
+      setProvider(sessionProvider);
+      writeSelectedProvider(sessionProvider);
       return;
     }
 
-    setProvider(selectedSession.__provider);
-    writeSelectedProvider(selectedSession.__provider);
-  }, [provider, selectedSession]);
+    // Historical sessions can still identify a provider outside the focused
+    // allowlist. Once the user leaves that session, restore an available
+    // Runtime so a new conversation can never start on Cursor or OpenCode.
+    if ((comicRuntimeOnly || readOnly) && !COMIC_RUNTIME_PROVIDERS.includes(provider)) {
+      const storedProvider = readSelectedProvider();
+      const nextProvider = COMIC_RUNTIME_PROVIDERS.includes(storedProvider)
+        ? storedProvider
+        : COMIC_RUNTIME_PROVIDERS[0] || 'codex';
+      if (nextProvider !== provider) {
+        setProvider(nextProvider);
+        writeSelectedProvider(nextProvider);
+      }
+    }
+  }, [provider, readOnly, selectedSession?.__provider, selectedSession?.provider]);
 
   // Permission prompts belong to a session, not to the transient provider
   // selection that is synchronized after navigation.
@@ -440,6 +534,10 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
   }, [selectedSession?.id]);
 
   const selectPermissionMode = useCallback((nextMode: PermissionMode) => {
+    if (readOnly) {
+      return;
+    }
+
     setPermissionMode(nextMode);
 
     // Persist per provider as well as per session: a brand-new chat has no
@@ -449,19 +547,27 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     if (selectedSession?.id) {
       localStorage.setItem(`permissionMode-${selectedSession.id}`, nextMode);
     }
-  }, [provider, selectedSession?.id]);
+  }, [provider, readOnly, selectedSession?.id]);
 
   const cyclePermissionMode = useCallback(() => {
+    if (readOnly) {
+      return;
+    }
+
     const modes = getPermissionModesForProvider(provider);
+
+    if (modes.length === 0) {
+      return;
+    }
 
     const currentIndex = modes.indexOf(permissionMode);
     const nextIndex = (currentIndex + 1) % modes.length;
     selectPermissionMode(modes[nextIndex]);
-  }, [permissionMode, provider, getPermissionModesForProvider, selectPermissionMode]);
+  }, [permissionMode, provider, readOnly, getPermissionModesForProvider, selectPermissionMode]);
 
   const availablePermissionModes = useMemo(
-    () => getPermissionModesForProvider(provider),
-    [getPermissionModesForProvider, provider],
+    () => readOnly ? [] : getPermissionModesForProvider(provider),
+    [getPermissionModesForProvider, provider, readOnly],
   );
 
   /**
@@ -476,11 +582,15 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     targetProvider: LLMProvider,
     requestedMode: PermissionMode | string,
   ): PermissionMode => {
+    if (readOnly) {
+      return 'default';
+    }
+
     const validModes = getPermissionModesForProvider(targetProvider);
     return validModes.includes(requestedMode as PermissionMode)
       ? requestedMode as PermissionMode
       : getDefaultPermissionModeForProvider(targetProvider);
-  }, [getDefaultPermissionModeForProvider, getPermissionModesForProvider]);
+  }, [getDefaultPermissionModeForProvider, getPermissionModesForProvider, readOnly]);
 
   /** Model and reasoning effort recorded for the open session by the backend. */
   const [sessionSelection, setSessionSelection] = useState<SessionProviderSelection | null>(null);
@@ -568,6 +678,10 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     model: string,
     sessionId?: string | null,
   ) => {
+    if (readOnly) {
+      throw new Error('Provider model changes are disabled in this deployment.');
+    }
+
     setStoredProviderModel(targetProvider, model);
 
     const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
@@ -608,7 +722,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
       }));
     }
     return { scope: 'session' as const, model: storedModel };
-  }, [setStoredProviderModel]);
+  }, [readOnly, setStoredProviderModel]);
 
   /**
    * Applies an effort choice optimistically and persists it for the open
@@ -620,6 +734,10 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     effort: string,
     sessionId?: string | null,
   ) => {
+    if (readOnly) {
+      throw new Error('Provider reasoning settings are disabled in this deployment.');
+    }
+
     setStoredProviderEffort(targetProvider, effort);
 
     const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
@@ -685,7 +803,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
       }
       throw error;
     }
-  }, [sessionSelection, setStoredProviderEffort]);
+  }, [readOnly, sessionSelection, setStoredProviderEffort]);
 
   // The open session's model wins over the per-provider default, so switching
   // sessions shows (and sends) what each session actually runs with.
@@ -735,16 +853,24 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     targetProvider: LLMProvider,
     input: CustomProviderModelInput,
   ) => {
+    if (readOnly) {
+      throw new Error('Provider model changes are disabled in this deployment.');
+    }
+
     const response = await api.providers.createModel(targetProvider, input);
     const result = await readModelMutationResponse(response);
     applyProviderCatalog(targetProvider, result.models);
-  }, [applyProviderCatalog, readModelMutationResponse]);
+  }, [applyProviderCatalog, readModelMutationResponse, readOnly]);
 
   const updateCustomModel = useCallback(async (
     targetProvider: LLMProvider,
     existing: ProviderModelOption,
     input: CustomProviderModelInput,
   ) => {
+    if (readOnly) {
+      throw new Error('Provider model changes are disabled in this deployment.');
+    }
+
     if (!existing.recordId) {
       throw new Error('This model cannot be edited.');
     }
@@ -767,6 +893,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     provider,
     providerModels,
     readModelMutationResponse,
+    readOnly,
     sessionModel,
     setStoredProviderModel,
   ]);
@@ -775,6 +902,10 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     targetProvider: LLMProvider,
     existing: ProviderModelOption,
   ) => {
+    if (readOnly) {
+      throw new Error('Provider model changes are disabled in this deployment.');
+    }
+
     if (!existing.recordId) {
       throw new Error('This model cannot be deleted.');
     }
@@ -797,6 +928,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     provider,
     providerModels,
     readModelMutationResponse,
+    readOnly,
     sessionModel,
     setStoredProviderModel,
   ]);

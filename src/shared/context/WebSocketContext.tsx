@@ -1,8 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 
 import { useAuth } from '@/modules/auth';
-import { IS_PLATFORM } from '@/shared/utils';
-import { expireAuthSession, isAuthTokenExpired } from '@/shared/authToken';
+import {
+  expireAuthSession,
+  getAuthSessionSnapshot,
+  isAuthTokenExpired,
+  isCurrentAuthSession,
+} from '@/shared/authToken';
+import { AUTH_TOKEN_STORAGE_KEY } from '@/shared/constants';
 import type { ServerEvent } from '@/shared/types';
 
 
@@ -33,21 +38,25 @@ export const useWebSocket = () => {
   return context;
 };
 
-const buildWebSocketUrl = (token: string | null) => {
+const buildWebSocketUrl = (
+  token: string | null,
+  authMode: 'platform' | 'dingtalk' | 'password' | 'unavailable' | null | undefined,
+) => {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  if (IS_PLATFORM) return `${protocol}//${window.location.host}/ws`; // Platform mode: Use same domain as the page (goes through proxy)
+  if (authMode === 'platform') return `${protocol}//${window.location.host}/ws`;
   if (!token) return null;
   if (isAuthTokenExpired(token)) {
     expireAuthSession();
     return null;
   }
-  return `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`; // OSS mode: Use same host:port that served the page
+  return `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`;
 };
 
 const useWebSocketProviderState = (): WebSocketContextType => {
   const wsRef = useRef<WebSocket | null>(null);
   const unmountedRef = useRef(false); // Track if component is unmounted
   const hasConnectedRef = useRef(false); // Track if we've ever connected (to detect reconnects)
+  const principalEpochRef = useRef<string | null>(null);
   /**
    * Listener registry for the subscribe API. A ref (not state) because the
    * set must be readable synchronously inside `onmessage` and never trigger
@@ -56,7 +65,28 @@ const useWebSocketProviderState = (): WebSocketContextType => {
   const listenersRef = useRef(new Set<ServerEventListener>());
   const [isConnected, setIsConnected] = useState(false);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const { isLoading: isAuthLoading, token, user } = useAuth();
+  const { authMode, isLoading: isAuthLoading, token, user } = useAuth();
+
+  const closeActiveSocket = useCallback(() => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    const activeSocket = wsRef.current;
+    if (!activeSocket) {
+      return;
+    }
+
+    // Detach reconnect handlers before closing a socket authenticated as the
+    // previous account. Only the auth-state effect may open its replacement.
+    activeSocket.onopen = null;
+    activeSocket.onmessage = null;
+    activeSocket.onclose = null;
+    activeSocket.onerror = null;
+    activeSocket.close();
+    wsRef.current = null;
+    setIsConnected(false);
+  }, []);
 
   const dispatch = useCallback((event: ServerEvent) => {
     for (const listener of listenersRef.current) {
@@ -72,12 +102,25 @@ const useWebSocketProviderState = (): WebSocketContextType => {
   // without reading the `connect` binding while it is still initializing.
   const connect = useCallback(function connect() {
     if (unmountedRef.current) return; // Prevent connection if unmounted
-    if (!IS_PLATFORM && (isAuthLoading || !user)) return;
+    if (isAuthLoading || (!user && authMode !== 'platform')) return;
     try {
       // Construct WebSocket URL
-      const wsUrl = buildWebSocketUrl(token);
+      const wsUrl = buildWebSocketUrl(token, authMode);
 
       if (!wsUrl) return console.warn('No authentication token found for WebSocket connection');
+      const connectionSession = getAuthSessionSnapshot();
+      if (authMode !== 'platform' && connectionSession.token !== token) {
+        return;
+      }
+      if (
+        principalEpochRef.current !== null
+        && principalEpochRef.current !== connectionSession.epoch
+      ) {
+        // A new login is a new principal, not a reconnect of the previous
+        // principal. Consumers must not run old-session catch-up behavior.
+        hasConnectedRef.current = false;
+      }
+      principalEpochRef.current = connectionSession.epoch;
 
       const websocket = new WebSocket(wsUrl);
       // Store connecting sockets too, so a token refresh can close them before
@@ -85,6 +128,13 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       wsRef.current = websocket;
 
       websocket.onopen = () => {
+        if (
+          wsRef.current !== websocket
+          || (authMode !== 'platform' && !isCurrentAuthSession(connectionSession))
+        ) {
+          websocket.close();
+          return;
+        }
         setIsConnected(true);
         if (hasConnectedRef.current) {
           // This is a reconnect — signal so components can catch up on missed messages
@@ -94,6 +144,12 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       };
 
       websocket.onmessage = (event) => {
+        if (
+          wsRef.current !== websocket
+          || (authMode !== 'platform' && !isCurrentAuthSession(connectionSession))
+        ) {
+          return;
+        }
         try {
           const data = JSON.parse(event.data) as ServerEvent;
           dispatch(data);
@@ -109,9 +165,14 @@ const useWebSocketProviderState = (): WebSocketContextType => {
         setIsConnected(false);
         wsRef.current = null;
 
+        if (authMode !== 'platform' && !isCurrentAuthSession(connectionSession)) {
+          return;
+        }
+
         // Attempt to reconnect after 3 seconds
         reconnectTimeoutRef.current = setTimeout(() => {
           if (unmountedRef.current) return; // Prevent reconnection if unmounted
+          if (authMode !== 'platform' && !isCurrentAuthSession(connectionSession)) return;
           connect();
         }, 3000);
       };
@@ -123,18 +184,36 @@ const useWebSocketProviderState = (): WebSocketContextType => {
     } catch (error) {
       console.error('Error creating WebSocket connection:', error);
     }
-  }, [dispatch, isAuthLoading, token, user]); // reconnect with current authentication state
+  }, [authMode, dispatch, isAuthLoading, token, user]); // reconnect with current authentication state
+
+  useEffect(() => {
+    const handleAuthStorageChange = (event: StorageEvent) => {
+      if (
+        event.key === AUTH_TOKEN_STORAGE_KEY
+        && (!event.storageArea || event.storageArea === localStorage)
+        && event.newValue !== token
+      ) {
+        // A storage event arrives before AuthContext finishes resolving the new
+        // account. Close now so no click can send over the old account's socket
+        // while authenticatedFetch already observes the new stored token.
+        closeActiveSocket();
+      }
+    };
+
+    window.addEventListener('storage', handleAuthStorageChange);
+    return () => window.removeEventListener('storage', handleAuthStorageChange);
+  }, [closeActiveSocket, token]);
 
   // Declared after `connect` so the effect body does not reference it before
   // initialization. `connect` is memoized on [dispatch, isAuthLoading, token,
-  // user] and `dispatch` is stable, so depending on it reconnects on exactly
-  // the same transitions as the previous [isAuthLoading, token, user] list.
+  // user, authMode] and `dispatch` is stable, so depending on it reconnects on
+  // the same transitions as the authenticated principal changes.
   useEffect(() => {
     // The cleanup below sets unmountedRef = true. Without this reset, every
     // re-run of the effect (e.g. on token refresh) would short-circuit connect()
     // at its unmounted guard and leave the socket permanently disconnected.
     unmountedRef.current = false;
-    if (!IS_PLATFORM && (isAuthLoading || !user)) {
+    if (isAuthLoading || (!user && authMode !== 'platform')) {
       return undefined;
     }
     connect();
@@ -144,19 +223,9 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }
-      const activeSocket = wsRef.current;
-      if (activeSocket) {
-        // Prevent the intentionally closed, old-token socket from scheduling
-        // a reconnect after the refreshed-token effect has already started.
-        activeSocket.onopen = null;
-        activeSocket.onmessage = null;
-        activeSocket.onclose = null;
-        activeSocket.onerror = null;
-        activeSocket.close();
-        wsRef.current = null;
-      }
+      closeActiveSocket();
     };
-  }, [connect, isAuthLoading, user]); // reconnect after authentication or token refresh
+  }, [authMode, closeActiveSocket, connect, isAuthLoading, user]); // reconnect after authentication or token refresh
 
   const sendMessage = useCallback((message: unknown) => {
     const socket = wsRef.current;

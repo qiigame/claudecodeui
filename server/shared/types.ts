@@ -48,6 +48,192 @@ export type AuthenticatedWebSocketUser = {
   [key: string]: unknown;
 };
 
+// ---------------------------
+//----------------- SHARED-WORKSPACE COLLABORATION ------------
+
+/**
+ * Public, non-secret identity attached to an authenticated user and returned
+ * with session summaries. The external DingTalk subject is deliberately never
+ * exposed outside the collaboration repository.
+ */
+export type CollaborationActorSummary = {
+  actorId: number;
+  userId: number;
+  displayName: string;
+  badge: string;
+  provider: string;
+  providerName: string;
+  /** Stable project person id; omitted only for legacy installs. */
+  personId?: string | null;
+  /** Registry state used to decide whether this actor may write. */
+  identityStatus?: 'verified' | 'configured' | 'pending' | 'ambiguous' | 'legacy';
+};
+
+/**
+ * Administrator-only snapshot used to enroll a first-login DingTalk actor.
+ * The raw stable subject is intentionally absent from CollaborationActorSummary
+ * and is exposed here only after an authenticated settings-admin check.
+ */
+export type PendingIdentityEnrollment = {
+  actorId: number;
+  userId: number;
+  displayName: string;
+  providerKey: string;
+  providerName: string;
+  externalSubject: string | null;
+  subjectScope: 'global' | 'provider' | 'unknown';
+  /** `configured` is visible here because a registry row can exist before the
+   * protected runtime subject has been operator-verified. */
+  identityStatus: 'configured' | 'pending' | 'ambiguous' | 'legacy';
+  createdAt: string;
+  lastLoginAt: string | null;
+};
+
+/**
+ * Trusted identity produced only after the server completes DingTalk OAuth.
+ * Callers must pass the provider subject obtained from DingTalk, never a value
+ * supplied by the browser.
+ */
+export type DingTalkActorIdentityInput = {
+  providerKey: string;
+  providerName: string;
+  externalSubject: string;
+  /** Union IDs are global across configured organizations; open IDs remain provider-scoped. */
+  subjectScope: 'global' | 'provider';
+  displayName: string;
+  badge: string;
+  gitEmail?: string;
+  /** Resolved only from the coordination registry, never from browser input. */
+  personId?: string | null;
+  /** `pending` is intentionally persisted for first-login enrollment. */
+  identityStatus?: 'verified' | 'configured' | 'pending' | 'ambiguous' | 'legacy';
+};
+
+/**
+ * Compact attribution included in project session lists. Detailed immutable
+ * events are fetched separately so initial sidebar payloads stay bounded.
+ */
+export type SessionAttributionSummary = {
+  createdBy: CollaborationActorSummary;
+  lastActor: CollaborationActorSummary;
+  participantCount: number;
+  lastAction: string;
+  updatedAt: string;
+};
+
+/** One immutable session action returned by the collaboration audit API. */
+export type SessionActorEvent = {
+  eventId: number;
+  sessionId: string;
+  action: string;
+  createdAt: string;
+  actor: CollaborationActorSummary;
+};
+
+/**
+ * Per-execution identity assembled from the authenticated actor and their
+ * explicit Git mapping. WebSocket runtimes consume only the environment map;
+ * the receipt token inside it must never be returned to a browser or log.
+ */
+export type ExecutionAttributionContext = {
+  runId: string;
+  actor: CollaborationActorSummary;
+  sessionId: string | null;
+  provider: string;
+  projectPath: string;
+  gitIdentityReady: boolean;
+  gitName: string;
+  gitEmail: string | null;
+  personId: string | null;
+  gitIdentityMode: 'personal' | 'shared' | 'unknown';
+  environment: Record<string, string>;
+};
+
+/**
+ * Trusted actor plus the Git identity resolved for one execution. A verified
+ * deployment registry mapping wins: shared Git deployments use the registered
+ * shared identity, while personal deployments use the person's verified VCS
+ * identity. A missing email means execution may continue but commits must be
+ * rejected by the injected hook.
+ */
+export type ExecutionActorIdentity = {
+  actor: CollaborationActorSummary;
+  gitName: string;
+  gitEmail: string | null;
+  personId: string | null;
+  identityStatus: 'verified' | 'configured' | 'pending' | 'ambiguous' | 'legacy';
+  gitIdentityId: string | null;
+  gitIdentityMode: 'personal' | 'shared' | 'unknown';
+};
+
+/**
+ * Persisted execution row resolved by its one-time receipt token. Repository
+ * paths and commit metadata submitted by hooks are validated against this
+ * trusted snapshot before an immutable receipt is accepted.
+ */
+export type ExecutionRunRecord = {
+  runId: string;
+  sessionId: string | null;
+  actorId: number;
+  personId: string | null;
+  identityStatus: 'verified' | 'configured' | 'pending' | 'ambiguous' | 'legacy';
+  provider: string;
+  projectPath: string;
+  expectedGitName: string;
+  expectedGitEmail: string | null;
+  gitIdentityMode: 'personal' | 'shared' | 'unknown';
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+};
+
+/**
+ * Fully inspected commit payload accepted by the collaboration repository.
+ * Callers must derive these fields from the repository with Git, not trust
+ * author, committer, task, or timestamp values sent by a hook.
+ */
+export type CommitReceiptInsert = {
+  commitSha: string;
+  repoPath: string;
+  runId: string;
+  sessionId: string | null;
+  actorId: number;
+  humanActor: string | null;
+  taskId: string | null;
+  provider: string;
+  authorName: string;
+  authorEmail: string;
+  committerName: string;
+  committerEmail: string;
+  verificationStatus: string;
+  committedAt: string;
+};
+
+/**
+ * Immutable server-side association between a Git commit and the authenticated
+ * CloudCLI execution that produced it. `verificationStatus` reports whether
+ * the actual Git author/committer and injected CloudCLI trailers matched the
+ * expected run identity.
+ */
+export type CommitReceiptSummary = {
+  receiptId: number;
+  commitSha: string;
+  repoPath: string;
+  runId: string;
+  sessionId: string | null;
+  taskId: string | null;
+  provider: string;
+  actor: CollaborationActorSummary;
+  humanActor: string | null;
+  authorName: string;
+  authorEmail: string;
+  committerName: string;
+  committerEmail: string;
+  verificationStatus: string;
+  committedAt: string;
+  recordedAt: string;
+};
+
 /**
  * HTTP upgrade request shape after websocket authentication succeeds.
  *
@@ -94,6 +280,10 @@ export type ProviderModelOption = {
 export type ProviderModelsDefinition = {
   OPTIONS: ProviderModelOption[];
   DEFAULT: string;
+  /** Reasoning effort inherited from the active provider configuration. */
+  DEFAULT_EFFORT?: string;
+  /** Service tier inherited from the active provider configuration. */
+  SERVICE_TIER?: string;
 };
 
 /**
@@ -247,6 +437,8 @@ export type SessionUpsertedEvent = {
     summary: string;
     messageCount: number;
     lastActivity: string;
+    attribution?: SessionAttributionSummary;
+    workspace?: SessionWorkspaceSummary;
   };
   project: SessionUpsertedProject | null;
   timestamp: string;
@@ -622,6 +814,13 @@ export type McpScope = 'user' | 'local' | 'project';
 export type McpTransport = 'stdio' | 'http' | 'sse';
 
 /**
+ * Codex policy used when an MCP tool would otherwise require an interactive
+ * prompt. Provider routes and the Codex TOML adapter restrict persisted values
+ * to this union; `approve` should be reserved for installation-trusted servers.
+ */
+export type CodexMcpToolsApprovalMode = 'auto' | 'prompt' | 'writes' | 'approve';
+
+/**
  * Normalized MCP server model exposed to frontend and route handlers.
  *
  * Provider adapters should map provider-native config to this structure before
@@ -641,6 +840,7 @@ export type ProviderMcpServer = {
   envVars?: string[];
   bearerTokenEnvVar?: string;
   envHttpHeaders?: Record<string, string>;
+  defaultToolsApprovalMode?: CodexMcpToolsApprovalMode;
 };
 
 /**
@@ -663,6 +863,7 @@ export type UpsertProviderMcpServerInput = {
   envVars?: string[];
   bearerTokenEnvVar?: string;
   envHttpHeaders?: Record<string, string>;
+  defaultToolsApprovalMode?: CodexMcpToolsApprovalMode;
 };
 
 // ---------------------------
@@ -725,6 +926,7 @@ export type ProjectRepositoryRow = {
   custom_project_name: string | null;
   isStarred: number;
   isArchived: number;
+  isSessionWorkspace?: number;
 };
 
 /**
@@ -836,6 +1038,92 @@ export type WorktreeListResult = {
   repositoryRoot: string;
   baseBranch: string | null;
   worktrees: WorktreeDescriptor[];
+};
+
+/**
+ * One repository offered when a configured project creates an isolated
+ * session workspace. Keys are stable policy identifiers; callers must never
+ * submit filesystem paths when choosing repositories.
+ */
+export type SessionWorkspaceRepositoryOption = {
+  key: string;
+  displayName: string;
+  relativePath: string;
+  baseBranch: string;
+  writable: boolean;
+  unavailableReason: string | null;
+};
+
+/**
+ * Read-only plan returned before a new session is created. The chat UI uses it
+ * to request an explicit repository selection for multi-repository roots while
+ * single-repository projects can proceed without an extra prompt.
+ */
+export type SessionWorkspacePlan = {
+  enabled: boolean;
+  requiresSelection: boolean;
+  defaultRepositoryKeys: string[];
+  repositories: SessionWorkspaceRepositoryOption[];
+};
+
+/**
+ * Persisted repository membership for one provisioned session workspace.
+ * `baseSha` is the exact fetched commit used to create the linked worktree.
+ */
+export type SessionWorkspaceRepositoryRecord = {
+  repositoryKey: string;
+  sourcePath: string;
+  worktreePath: string;
+  branchName: string;
+  remoteName: string;
+  baseBranch: string;
+  baseSha: string;
+};
+
+/**
+ * Runtime workspace metadata attached to session API payloads. The source
+ * project remains the sidebar owner while this hidden project supplies the
+ * filesystem root for chat, shell, files, and Git operations.
+ */
+export type SessionWorkspaceSummary = {
+  projectId: string;
+  path: string;
+  branchPrefix: string;
+  repositories: SessionWorkspaceRepositoryRecord[];
+};
+
+/**
+ * Input used by the Worktrees module to provision a workspace before the
+ * provider session starts. Repository keys are validated against server-owned
+ * policy and the session id determines all generated paths and branch names.
+ */
+export type ProvisionSessionWorkspaceInput = {
+  sessionId: string;
+  sourceProjectPath: string;
+  repositoryKeys: string[];
+};
+
+/**
+ * Filesystem result returned by provisioning. The Providers module persists
+ * it only after every requested Git worktree has been created and verified.
+ */
+export type ProvisionSessionWorkspaceResult = {
+  sourceProjectPath: string;
+  workspacePath: string;
+  branchPrefix: string;
+  repositories: SessionWorkspaceRepositoryRecord[];
+};
+
+/**
+ * Production application-service surface for session workspace planning,
+ * provisioning, compensation, and shared-deployment safety guards.
+ */
+export type SessionWorkspaceService = {
+  plan(sourceProjectPath: string): Promise<SessionWorkspacePlan>;
+  provision(input: ProvisionSessionWorkspaceInput): Promise<ProvisionSessionWorkspaceResult>;
+  rollback(provisioned: ProvisionSessionWorkspaceResult): Promise<void>;
+  isProtectedBaselinePath(projectPath: string): boolean;
+  isManagedWorkspacePath(projectPath: string): boolean;
 };
 
 // ---------------------------
@@ -1008,6 +1296,7 @@ export type WorktreeProjectGateway = {
  */
 export type WorktreeServices = {
   resolveProjectPath(projectId: string): string;
+  planSessionWorkspace(projectPath: string): Promise<SessionWorkspacePlan>;
   list(input: ListWorktreesInput): Promise<WorktreeListResult>;
   create(input: CreateWorktreeInput): Promise<CreateWorktreeResult>;
   createAndOpen(input: CreateWorktreeInput): Promise<CreateAndOpenWorktreeResult>;
@@ -1172,7 +1461,14 @@ export type FileTreeServices = {
   }>;
   listProjectFiles(
     projectId: string,
-    options?: { respectGitignore: boolean },
+    options?: {
+      respectGitignore: boolean;
+      /**
+       * When present, list only this directory's immediate children. A value
+       * of `.` selects the project root. Omit it for the legacy recursive tree.
+       */
+      directoryPath?: string;
+    },
   ): Promise<FileTreeNode[]>;
   createEntry(input: {
     projectId: string;

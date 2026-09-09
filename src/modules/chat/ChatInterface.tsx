@@ -6,6 +6,9 @@ import { useTasksSettings } from '@/modules/task-master';
 import { useWebSocket } from '@/shared/context/WebSocketContext';
 import PermissionContext from '@/modules/chat/context/PermissionContext';
 import { api } from '@/shared/api';
+import { COMIC_RUNTIME_PROVIDERS } from '@/shared/constants';
+import { comicRuntimeOnly } from '@/shared/utils';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 import type {
   ChatMessage,
   Project,
@@ -26,6 +29,7 @@ import {
 import ChatMessagesPane from '@/modules/chat/transcript/ChatMessagesPane';
 import ChatComposer from '@/modules/chat/composer/ChatComposer';
 import CommandResultModal from '@/modules/chat/modals/CommandResultModal';
+import SessionWorkspaceModal from '@/modules/chat/modals/SessionWorkspaceModal';
 
 type ChatInterfaceProps = {
   isActive: boolean;
@@ -69,9 +73,14 @@ function ChatInterface({
   onShowAllTasks,
 }: ChatInterfaceProps) {
   const { tasksEnabled, isTaskMasterInstalled } = useTasksSettings();
+  const { can, isReadOnly, status: deploymentPolicyStatus } = useDeploymentPolicy();
   const { subscribe } = useWebSocket();
   const { t } = useTranslation('chat');
   const processingSessions = useProcessingSessions();
+  // Deployment capabilities decide what the chat may do. Person mapping is
+  // attribution metadata and must not disable an authenticated conversation.
+  const uiReadOnly = isReadOnly;
+
   const {
     markSessionProcessing: onSessionProcessing,
     markSessionIdle: onSessionIdle,
@@ -122,7 +131,21 @@ function ChatInterface({
   } = useChatProviderState({
     selectedSession,
     selectedProject,
+    readOnly: uiReadOnly,
   });
+
+  // Keep client affordances aligned with the server policy. The server remains
+  // the authority, but hiding an action prevents predictable 403 loops and
+  // avoids implying that product/QA users can mutate source or tooling.
+  const canExecuteCommands = deploymentPolicyStatus === 'ready'
+    && !uiReadOnly
+    && (can('shell.exec') || can('terminal.interactive') || can('local-shell'));
+  // Worktree planning/provisioning is a filesystem mutation.  Require the
+  // deployment to be writable in addition to the capability bit so a stale or
+  // contradictory policy can never open the selector or request a worktree.
+  const canProvisionWorkspace = deploymentPolicyStatus === 'ready'
+    && !isReadOnly
+    && can('worktree.mutate');
 
   const {
     chatMessages,
@@ -170,6 +193,49 @@ function ChatInterface({
     lastSeqRef,
     sessionStore,
   });
+
+  // Chat execution is still available in product/QA for the two runtimes with
+  // a server-enforced read-only adapter. A historical Cursor/OpenCode session
+  // remains readable, but its provider cannot safely accept another turn.
+  // Prefer the provider pinned on the session row so the first render cannot
+  // briefly expose a send button while the provider hook synchronizes it.
+  const activeSessionProvider = selectedSession?.__provider
+    ?? selectedSession?.provider
+    ?? provider;
+  // A new conversation has no provider-bound session yet. Keep the runtime
+  // picker available in that transient state so a stale Cursor/OpenCode
+  // preference can be replaced with Claude/Codex. Once a session row (or its
+  // allocated id) exists, an unsupported historical provider must stay
+  // read-only because switching it would create a mismatched runtime turn.
+  const providerReadOnlyUnsupported = uiReadOnly
+    && Boolean(selectedSession?.id || currentSessionId)
+    && !COMIC_RUNTIME_PROVIDERS.includes(activeSessionProvider);
+  const canSendMessages = can('chat.use')
+    && can('session.write')
+    && can('provider.runtime')
+    && !providerReadOnlyUnsupported;
+  // Uploads are useful for supported read-only runtimes, but do not invite a
+  // user to stage a file for a provider whose next turn is unavailable.
+  const canUploadAttachments = can('attachment.upload') && canSendMessages;
+  const canApproveTools = can('agent.use') && !uiReadOnly;
+  const canScheduleMessages = can('agent.use') && !uiReadOnly;
+  const canManageProviderModels = can('provider.write') && !uiReadOnly;
+  // Sharing a transcript is governed by the session capability, independently
+  // of whether person attribution has completed.
+  const canManageShare = can('session.write');
+  const canWriteSessionTranscript = can('file.write') && can('session.write') && !uiReadOnly;
+  const canManageSettings = Boolean(onShowSettings) && can('settings.write') && !uiReadOnly;
+
+  // Pending/ambiguous managed identities may subscribe to an active run for
+  // read-only observation, but the server intentionally rejects control
+  // frames (including abort). Keep the stop affordance from promising an
+  // operation that will be denied at the WebSocket boundary.
+  const canAbortInteractiveSession = deploymentPolicyStatus === 'ready'
+    && canAbortSession
+    && can('session.read')
+    && can('session.write')
+    && can('chat.use')
+    && can('provider.runtime');
 
   // Brand-new conversation: the composer allocated a stable session id via
   // the session gateway before the first send. Record it locally and put it
@@ -226,6 +292,11 @@ function ChatInterface({
     isInputFocused,
     commandModalPayload,
     closeCommandModal,
+    workspaceSelectionPlan,
+    workspaceSelectionKeys,
+    toggleWorkspaceRepository,
+    confirmWorkspaceSelection,
+    closeWorkspaceSelection,
     showCostModal,
     editingAnchorId,
     beginEditMessage,
@@ -241,14 +312,20 @@ function ChatInterface({
     currentProviderEffort,
     isLoading: isProcessing,
     processingSessions,
-    canAbortSession,
+    canAbortSession: canAbortInteractiveSession,
     tokenBudget,
     sendMessage,
     sendByCtrlEnter,
     onSessionProcessing,
     onSessionEstablished: handleSessionEstablished,
     onFileOpen,
-    onShowSettings,
+    onShowSettings: canManageSettings ? onShowSettings : undefined,
+    canExecuteCommands,
+    canProvisionWorkspace,
+    canUploadAttachments,
+    canSendMessages,
+    canApproveTools,
+    readOnly: uiReadOnly,
     scrollToBottom,
     addMessage,
     setIsUserScrolledUp,
@@ -294,7 +371,7 @@ function ChatInterface({
   });
 
   useEffect(() => {
-    if (!canAbortSession) {
+    if (!canAbortInteractiveSession) {
       return;
     }
 
@@ -311,7 +388,7 @@ function ChatInterface({
     return () => {
       document.removeEventListener('keydown', handleGlobalEscape, { capture: true });
     };
-  }, [canAbortSession, handleAbortSession]);
+  }, [canAbortInteractiveSession, handleAbortSession]);
 
   useEffect(() => {
     return () => {
@@ -322,8 +399,12 @@ function ChatInterface({
   /**
    * Branches the conversation into a new session that ends at this message,
    * then opens it. The session being viewed is left exactly as it was.
-   */
+  */
   const handleForkFromMessage = useCallback(async (message: ChatMessage) => {
+    if (!canWriteSessionTranscript) {
+      return;
+    }
+
     const anchorId = message.transcriptAnchorId;
     const sourceSessionId = selectedSession?.id;
     if (!anchorId || !sourceSessionId) return;
@@ -339,33 +420,45 @@ function ChatInterface({
     } catch (error) {
       console.error('Error forking session:', error);
     }
-  }, [onNavigateToSession, selectedSession?.id]);
+  }, [canWriteSessionTranscript, onNavigateToSession, selectedSession?.id]);
 
   const { scheduledMessages, schedule: scheduleMessage, cancel: cancelScheduledMessage } =
-    useScheduledMessages(currentSessionId || selectedSession?.id || null);
+    useScheduledMessages(currentSessionId || selectedSession?.id || null, {
+      canSchedule: canScheduleMessages,
+    });
 
   /**
    * Hands the composer's current text to the server to send later, and clears
    * the box as a send would — the message has left the composer either way.
    */
   const handleScheduleMessage = useCallback(async (scheduledFor: Date) => {
+    if (!canScheduleMessages) {
+      return;
+    }
+
     const content = input.trim();
     if (!content) return;
 
     const scheduled = await scheduleMessage({
       content,
       scheduledFor,
-      options: { model: currentProviderModel, effort: currentProviderEffort, permissionMode },
+      options: {
+        ...(!comicRuntimeOnly
+          ? { model: currentProviderModel, effort: currentProviderEffort }
+          : {}),
+        permissionMode,
+      },
     });
     if (scheduled) {
       setInput('');
     }
-  }, [currentProviderEffort, currentProviderModel, input, permissionMode, scheduleMessage, setInput]);
+  }, [canScheduleMessages, currentProviderEffort, currentProviderModel, input, permissionMode, scheduleMessage, setInput]);
 
   const permissionContextValue = useMemo(() => ({
     pendingPermissionRequests,
+    canApproveTools,
     handlePermissionDecision,
-  }), [pendingPermissionRequests, handlePermissionDecision]);
+  }), [canApproveTools, pendingPermissionRequests, handlePermissionDecision]);
 
   // A composer pick becomes the default for new chats and, when a session is
   // open, is recorded against that session so reopening it restores this model.
@@ -391,13 +484,24 @@ function ChatInterface({
   const hasActivityIndicator = Boolean(sessionActivity && pendingPermissionRequests.length === 0);
 
   const selectedProviderLabel =
-    provider === 'cursor'
+    activeSessionProvider === 'cursor'
       ? t('messageTypes.cursor')
-      : provider === 'codex'
+      : activeSessionProvider === 'codex'
         ? t('messageTypes.codex')
-        : provider === 'opencode'
+        : activeSessionProvider === 'opencode'
             ? t('messageTypes.opencode', { defaultValue: 'OpenCode' })
           : t('messageTypes.claude');
+
+  const sendDisabledReason = providerReadOnlyUnsupported
+      ? t('input.providerReadOnlyUnsupported', {
+          provider: selectedProviderLabel,
+          defaultValue: '{{provider}} sessions cannot be continued in this read-only deployment. Choose a Claude or Codex session.',
+        })
+      : !canSendMessages
+        ? t('input.sendUnavailable', {
+            defaultValue: 'Sending is unavailable in this deployment.',
+          })
+        : null;
 
   if (!selectedProject) {
     return (
@@ -459,7 +563,12 @@ function ChatInterface({
           showLoadAllOverlay={showLoadAllOverlay}
           createDiff={createDiff}
           onFileOpen={onFileOpen}
-          onShowSettings={onShowSettings}
+          onShowSettings={canManageSettings ? onShowSettings : undefined}
+          canManageProviderModels={canManageProviderModels}
+          canSendMessages={canSendMessages}
+          sendDisabledReason={sendDisabledReason}
+          canManageShare={canManageShare}
+          readOnly={uiReadOnly}
           onGrantToolPermission={handleGrantToolPermission}
           showRawParameters={showRawParameters}
           showThinking={showThinking}
@@ -467,8 +576,8 @@ function ChatInterface({
           // Editing replaces the turn and everything after it, so it is only
           // offered when the session is idle — a half-truncated transcript with
           // a live stream writing into it is not recoverable.
-          onEditMessage={supportsMessageEditing && !isProcessing ? beginEditMessage : undefined}
-          onForkFromMessage={supportsSessionForking ? handleForkFromMessage : undefined}
+          onEditMessage={supportsMessageEditing && canWriteSessionTranscript && !isProcessing ? beginEditMessage : undefined}
+          onForkFromMessage={supportsSessionForking && canWriteSessionTranscript ? handleForkFromMessage : undefined}
           onLoadFullTranscript={loadFullTranscript}
         />
 
@@ -491,6 +600,14 @@ function ChatInterface({
           pendingPermissionRequests={pendingPermissionRequests}
           handlePermissionDecision={handlePermissionDecision}
           handleGrantToolPermission={handleGrantToolPermission}
+          canExecuteCommands={canExecuteCommands}
+          canUploadAttachments={canUploadAttachments}
+          canSendMessages={canSendMessages}
+          sendDisabledReason={sendDisabledReason}
+          canAbortSession={canAbortInteractiveSession}
+          canApproveTools={canApproveTools}
+          canScheduleMessages={canScheduleMessages}
+          readOnly={uiReadOnly}
           activity={sessionActivity}
           isLoading={isProcessing}
           onAbortSession={handleAbortSession}
@@ -536,7 +653,7 @@ function ChatInterface({
           selectedCommandIndex={selectedCommandIndex}
           onCommandSelect={handleCommandSelect}
           onCloseCommandMenu={resetCommandMenuState}
-          isCommandMenuOpen={showCommandMenu}
+          isCommandMenuOpen={canExecuteCommands && showCommandMenu}
           frequentCommands={commandQuery ? [] : frequentCommands}
           getRootProps={getRootProps as (...args: unknown[]) => Record<string, unknown>}
           getInputProps={getInputProps as (...args: unknown[]) => Record<string, unknown>}
@@ -569,7 +686,20 @@ function ChatInterface({
         activeProvider={provider}
         activeProviderModel={currentProviderModel}
         currentSessionId={currentSessionId || selectedSession?.id || null}
+        canManageSettings={canManageSettings}
+        canManageProviderModels={canManageProviderModels}
+        readOnly={uiReadOnly}
         onSelectProviderModel={selectProviderModel}
+      />
+      <SessionWorkspaceModal
+        // A policy/identity transition can happen while the planning request
+        // is in flight. Do not leave a stale worktree-creation dialog mounted
+        // after the server has withdrawn the mutation capability.
+        plan={canProvisionWorkspace ? workspaceSelectionPlan : null}
+        selectedKeys={workspaceSelectionKeys}
+        onToggle={toggleWorkspaceRepository}
+        onConfirm={confirmWorkspaceSelection}
+        onClose={closeWorkspaceSelection}
       />
     </PermissionContext.Provider>
   );

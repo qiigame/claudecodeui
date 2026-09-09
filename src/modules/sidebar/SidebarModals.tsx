@@ -4,11 +4,13 @@ import { AlertTriangle, EyeOff, Trash2 } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
 import { Button } from '@/shared/ui';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
 import { Settings } from '@/modules/settings';
 import { VersionUpgradeModal } from '@/modules/version-upgrade';
 import type { InstallMode, PendingSidebarDeletion, Project, ReleaseInfo, SettingsProject } from '@/shared/types';
 import { normalizeProjectForSettings } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import { ProjectCreationWizard } from '@/modules/project-creation-wizard';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type SidebarModalsProps = {
   projects: Project[];
@@ -28,6 +30,12 @@ type SidebarModalsProps = {
   currentVersion: string;
   latestVersion: string | null;
   installMode: InstallMode;
+  /** Server-authorized project metadata capability. */
+  canMutateProjects?: boolean;
+  /** Server-authorized session metadata capability. */
+  canWriteSessions?: boolean;
+  /** Server-authorized filesystem capability required for transcript deletion. */
+  canWriteSessionFiles?: boolean;
   t: TFunction;
 };
 
@@ -63,8 +71,24 @@ export default function SidebarModals({
   currentVersion,
   latestVersion,
   installMode,
+  canMutateProjects = false,
+  canWriteSessions = false,
+  canWriteSessionFiles = false,
   t,
 }: SidebarModalsProps) {
+  const { authMode, user, canManageSettings: authCanManageSettings } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  // Keep the modal boundary independent from its parent prop.  A policy can
+  // change while a confirmation or wizard is open; a stale `true` prop must
+  // not leave a project mutation surface mounted in a read-only deployment.
+  const canManageProjects = canMutateProjects
+    && can('project.mutate')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
+  const canManageSettings = authCanManageSettings
+    && can('settings.write')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
   // Settings expects project identity/path fields to be present for dropdown labels and local-scope MCP config.
   const settingsProjects = useMemo(
     () => projects.map(normalizeProjectForSettings),
@@ -73,7 +97,7 @@ export default function SidebarModals({
 
   return (
     <>
-      {showNewProject &&
+      {canManageProjects && showNewProject &&
         ReactDOM.createPortal(
           <ProjectCreationWizard
             onClose={onCloseNewProject}
@@ -82,7 +106,7 @@ export default function SidebarModals({
           document.body,
         )}
 
-      {showSettings &&
+      {canManageSettings && showSettings &&
         ReactDOM.createPortal(
           <TypedSettings
             isOpen={showSettings}
@@ -93,7 +117,7 @@ export default function SidebarModals({
           document.body,
         )}
 
-      {pendingDeletion?.kind === 'project' &&
+      {canManageProjects && pendingDeletion?.kind === 'project' &&
         ReactDOM.createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
             <div className="w-full max-w-md overflow-hidden rounded-xl border border-border bg-card shadow-2xl">
@@ -147,7 +171,7 @@ export default function SidebarModals({
           document.body,
         )}
 
-      {pendingDeletion?.kind === 'session' &&
+      {canWriteSessions && pendingDeletion?.kind === 'session' &&
         ReactDOM.createPortal(
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
             <div className="w-full max-w-md overflow-hidden rounded-xl border border-border bg-card shadow-2xl">
@@ -186,14 +210,16 @@ export default function SidebarModals({
                     {t('deleteConfirmation.archiveSession', 'Archive session')}
                   </Button>
                 )}
-                <Button
-                  variant="destructive"
-                  className="w-full justify-start bg-red-600 text-white hover:bg-red-700"
-                  onClick={() => onConfirmDeleteSession(true)}
-                >
-                  <Trash2 className="mr-2 h-4 w-4" />
-                  {t('deleteConfirmation.deleteSessionPermanently', 'Delete permanently')}
-                </Button>
+                {canWriteSessionFiles && (
+                  <Button
+                    variant="destructive"
+                    className="w-full justify-start bg-red-600 text-white hover:bg-red-700"
+                    onClick={() => onConfirmDeleteSession(true)}
+                  >
+                    <Trash2 className="mr-2 h-4 w-4" />
+                    {t('deleteConfirmation.deleteSessionPermanently', 'Delete permanently')}
+                  </Button>
+                )}
                 <Button variant="ghost" className="w-full" onClick={onCancelDeletion}>
                   {t('actions.cancel')}
                 </Button>
@@ -204,7 +230,7 @@ export default function SidebarModals({
         )}
 
       <VersionUpgradeModal
-        isOpen={showVersionModal}
+        isOpen={canManageSettings && showVersionModal}
         onClose={onCloseVersionModal}
         releaseInfo={releaseInfo}
         currentVersion={currentVersion}

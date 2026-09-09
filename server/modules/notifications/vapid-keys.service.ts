@@ -6,14 +6,25 @@ import { getConnection } from '../database/index.js';
 let cachedKeys = null;
 const db = getConnection();
 
-function ensureVapidKeys() {
+/**
+ * Reads the server-owned key pair without creating one.  Public HTTP reads
+ * must stay observational: a missing row should not turn a GET into a DB
+ * mutation (particularly in a product/QA deployment whose state store may
+ * be mounted with a narrower write policy).
+ */
+function readStoredVapidKeys() {
   if (cachedKeys) return cachedKeys;
 
   const row = db.prepare('SELECT public_key, private_key FROM vapid_keys ORDER BY id DESC LIMIT 1').get();
-  if (row) {
-    cachedKeys = { publicKey: row.public_key, privateKey: row.private_key };
-    return cachedKeys;
-  }
+  if (!row) return null;
+
+  cachedKeys = { publicKey: row.public_key, privateKey: row.private_key };
+  return cachedKeys;
+}
+
+function ensureVapidKeys() {
+  const storedKeys = readStoredVapidKeys();
+  if (storedKeys) return storedKeys;
 
   const keys = webPush.generateVAPIDKeys();
   db.prepare('INSERT INTO vapid_keys (public_key, private_key) VALUES (?, ?)').run(keys.publicKey, keys.privateKey);
@@ -22,7 +33,7 @@ function ensureVapidKeys() {
 }
 
 function getPublicKey() {
-  return ensureVapidKeys().publicKey;
+  return readStoredVapidKeys()?.publicKey ?? null;
 }
 
 function configureWebPush() {

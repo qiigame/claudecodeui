@@ -1,9 +1,19 @@
 import { spawn } from 'node:child_process';
-import { stat } from 'node:fs/promises';
+import { realpath, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import path from 'node:path';
 import readline from 'node:readline';
 
-import { AppError } from '@/shared/utils.js';
+import {
+  AppError,
+  closeProviderTranscriptReadHandle,
+  openProviderTranscriptReadHandle,
+  preflightProviderTranscriptPath,
+  readFirstJsonlRecordFromHandle,
+  readObjectRecord,
+  resolveCodexHomeDirectory,
+  validateProviderTranscriptRecord,
+} from '@/shared/utils.js';
 
 /**
  * Minimal JSON-RPC client for `codex app-server`.
@@ -39,8 +49,100 @@ type JsonRpcResponse = {
  */
 export type CodexThreadFork = {
   threadId: string;
+  /** Canonical, validated path under the configured Codex sessions root. */
   path: string;
 };
+
+function forkSourceError(): AppError {
+  return new AppError('The Codex fork source transcript is invalid or unavailable.', {
+    code: 'FORK_SOURCE_INVALID',
+    statusCode: 409,
+  });
+}
+
+function forkResultError(message: string): AppError {
+  return new AppError(message, {
+    code: 'FORK_FAILED',
+    statusCode: 502,
+  });
+}
+
+/**
+ * Resolves an existing directory to the same canonical spelling used by the
+ * transcript validator.  A fork must never silently turn a missing or regular
+ * file `cwd` into a path relative to the CloudCLI process.
+ */
+async function resolveCanonicalDirectory(value: unknown): Promise<string | null> {
+  if (typeof value !== 'string' || !value.trim() || !path.isAbsolute(value)) {
+    return null;
+  }
+
+  const lexicalPath = path.resolve(value);
+  try {
+    if (!(await stat(lexicalPath)).isDirectory()) {
+      return null;
+    }
+    return path.resolve(await realpath(lexicalPath));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Authenticates a Codex rollout artifact before it is used as a fork source or
+ * persisted as the new session path.  The shared preflight establishes root
+ * containment, filename shape, symlink policy, and regular-file type; the
+ * opening envelope then binds the native id, top-level thread kind, and cwd.
+ */
+async function validateCodexThreadArtifact(input: {
+  candidatePath: string;
+  threadId: string;
+  sessionsRoot: string;
+  expectedCwd: string;
+}): Promise<string | null> {
+  const preflight = await preflightProviderTranscriptPath({
+    provider: 'codex',
+    candidatePath: input.candidatePath,
+    rootPath: input.sessionsRoot,
+    providerSessionId: input.threadId,
+  });
+  if (!preflight) {
+    return null;
+  }
+
+  const opened = await openProviderTranscriptReadHandle(preflight.canonicalPath, {
+    device: preflight.device,
+    inode: preflight.inode,
+  });
+  if (!opened) {
+    return null;
+  }
+  try {
+    const firstRecord = await readFirstJsonlRecordFromHandle(opened.handle);
+    if (!validateProviderTranscriptRecord({
+      provider: 'codex',
+      preflight,
+      firstRecord,
+      providerSessionId: input.threadId,
+      expectedSubagent: false,
+    })) {
+      return null;
+    }
+
+    const record = readObjectRecord(firstRecord);
+    const payload = readObjectRecord(record?.payload);
+    if (record?.type !== 'session_meta' || typeof payload?.cwd !== 'string') {
+      return null;
+    }
+
+    const artifactCwd = await resolveCanonicalDirectory(payload.cwd);
+    return artifactCwd === input.expectedCwd
+      ? preflight.canonicalPath
+      : null;
+  } finally {
+    await closeProviderTranscriptReadHandle(opened.handle);
+  }
+}
 
 /**
  * Resolves the `codex` launcher shipped in node_modules.
@@ -72,10 +174,19 @@ function resolveCodexLauncher(): string {
  */
 async function withAppServer<T>(
   run: (call: (method: string, params: unknown) => Promise<unknown>) => Promise<T>,
+  codexHomeDirectory = resolveCodexHomeDirectory(),
 ): Promise<T> {
   const launcher = resolveCodexLauncher();
+  // `resolveCodexHomeDirectory` also accepts CloudCLI's COMIC_CODEX_HOME
+  // alias, while the native CLI only reads CODEX_HOME.  Normalize the child
+  // environment so the app-server talks to the exact sessions tree that was
+  // authenticated by the caller, rather than the operator's ambient home.
+  const childEnvironment = {
+    ...process.env,
+    CODEX_HOME: codexHomeDirectory,
+  };
   const child = spawn(process.execPath, [launcher, 'app-server'], {
-    env: process.env,
+    env: childEnvironment,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -202,42 +313,96 @@ export const codexAppServer = {
    * `cwd` decides the working directory recorded in the copy's `session_meta`,
    * and that field is what the session indexer keys a session's project off —
    * omitting it would file every fork under whatever directory this server
-   * happens to be running from.
+   * happens to be running from. `jsonlPath` is the persisted source index and
+   * is authenticated before the app-server is allowed to copy anything.  The
+   * protocol also accepts the canonical `path`; sending it is important because
+   * otherwise the app-server resolves only `threadId` again and can select a
+   * different rollout after the preflight check.
    */
   async forkThread(input: {
     threadId: string;
+    jsonlPath: string;
     lastTurnId?: string;
     cwd: string;
   }): Promise<CodexThreadFork> {
+    if (
+      !input
+      || typeof input.threadId !== 'string'
+      || typeof input.jsonlPath !== 'string'
+      || typeof input.cwd !== 'string'
+      || !input.threadId.trim()
+      || !input.jsonlPath.trim()
+      || !input.cwd.trim()
+    ) {
+      throw forkSourceError();
+    }
+
+    const codexHomeDirectory = resolveCodexHomeDirectory();
+    const sessionsRoot = path.join(codexHomeDirectory, 'sessions');
+    const expectedCwd = await resolveCanonicalDirectory(input.cwd);
+    if (!expectedCwd) {
+      throw forkSourceError();
+    }
+
+    // Authenticate the source before spawning a child or issuing the RPC. The
+    // database path is an index only; a successful `thread/fork` response does
+    // not make an arbitrary host file a valid Codex transcript.
+    let canonicalSourcePath: string | null;
+    try {
+      canonicalSourcePath = await validateCodexThreadArtifact({
+        candidatePath: input.jsonlPath,
+        threadId: input.threadId,
+        sessionsRoot,
+        expectedCwd,
+      });
+    } catch {
+      canonicalSourcePath = null;
+    }
+    if (!canonicalSourcePath) {
+      throw forkSourceError();
+    }
+
     return withAppServer(async (call) => {
       const result = await call('thread/fork', {
         threadId: input.threadId,
+        // Codex's app-server protocol documents `path` as an alternative
+        // source selector. Keep threadId for compatibility with older servers,
+        // while making the authenticated canonical artifact authoritative when
+        // this server supports the field.
+        path: canonicalSourcePath,
         ...(input.lastTurnId ? { lastTurnId: input.lastTurnId } : {}),
-        ...(input.cwd ? { cwd: input.cwd } : {}),
+        ...(expectedCwd ? { cwd: expectedCwd } : {}),
       }) as { thread?: { id?: unknown; path?: unknown } } | undefined;
 
       const threadId = typeof result?.thread?.id === 'string' ? result.thread.id : '';
-      const path = typeof result?.thread?.path === 'string' ? result.thread.path : '';
-      if (!threadId || !path) {
-        throw new AppError('Codex reported a fork without a thread id or transcript path.', {
-          code: 'FORK_FAILED',
-          statusCode: 502,
-        });
+      const reportedPath = typeof result?.thread?.path === 'string' ? result.thread.path : '';
+      if (!threadId || !reportedPath) {
+        throw forkResultError('Codex reported a fork without a thread id or transcript path.');
+      }
+      if (threadId.toLowerCase() === input.threadId.toLowerCase()) {
+        throw forkResultError('Codex returned the source thread id for the fork.');
       }
 
       // Confirmed rather than trusted: both callers are about to point a
-      // database row at this file, and a row naming a transcript that is not
-      // there is a session that can never be opened.
+      // database row at this file. Validate the returned path and opening
+      // envelope, not just its existence, so an app-server bug or a malicious
+      // response cannot move the row outside the configured Codex home.
+      let canonicalForkPath: string | null;
       try {
-        await stat(path);
-      } catch {
-        throw new AppError('Codex reported a fork but wrote no transcript for it.', {
-          code: 'FORK_FAILED',
-          statusCode: 502,
+        canonicalForkPath = await validateCodexThreadArtifact({
+          candidatePath: reportedPath,
+          threadId,
+          sessionsRoot,
+          expectedCwd,
         });
+      } catch {
+        canonicalForkPath = null;
+      }
+      if (!canonicalForkPath) {
+        throw forkResultError('Codex reported a fork but wrote no valid transcript for it.');
       }
 
-      return { threadId, path };
-    });
+      return { threadId, path: canonicalForkPath };
+    }, codexHomeDirectory);
   },
 };

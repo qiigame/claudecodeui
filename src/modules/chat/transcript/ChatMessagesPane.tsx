@@ -64,6 +64,16 @@ type ChatMessagesPaneProps = {
   createDiff: any;
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   onShowSettings?: () => void;
+  /** Server-authorized provider model catalog mutation capability. */
+  canManageProviderModels?: boolean;
+  /** Whether the active session can accept a new chat turn. */
+  canSendMessages?: boolean;
+  /** Human-readable reason shown when a new turn is unavailable. */
+  sendDisabledReason?: string | null;
+  /** Whether this actor may create/revoke a read-only session share. */
+  canManageShare?: boolean;
+  /** Restricts the empty-state selector to safe read-only runtimes. */
+  readOnly?: boolean;
   onGrantToolPermission: (suggestion: { entry: string; toolName: string }) => { success: boolean };
   showRawParameters?: boolean;
   showThinking?: boolean;
@@ -121,6 +131,13 @@ function ChatMessagesPane({
   onLoadFullTranscript,
   onFileOpen,
   onShowSettings,
+  // Do not let a direct/legacy mount expose mutation or send affordances while
+  // the server capability snapshot is unavailable.
+  canManageProviderModels = false,
+  canSendMessages = false,
+  sendDisabledReason = null,
+  canManageShare = false,
+  readOnly = false,
   onGrantToolPermission,
   showRawParameters,
   showThinking,
@@ -183,6 +200,8 @@ function ChatMessagesPane({
               provider={provider}
               selectedProject={selectedProject}
               createDiff={createDiff}
+              sessionId={currentSessionId || selectedSession?.id || null}
+              canManageShare={canManageShare}
               onLoadFullTranscript={onLoadFullTranscript}
             />
           </div>
@@ -211,6 +230,10 @@ function ChatMessagesPane({
           tasksEnabled={tasksEnabled}
           isTaskMasterInstalled={isTaskMasterInstalled}
           onShowAllTasks={onShowAllTasks}
+          canManageProviderModels={canManageProviderModels}
+          canSendMessages={canSendMessages}
+          sendDisabledReason={sendDisabledReason}
+          readOnly={readOnly}
           setInput={setInput}
         />
       ) : (

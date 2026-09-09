@@ -1,5 +1,5 @@
 import { api } from '@/shared/api';
-import type { QueuedSendOptions } from '@/shared/types';
+import type { QueuedSendOptions, UserDataHydrationOptions } from '@/shared/types';
 
 /**
  * Unsent composer text and queued messages, stored in `auth.db` rather than in
@@ -53,6 +53,9 @@ const listeners = new Set<() => void>();
 let drafts = new Map<string, DraftRecord>();
 const pendingScopes = new Set<string>();
 let serverWriteTimer: ReturnType<typeof setTimeout> | null = null;
+// Abort signals are best effort; this generation is the synchronous ownership
+// fence for transports/mocks that still resolve after an account reset.
+let hydrationGeneration = 0;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   Boolean(value) && typeof value === 'object' && !Array.isArray(value)
@@ -233,23 +236,42 @@ export function subscribeToChatDrafts(listener: () => void): () => void {
  * user is looking at that composer right now, and replacing its contents with a
  * staler server copy would delete what they are in the middle of writing.
  */
-export async function hydrateChatDrafts(): Promise<void> {
+export async function hydrateChatDrafts(options: UserDataHydrationOptions = {}): Promise<void> {
+  const requestGeneration = hydrationGeneration;
+  const isCurrent = () => (
+    requestGeneration === hydrationGeneration
+    && !options.signal?.aborted
+    && (options.isCurrent?.() ?? true)
+  );
   let serverDrafts: Array<{ scope?: unknown; text?: unknown; queuedMessage?: unknown }> = [];
 
   try {
-    const response = await api.user.drafts();
+    const response = await api.user.drafts({ signal: options.signal });
+    if (!isCurrent()) {
+      return;
+    }
     if (!response.ok) {
       return;
     }
 
     const payload = (await response.json()) as { drafts?: unknown };
+    if (!isCurrent()) {
+      return;
+    }
     if (!Array.isArray(payload.drafts)) {
       return;
     }
     serverDrafts = payload.drafts as typeof serverDrafts;
   } catch (error) {
+    if (!isCurrent()) {
+      return;
+    }
     // Keep the mirror: an offline load must still show what was typed here.
     console.error('Failed to load chat drafts:', error);
+    return;
+  }
+
+  if (!isCurrent()) {
     return;
   }
 
@@ -285,6 +307,7 @@ export async function hydrateChatDrafts(): Promise<void> {
 
 /** Drops every cached draft on sign-out, so the next user sees none of them. */
 export function resetChatDrafts(): void {
+  hydrationGeneration += 1;
   drafts = new Map();
   pendingScopes.clear();
   if (serverWriteTimer !== null) {

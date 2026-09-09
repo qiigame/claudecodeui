@@ -324,6 +324,30 @@ test('buildCodexInputItems emits text plus absolute local_image paths', () => {
   assert.equal(imageItem.path, path.resolve(cwd, '.cloudcli/assets/pic.jpg'));
 });
 
+test('buildCodexInputItems refuses an existing symlink that resolves outside allowed roots', async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), 'codex-image-project-'));
+  const outsideDir = await mkdtemp(path.join(os.tmpdir(), 'codex-image-outside-'));
+  try {
+    const outsideImage = path.join(outsideDir, 'secret.png');
+    await writeFile(outsideImage, PNG_BYTES);
+    const linkPath = path.join(cwd, 'linked-secret.png');
+    if (!(await createSymlinkIfSupported(outsideImage, linkPath, 'file'))) {
+      t.skip('Symlink creation is not supported in this environment');
+      return;
+    }
+
+    const items = buildCodexInputItems(
+      'Describe this image:',
+      [{ path: 'linked-secret.png', mimeType: 'image/png' }],
+      cwd,
+    );
+    assert.deepEqual(items, [{ type: 'text', text: 'Describe this image:' }]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
 test('isAllowedImageSourcePath only accepts the upload store and the run cwd', () => {
   const cwd = path.join(os.tmpdir(), 'some-project');
   const uploadStore = path.join(os.homedir(), '.cloudcli', 'assets');
@@ -350,4 +374,52 @@ test('provider builders refuse descriptors outside the allowed roots', async () 
     cwd,
   );
   assert.deepEqual(claudeContent, [{ type: 'text', text: 'prompt' }]);
+});
+
+test('prompt attachment tags revalidate paths when a provider working directory is supplied', async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), 'prompt-attachment-project-'));
+  const outsideDir = await mkdtemp(path.join(os.tmpdir(), 'prompt-attachment-outside-'));
+  try {
+    const allowedFile = path.join(cwd, 'notes.txt');
+    const outsideFile = path.join(outsideDir, 'secret.txt');
+    await writeFile(allowedFile, 'safe');
+    await writeFile(outsideFile, 'secret');
+
+    const symlinkPath = path.join(cwd, 'linked-secret.txt');
+    const symlinkCreated = await createSymlinkIfSupported(outsideFile, symlinkPath, 'file');
+    if (!symlinkCreated) {
+      t.diagnostic('Symlink creation is not supported; validating lexical escape only');
+    }
+
+    const candidates = [
+      { path: 'notes.txt', name: 'notes.txt' },
+      { path: outsideFile, name: 'secret.txt' },
+      ...(symlinkCreated ? [{ path: 'linked-secret.txt', name: 'linked-secret.txt' }] : []),
+      { path: 'queued-later.txt', name: 'queued-later.txt' },
+    ];
+
+    const filesTag = appendFilesInputTag('inspect attachments', candidates, cwd);
+    assert.match(filesTag, /1\. .*notes\.txt/);
+    assert.match(filesTag, /2\. .*queued-later\.txt/);
+    assert.doesNotMatch(filesTag, /secret\.txt/);
+    assert.match(filesTag, /The user attached 2 file\(s\)/);
+
+    const imagesTag = appendImagesInputTag(
+      'inspect images',
+      [
+        { path: 'notes.png' },
+        { path: outsideFile },
+        ...(symlinkCreated ? [{ path: symlinkPath }] : []),
+      ],
+      cwd,
+    );
+    // `notes.png` does not need to exist yet: queued uploads retain their
+    // lexical path, while the outside/symlinked descriptors are discarded.
+    assert.match(imagesTag, /The user attached 1 image\(s\)/);
+    assert.match(imagesTag, /notes\.png/);
+    assert.doesNotMatch(imagesTag, /secret\.txt/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
 });

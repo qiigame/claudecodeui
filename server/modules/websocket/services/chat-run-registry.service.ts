@@ -302,6 +302,16 @@ export const chatRunRegistry = {
   },
 
   /**
+   * Removes a just-reserved run before a provider starts. The chat gateway uses
+   * this fail-closed path when trusted actor attribution cannot be persisted.
+   */
+  discardRunIfCurrent(run: ChatRun): void {
+    if (runs.get(run.appSessionId) === run && run.status === 'running') {
+      runs.delete(run.appSessionId);
+    }
+  },
+
+  /**
    * Test-only escape hatch: clears every tracked run.
    */
   clearAll(): void {

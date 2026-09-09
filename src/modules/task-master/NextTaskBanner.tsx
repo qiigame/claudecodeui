@@ -16,6 +16,8 @@ import { cn } from '@/shared/utils';
 import { useTaskMaster } from '@/modules/task-master/context/TaskMasterContext';
 import TaskDetailModal from '@/modules/task-master/modals/TaskDetailModal';
 import TaskMasterSetupModal from '@/modules/task-master/modals/TaskMasterSetupModal';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type NextTaskBannerProps = {
   onShowAllTasks?: (() => void) | null;
@@ -58,6 +60,11 @@ export default function NextTaskBanner({ onShowAllTasks = null, onStartTask = nu
     refreshTasks,
     setCurrentProject,
   } = useTaskMaster();
+  const { authMode, user } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const canMutateTasks = can('project.mutate')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
 
   const [showTaskDetail, setShowTaskDetail] = useState(false);
   const [showSetupModal, setShowSetupModal] = useState(false);
@@ -87,13 +94,15 @@ export default function NextTaskBanner({ onShowAllTasks = null, onStartTask = nu
               <p className="text-sm font-medium text-gray-900 dark:text-white">TaskMaster AI is not configured</p>
             </div>
 
-            <button
-              onClick={() => setShowSetupModal(true)}
-              className="flex items-center gap-1 rounded bg-blue-600 px-2 py-1 text-xs text-white transition-colors hover:bg-blue-700"
-            >
-              <Terminal className="h-3 w-3" />
-              Initialize
-            </button>
+            {canMutateTasks && (
+              <button
+                onClick={() => setShowSetupModal(true)}
+                className="flex items-center gap-1 rounded bg-blue-600 px-2 py-1 text-xs text-white transition-colors hover:bg-blue-700"
+              >
+                <Terminal className="h-3 w-3" />
+                Initialize
+              </button>
+            )}
           </div>
 
           <button
@@ -116,6 +125,7 @@ export default function NextTaskBanner({ onShowAllTasks = null, onStartTask = nu
         <TaskMasterSetupModal
           isOpen={showSetupModal}
           project={currentProject}
+          canMutate={canMutateTasks}
           onClose={() => setShowSetupModal(false)}
           onAfterClose={handleSetupRefresh}
         />
@@ -140,13 +150,15 @@ export default function NextTaskBanner({ onShowAllTasks = null, onStartTask = nu
             </div>
 
             <div className="flex flex-shrink-0 items-center gap-1">
-              <button
-                onClick={() => onStartTask?.()}
-                className="flex items-center gap-1 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700"
-              >
-                <Play className="h-3 w-3" />
-                Start Task
-              </button>
+              {canMutateTasks && (
+                <button
+                  onClick={() => onStartTask?.()}
+                  className="flex items-center gap-1 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700"
+                >
+                  <Play className="h-3 w-3" />
+                  Start Task
+                </button>
+              )}
 
               <button
                 onClick={() => setShowTaskDetail(true)}
@@ -172,6 +184,7 @@ export default function NextTaskBanner({ onShowAllTasks = null, onStartTask = nu
         <TaskDetailModal
           task={nextTask}
           isOpen={showTaskDetail}
+          canMutate={canMutateTasks}
           onClose={() => setShowTaskDetail(false)}
           onStatusChange={() => {
             void refreshTasks();

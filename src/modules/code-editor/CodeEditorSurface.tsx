@@ -13,6 +13,8 @@ type CodeEditorSurfaceProps = {
   fontSize: number;
   showLineNumbers: boolean;
   extensions: Extension[];
+  /** Prevents keyboard/paste/drop edits when the deployment is read-only. */
+  readOnly?: boolean;
 };
 
 /** Rendered by CodeEditor inside the code-editor module to show either the CodeMirror editing surface or the markdown preview. */
@@ -25,6 +27,7 @@ export default function CodeEditorSurface({
   fontSize,
   showLineNumbers,
   extensions,
+  readOnly = false,
 }: CodeEditorSurfaceProps) {
   if (markdownPreview && isMarkdownFile) {
     return (
@@ -39,7 +42,9 @@ export default function CodeEditorSurface({
   return (
     <CodeMirror
       value={content}
-      onChange={onChange}
+      onChange={readOnly ? undefined : onChange}
+      editable={!readOnly}
+      readOnly={readOnly}
       extensions={extensions}
       theme={isDarkMode ? oneDark : undefined}
       height="100%"

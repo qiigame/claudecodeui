@@ -111,7 +111,7 @@ function resolveSessionRow(sessionId, provider) {
     return appSessionRow;
   }
 
-  const providerSessionRow = sessionsDb.getSessionByProviderSessionId(sessionId);
+  const providerSessionRow = sessionsDb.getSessionByProviderSessionId(sessionId, provider);
   if (rowMatchesProvider(providerSessionRow, provider)) {
     return providerSessionRow;
   }

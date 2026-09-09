@@ -51,6 +51,13 @@ const submit = async (provider: LLMProvider) => {
       currentProviderEffort: 'medium',
       isLoading: false,
       canAbortSession: false,
+      // The test submits a turn intentionally; do not rely on the hook's
+      // fail-closed defaults for that writable-path assertion.
+      canExecuteCommands: true,
+      canProvisionWorkspace: true,
+      canUploadAttachments: true,
+      canSendMessages: true,
+      canApproveTools: true,
       tokenBudget: null,
       sendMessage: (message) => {
         sent.push(message as SentMessage);

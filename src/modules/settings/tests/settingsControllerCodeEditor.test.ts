@@ -50,6 +50,14 @@ vi.mock('@/shared/context/ThemeContext', () => {
   return { useTheme: () => theme };
 });
 
+vi.mock('@/shared/utils', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...(actual as Record<string, unknown>),
+    taskMasterUiEnabled: false,
+  };
+});
+
 vi.mock('@/modules/provider-auth', () => {
   const authStatus = {
     providerAuthStatus: {},
@@ -87,11 +95,11 @@ const storedCodeEditorSettings = (): Record<string, unknown> | undefined => {
  */
 const loadPreferenceStore = () => import('@/shared/userSettings');
 
-const renderSettings = async () => {
+const renderSettings = async (initialTab = 'appearance') => {
   const { useSettingsController } = await import(
     '@/modules/settings/hooks/useSettingsController'
   );
-  return renderHook(() => useSettingsController({ isOpen: true, initialTab: 'appearance' }));
+  return renderHook(() => useSettingsController({ isOpen: true, initialTab }));
 };
 
 beforeEach(() => {
@@ -117,6 +125,14 @@ test('opening settings writes no code-editor preference for a user who never set
     undefined,
     'merely opening the dialog must not materialize code-editor defaults',
   );
+});
+
+test('a disabled TaskMaster build redirects a saved Tasks deep link to Agents', async () => {
+  const { result } = await renderSettings('tasks');
+
+  await waitFor(() => {
+    assert.equal(result.current.activeTab, 'agents');
+  });
 });
 
 test('opening settings does not change a font size the user already chose', async () => {

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { closeConnection, initializeDatabase, sessionsDb, userDb } from '@/modules/database/index.js';
 import { sessionsService } from '@/modules/providers/index.js';
 import { handleChatConnection } from '@/modules/websocket/services/chat-websocket.service.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
@@ -79,6 +79,12 @@ async function withGateway(
     runs: RunCall[];
   }) => Promise<void>,
   rows: unknown[] = TRANSCRIPT_ROWS,
+  identityOptions: {
+    requestUser?: Record<string, unknown>;
+    requireDingTalkActor?: boolean;
+    requireVerifiedDingTalkActor?: boolean;
+    isActorVerified?: (userId: string | number) => boolean;
+  } = {},
 ): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'chat-edit-send-'));
@@ -88,6 +94,7 @@ async function withGateway(
   closeConnection();
   process.env.DATABASE_PATH = path.join(tempDirectory, 'auth.db');
   await initializeDatabase();
+  userDb.createUser('chat-edit-test-user', 'not-used');
 
   const runs: RunCall[] = [];
   const socket = createFakeSocket();
@@ -98,7 +105,7 @@ async function withGateway(
 
     handleChatConnection(
       socket as never,
-      { user: { id: 1 } } as never,
+      { user: identityOptions.requestUser ?? { id: 1 } } as never,
       {
         runtime: {
           hasRuntime: () => true,
@@ -109,12 +116,18 @@ async function withGateway(
             }
           },
         } as never,
+        requireDingTalkActor: identityOptions.requireDingTalkActor,
+        requireVerifiedDingTalkActor: identityOptions.requireVerifiedDingTalkActor,
+        isActorVerified: identityOptions.isActorVerified,
       },
     );
 
     await runTest({ socket, runs });
   } finally {
     releaseHeldRun?.();
+    // The websocket listener owns the async run. Let its finally block persist
+    // execution completion before this fixture closes and swaps the database.
+    await new Promise((resolve) => { setTimeout(resolve, 30); });
     releaseHeldRun = null;
     holdRun = null;
     connectedClients.clear();
@@ -306,4 +319,43 @@ test('a provider that has to branch to rewind is rewound before the run, not dur
     assert.ok(socket.frames.some((frame) => frame.kind === 'history_truncated'));
     assert.equal(truncatedBeforeRewind, true);
   }, CODEX_TRANSCRIPT_ROWS);
+});
+
+test('an actor revoked during async edit preparation cannot reach the provider runtime', async () => {
+  let actorVerified = true;
+  await withGateway('codex', async ({ socket, runs }) => {
+    const realRewind = sessionsService.rewindSessionForEdit;
+    sessionsService.rewindSessionForEdit = async () => {
+      // Simulates an administrator revoking the registry binding while the
+      // provider-owned rewind is awaiting completion.
+      actorVerified = false;
+    };
+
+    try {
+      socket.emit('message', JSON.stringify({
+        type: 'chat.edit-send',
+        sessionId: SESSION_ID,
+        anchorId: 'turn-b',
+        content: 'must not run after revocation',
+      }));
+      await settle();
+    } finally {
+      sessionsService.rewindSessionForEdit = realRewind;
+    }
+
+    assert.equal(runs.length, 0);
+    assert.equal(socket.frames.at(-2)?.code, 'IDENTITY_ENROLLMENT_REQUIRED');
+    assert.equal(socket.frames.at(-1)?.kind, 'complete');
+  }, CODEX_TRANSCRIPT_ROWS, {
+    requestUser: {
+      id: 1,
+      actor: {
+        provider: 'dingtalk',
+        personId: 'person-1',
+        identityStatus: 'verified',
+      },
+    },
+    requireVerifiedDingTalkActor: true,
+    isActorVerified: () => actorVerified,
+  });
 });

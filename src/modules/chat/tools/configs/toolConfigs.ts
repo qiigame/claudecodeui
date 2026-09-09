@@ -464,7 +464,10 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
       type: 'one-line',
       label: 'Task',
       getValue: (input) => {
-        const parts = [];
+        // Keep the accumulator typed explicitly: with strict inference an
+        // unannotated empty array becomes `never[]`, which rejects the
+        // optional task fields below during the frontend typecheck.
+        const parts: string[] = [];
         if (input.taskId) parts.push(`#${input.taskId}`);
         if (input.status) parts.push(input.status);
         if (input.subject) parts.push(`"${input.subject}"`);
@@ -572,7 +575,9 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
         }
 
         // Format multiple fields
-        const parts = [];
+        // The fields are optional, but every rendered fragment is text. An
+        // explicit string accumulator avoids strict-mode `never[]` inference.
+        const parts: string[] = [];
 
         if (input.model) {
           parts.push(`**Model:** ${input.model}`);

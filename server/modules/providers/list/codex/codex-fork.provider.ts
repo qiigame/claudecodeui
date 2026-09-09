@@ -28,6 +28,7 @@ export class CodexForkProvider implements IProviderFork {
     // second call that could fail after the fork already succeeded.
     const fork = await codexAppServer.forkThread({
       threadId: input.providerSessionId,
+      jsonlPath: input.jsonlPath,
       lastTurnId: input.upToAnchorId,
       cwd: input.projectPath,
     });

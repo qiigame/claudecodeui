@@ -18,6 +18,8 @@ import { cn } from '@/shared/utils';
 import { Badge, Button } from '@/shared/ui';
 import { api, readApiJson } from '@/shared/api';
 import type { SettingsMainTab } from '@/shared/types';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type BrowserUseStatus = {
   enabled: boolean;
@@ -118,6 +120,17 @@ const PROMPTS = [
 
 /** Used by the project-workspace module to render the Browser tab's session list and live preview. */
 export default function BrowserUsePanel({ isVisible, onShowSettings }: BrowserUsePanelProps) {
+  const { authMode, user, canManageSettings: authCanManageSettings } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const managedIdentityRestricted = isManagedIdentityRestricted(authMode, user);
+  const canManageSettings = authCanManageSettings
+    && can('settings.write')
+    && !isReadOnly
+    && !managedIdentityRestricted;
+  // Browser session lifecycle controls can terminate or remove an agent
+  // session.  Product/QA deployments intentionally grant browser.read only,
+  // so keep those controls out of the UI and fail closed in their callbacks.
+  const canUseBrowser = can('browser.use') && !isReadOnly && !managedIdentityRestricted;
   const [status, setStatus] = useState<BrowserUseStatus | null>(null);
   const [sessions, setSessions] = useState<BrowserUseSession[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -193,12 +206,14 @@ export default function BrowserUsePanel({ isVisible, onShowSettings }: BrowserUs
   }, [refresh]);
 
   const stopSession = () => runAction(async () => {
+    if (!canUseBrowser) return;
     if (!selectedSession) return;
     const response = await api.browserUse.stopSession(selectedSession.id);
     await readApiJson(response);
   });
 
   const deleteSession = () => runAction(async () => {
+    if (!canUseBrowser) return;
     if (!selectedSession) return;
     const response = await api.browserUse.deleteSession(selectedSession.id);
     await readApiJson(response);
@@ -206,6 +221,7 @@ export default function BrowserUsePanel({ isVisible, onShowSettings }: BrowserUs
   });
 
   const installBrowserBinaries = () => runAction(async () => {
+    if (!canManageSettings || !canUseBrowser) return;
     setIsInstalling(true);
     try {
       const response = await api.browserUse.installRuntime();
@@ -264,7 +280,9 @@ export default function BrowserUsePanel({ isVisible, onShowSettings }: BrowserUs
             <p className="mt-1 max-w-xl text-sm leading-6 text-muted-foreground">
               {status?.enabled
                 ? 'Agent browser sessions appear here while an AI task is using Browser.'
-                : 'Enable Browser in settings to let agents open monitored browser sessions.'}
+                : canManageSettings
+                  ? 'Enable Browser in settings to let agents open monitored browser sessions.'
+                  : 'Browser is not enabled for this workspace.'}
             </p>
           </div>
         </div>
@@ -273,20 +291,22 @@ export default function BrowserUsePanel({ isVisible, onShowSettings }: BrowserUs
           <div className="mt-4 rounded-md border border-border bg-muted/30 p-3">
             <div className="text-sm font-medium text-foreground">Runtime setup required</div>
             <p className="mt-1 text-sm text-muted-foreground">{status?.message}</p>
-            <Button
-              type="button"
-              size="sm"
-              className="mt-3"
-              onClick={installBrowserBinaries}
-              disabled={isBusy || isInstalling || status?.installInProgress}
-            >
-              {isInstalling || status?.installInProgress ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Download className="h-4 w-4" />
-              )}
-              {isInstalling || status?.installInProgress ? 'Installing...' : 'Install Runtime'}
-            </Button>
+            {canManageSettings && canUseBrowser && (
+              <Button
+                type="button"
+                size="sm"
+                className="mt-3"
+                onClick={installBrowserBinaries}
+                disabled={isBusy || isInstalling || status?.installInProgress}
+              >
+                {isInstalling || status?.installInProgress ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="h-4 w-4" />
+                )}
+                {isInstalling || status?.installInProgress ? 'Installing...' : 'Install Runtime'}
+              </Button>
+            )}
           </div>
         )}
 
@@ -347,7 +367,7 @@ export default function BrowserUsePanel({ isVisible, onShowSettings }: BrowserUs
           <p className="mt-0.5 text-xs text-muted-foreground">Monitor browser sessions opened by AI agents.</p>
         </div>
         <div className="flex items-center gap-1.5">
-          {onShowSettings && (
+          {canManageSettings && onShowSettings && (
             <Button
               variant="ghost"
               size="sm"
@@ -441,12 +461,16 @@ export default function BrowserUsePanel({ isVisible, onShowSettings }: BrowserUs
                   <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => setIsFullscreen(true)} disabled={!selectedSession?.screenshotDataUrl} title="Full screen" aria-label="Full screen">
                     <Expand className="h-4 w-4" />
                   </Button>
-                  <Button variant="ghost" size="sm" className="h-8 w-8 p-0 lg:hidden" onClick={stopSession} disabled={isBusy || !selectedSession || selectedSession.status !== 'ready'} title="Stop session" aria-label="Stop session">
-                    <Square className="h-4 w-4" />
-                  </Button>
-                  <Button variant="ghost" size="sm" className="h-8 w-8 p-0 lg:hidden" onClick={deleteSession} disabled={isBusy || !selectedSession} title="Delete session" aria-label="Delete session">
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
+                  {canUseBrowser && (
+                    <>
+                      <Button variant="ghost" size="sm" className="h-8 w-8 p-0 lg:hidden" onClick={stopSession} disabled={isBusy || !selectedSession || selectedSession.status !== 'ready'} title="Stop session" aria-label="Stop session">
+                        <Square className="h-4 w-4" />
+                      </Button>
+                      <Button variant="ghost" size="sm" className="h-8 w-8 p-0 lg:hidden" onClick={deleteSession} disabled={isBusy || !selectedSession} title="Delete session" aria-label="Delete session">
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </>
+                  )}
                 </div>
                 {renderBrowserSurface()}
               </div>
@@ -495,16 +519,18 @@ export default function BrowserUsePanel({ isVisible, onShowSettings }: BrowserUs
                   <span className="truncate font-medium text-foreground">{selectedSession?.profileName || 'Temporary'}</span>
                 </div>
               </div>
-              <div className="mt-3 grid grid-cols-2 gap-2">
-                <Button variant="outline" size="sm" onClick={stopSession} disabled={isBusy || !selectedSession || selectedSession.status !== 'ready'}>
-                  <Square className="h-4 w-4" />
-                  Stop
-                </Button>
-                <Button variant="outline" size="sm" onClick={deleteSession} disabled={isBusy || !selectedSession}>
-                  <Trash2 className="h-4 w-4" />
-                  Delete
-                </Button>
-              </div>
+              {canUseBrowser && (
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <Button variant="outline" size="sm" onClick={stopSession} disabled={isBusy || !selectedSession || selectedSession.status !== 'ready'}>
+                    <Square className="h-4 w-4" />
+                    Stop
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={deleteSession} disabled={isBusy || !selectedSession}>
+                    <Trash2 className="h-4 w-4" />
+                    Delete
+                  </Button>
+                </div>
+              )}
             </div>
           </div>
         </aside>

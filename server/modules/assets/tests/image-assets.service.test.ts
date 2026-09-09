@@ -6,9 +6,11 @@ import test from 'node:test';
 import {
   buildStoredAttachmentRecords,
   buildStoredImageRecords,
+  isCanonicalAssetPathInside,
   isAllowedImageMimeType,
   resolveAttachmentAssetFile,
   resolveImageAssetFile,
+  sanitizeStoredAttachmentName,
 } from '@/modules/assets/services/image-assets.service.js';
 
 const ASSETS_DIR = path.join(os.homedir(), '.cloudcli', 'assets');
@@ -65,10 +67,32 @@ test('resolveImageAssetFile rejects traversal and separator attempts', () => {
   assert.equal(resolveImageAssetFile('a..b/../c.png'), null);
 });
 
+test('stored attachment names cannot become traversal-like or unreadable', () => {
+  assert.equal(sanitizeStoredAttachmentName('../brief..final.pdf'), 'brief.final.pdf');
+  assert.equal(sanitizeStoredAttachmentName('C:\\private\\notes.txt'), 'notes.txt');
+  assert.equal(sanitizeStoredAttachmentName('...'), 'attachment');
+  assert.equal(sanitizeStoredAttachmentName('需求 文档.pdf'), '_.pdf');
+  assert.equal(sanitizeStoredAttachmentName('a'.repeat(240)).length, 180);
+  assert.equal(sanitizeStoredAttachmentName('safe..name.txt').includes('..'), false);
+});
+
 test('resolveAttachmentAssetFile uses the same direct-child boundary', () => {
   assert.equal(
     resolveAttachmentAssetFile('123-notes.txt'),
     path.join(path.resolve(ASSETS_DIR), '123-notes.txt'),
   );
   assert.equal(resolveAttachmentAssetFile('../notes.txt'), null);
+});
+
+test('canonical asset containment rejects an escaped or directory-root path', () => {
+  const assetsDirectory = path.join('/tmp', 'cloudcli-assets');
+  assert.equal(
+    isCanonicalAssetPathInside(assetsDirectory, path.join(assetsDirectory, 'image.png')),
+    true,
+  );
+  assert.equal(
+    isCanonicalAssetPathInside(assetsDirectory, path.join(assetsDirectory, '..', 'auth.db')),
+    false,
+  );
+  assert.equal(isCanonicalAssetPathInside(assetsDirectory, assetsDirectory), false);
 });

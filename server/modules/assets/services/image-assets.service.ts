@@ -42,6 +42,24 @@ export function isAllowedImageMimeType(mimeType: string): boolean {
   return ALLOWED_IMAGE_MIME_TYPES.has(mimeType);
 }
 
+/**
+ * Produces a short direct-child filename for the server-owned attachment
+ * store. Browsers may submit path-like names, control characters, very long
+ * names, or consecutive dots. The serving boundary deliberately rejects any
+ * filename containing `..`, so normalize that spelling before Multer writes
+ * the file; otherwise an otherwise valid upload could succeed but become
+ * impossible to read back.
+ */
+export function sanitizeStoredAttachmentName(originalName: string): string {
+  const leafName = path.posix.basename(String(originalName ?? '').replace(/\\/g, '/'));
+  const normalizedName = leafName
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .replace(/\.{2,}/g, '.')
+    .replace(/^\.+/, '')
+    .slice(0, 180);
+  return normalizedName || 'attachment';
+}
+
 /** Creates the global `~/.cloudcli/assets` folder if needed and returns it. */
 export async function ensureImageAssetsDir(): Promise<string> {
   const assetsDir = getGlobalImageAssetsDir();
@@ -103,6 +121,17 @@ export function resolveAttachmentAssetFile(filename: string): string | null {
 }
 
 /**
+ * Checks a canonical asset path against its canonical storage directory.
+ * Exported for the focused security tests; callers must pass paths already
+ * resolved with `realpath`, because lexical checks cannot detect symlink
+ * escapes.
+ */
+export function isCanonicalAssetPathInside(assetsDirectory: string, candidatePath: string): boolean {
+  const relative = path.relative(path.resolve(assetsDirectory), path.resolve(candidatePath));
+  return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+/**
  * Opens one stored chat asset for the assets route without exposing arbitrary
  * filesystem reads. The route translates the lookup status and streams the
  * returned direct-child file to the authenticated client.
@@ -113,15 +142,75 @@ export async function openStoredAttachmentAsset(filename: string) {
     return { status: 'invalid' as const };
   }
 
+  const assetsDir = path.resolve(getGlobalImageAssetsDir());
+  let canonicalAssetsDir: string;
+  let canonicalResolved: string;
   try {
-    await fs.access(resolved);
-  } catch {
-    return { status: 'missing' as const };
+    // Resolve both sides before opening the stream. A lexical filename check
+    // alone is insufficient when an attacker (or a broken deployment script)
+    // places a symlink inside the assets directory that points elsewhere.
+    canonicalAssetsDir = await fs.realpath(assetsDir);
+    canonicalResolved = await fs.realpath(resolved);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { status: 'missing' as const };
+    }
+    return { status: 'invalid' as const };
   }
 
-  return {
-    status: 'found' as const,
-    contentType: mime.lookup(resolved) || 'application/octet-stream',
-    stream: fsSync.createReadStream(resolved),
-  };
+  if (!isCanonicalAssetPathInside(canonicalAssetsDir, canonicalResolved)) {
+    return { status: 'invalid' as const };
+  }
+
+  let expectedStats;
+  try {
+    expectedStats = await fs.stat(canonicalResolved);
+    if (!expectedStats.isFile()) {
+      return { status: 'missing' as const };
+    }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { status: 'missing' as const };
+    }
+    return { status: 'invalid' as const };
+  }
+
+  // Open a descriptor and stream from that descriptor instead of reopening the
+  // checked pathname.  Between realpath/stat and createReadStream an attacker
+  // (or a cleanup job) could replace the direct child with a symlink to an
+  // arbitrary file.  O_NOFOLLOW blocks that replacement where the platform
+  // supports it; the inode/device comparison covers platforms without the
+  // flag and also detects a regular-file replacement race.
+  let fileHandle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    const noFollow = (fsSync.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+    fileHandle = await fs.open(canonicalResolved, fsSync.constants.O_RDONLY | noFollow);
+    const openedStats = await fileHandle.stat();
+    if (!openedStats.isFile()
+      || openedStats.dev !== expectedStats.dev
+      || openedStats.ino !== expectedStats.ino) {
+      await fileHandle.close();
+      fileHandle = null;
+      return { status: 'invalid' as const };
+    }
+
+    const stream = fileHandle.createReadStream();
+    // Ownership of the descriptor transfers to the stream.  `autoClose` is
+    // enabled by default, so the route does not need to know about the handle.
+    fileHandle = null;
+    return {
+      status: 'found' as const,
+      contentType: mime.lookup(canonicalResolved) || 'application/octet-stream',
+      stream,
+    };
+  } catch (error) {
+    await fileHandle?.close().catch(() => undefined);
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { status: 'missing' as const };
+    }
+    return { status: 'invalid' as const };
+  }
 }

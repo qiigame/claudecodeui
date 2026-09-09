@@ -47,6 +47,12 @@ type SidebarProjectItemProps = {
   onStartEditingSession: (projectId: string, sessionId: string, initialName: string) => void;
   onCancelEditingSession: () => void;
   onSaveEditingSession: (projectName: string, sessionId: string, summary: string, provider: LLMProvider) => void;
+  /** Whether project metadata controls may be rendered for this deployment. */
+  canMutateProjects?: boolean;
+  /** Whether session metadata controls may be rendered for this deployment. */
+  canWriteSessions?: boolean;
+  /** Whether session transcript files may be copied or removed in this deployment. */
+  canWriteSessionFiles?: boolean;
   t: TFunction;
 };
 
@@ -91,6 +97,9 @@ function SidebarProjectItem({
   onStartEditingSession,
   onCancelEditingSession,
   onSaveEditingSession,
+  canMutateProjects = false,
+  canWriteSessions = false,
+  canWriteSessionFiles = false,
   t,
 }: SidebarProjectItemProps) {
   // Project identity is tracked by the DB-assigned `projectId` everywhere
@@ -158,7 +167,7 @@ function SidebarProjectItem({
           >
             <div className="flex items-center justify-between">
               <div className="flex min-w-0 flex-1 items-center gap-3">
-                <button
+                {canMutateProjects && <button
                   className={cn(
                     'w-8 h-8 rounded-lg flex items-center justify-center active:scale-90 transition-all duration-150 border',
                     isStarred
@@ -179,10 +188,10 @@ function SidebarProjectItem({
                         : 'text-gray-600 dark:text-gray-400',
                     )}
                   />
-                </button>
+                </button>}
 
                 <div className="min-w-0 flex-1">
-                  {isEditing ? (
+                  {isEditing && canMutateProjects ? (
                     <input
                       ref={mobileRenameInputRef}
                       type="text"
@@ -227,7 +236,7 @@ function SidebarProjectItem({
               </div>
 
               <div className="flex items-center gap-1">
-                {isEditing ? (
+                {isEditing && canMutateProjects ? (
                   <>
                     <button
                       className="flex h-8 w-8 items-center justify-center rounded-lg bg-green-500 shadow-sm transition-all duration-150 active:scale-90 active:shadow-none dark:bg-green-600"
@@ -250,17 +259,19 @@ function SidebarProjectItem({
                   </>
                 ) : (
                   <>
-                    <button
-                      className="flex h-8 w-8 items-center justify-center rounded-lg border border-red-200 bg-red-500/10 active:scale-90 dark:border-red-800 dark:bg-red-900/30"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onDeleteProject(project);
-                      }}
-                    >
-                      <Trash2 className="h-4 w-4 text-red-600 dark:text-red-400" />
-                    </button>
+                    {canMutateProjects && (
+                      <button
+                        className="flex h-8 w-8 items-center justify-center rounded-lg border border-red-200 bg-red-500/10 active:scale-90 dark:border-red-800 dark:bg-red-900/30"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onDeleteProject(project);
+                        }}
+                      >
+                        <Trash2 className="h-4 w-4 text-red-600 dark:text-red-400" />
+                      </button>
+                    )}
 
-                    <button
+                    {canMutateProjects && <button
                       className="flex h-8 w-8 items-center justify-center rounded-lg border border-primary/20 bg-primary/10 active:scale-90 dark:border-primary/30 dark:bg-primary/20"
                       onClick={(event) => {
                         event.stopPropagation();
@@ -268,7 +279,7 @@ function SidebarProjectItem({
                       }}
                     >
                       <Edit3 className="h-4 w-4 text-primary" />
-                    </button>
+                    </button>}
 
                     <div className="flex h-6 w-6 items-center justify-center rounded-md bg-muted/30">
                       {isExpanded ? (
@@ -298,7 +309,7 @@ function SidebarProjectItem({
           onClick={selectAndToggleProject}
         >
           <div className="flex min-w-0 flex-1 items-center gap-3">
-            <div
+            {canMutateProjects && <div
               className={cn(
                 'w-6 h-6 flex items-center justify-center rounded cursor-pointer transition-all duration-200',
                 isStarred
@@ -319,9 +330,9 @@ function SidebarProjectItem({
                     : 'text-muted-foreground',
                 )}
               />
-            </div>
+            </div>}
             <div className="min-w-0 flex-1 text-left">
-              {isEditing ? (
+              {isEditing && canMutateProjects ? (
                 <div className="space-y-1">
                   <input
                     type="text"
@@ -363,7 +374,7 @@ function SidebarProjectItem({
           </div>
 
           <div className="flex flex-shrink-0 items-center gap-1">
-            {isEditing ? (
+            {isEditing && canMutateProjects ? (
               <>
                 <div
                   className="flex h-6 w-6 cursor-pointer items-center justify-center rounded text-green-600 transition-colors hover:bg-green-50 hover:text-green-700 dark:hover:bg-green-900/20"
@@ -386,7 +397,7 @@ function SidebarProjectItem({
               </>
             ) : (
               <>
-                <div
+                {canMutateProjects && <div
                   className="touch:opacity-100 flex h-6 w-6 cursor-pointer items-center justify-center rounded opacity-0 transition-all duration-200 hover:bg-accent group-hover:opacity-100"
                   onClick={(event) => {
                     event.stopPropagation();
@@ -395,8 +406,8 @@ function SidebarProjectItem({
                   title={t('tooltips.renameProject')}
                 >
                   <Edit3 className="h-3 w-3" />
-                </div>
-                <div
+                </div>}
+                {canMutateProjects && <div
                   className="touch:opacity-100 flex h-6 w-6 cursor-pointer items-center justify-center rounded opacity-0 transition-all duration-200 hover:bg-red-50 group-hover:opacity-100 dark:hover:bg-red-900/20"
                   onClick={(event) => {
                     event.stopPropagation();
@@ -405,7 +416,7 @@ function SidebarProjectItem({
                   title={t('tooltips.deleteProject')}
                 >
                   <Trash2 className="h-3 w-3 text-red-600 dark:text-red-400" />
-                </div>
+                </div>}
                 {isExpanded ? (
                   <ChevronDown className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-foreground" />
                 ) : (
@@ -441,6 +452,8 @@ function SidebarProjectItem({
         onForkSession={onForkSession}
         onLoadMoreSessions={onLoadMoreSessions}
         onNewSession={onNewSession}
+        canWriteSessions={canWriteSessions}
+        canWriteSessionFiles={canWriteSessionFiles}
         t={t}
       />
     </div>

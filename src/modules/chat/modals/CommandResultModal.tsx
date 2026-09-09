@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 
 import { Badge, Button, Dialog, DialogContent, DialogTitle, Input } from '@/shared/ui';
+import { comicRuntimeOnly } from '@/shared/utils';
 import type {
   LLMProvider,
   ProviderModelActions,
@@ -34,6 +35,11 @@ type CommandResultModalProps = {
   activeProvider: LLMProvider;
   activeProviderModel: string;
   currentSessionId: string | null;
+  canManageSettings?: boolean;
+  /** Server-authorized provider catalog mutation capability. */
+  canManageProviderModels?: boolean;
+  /** Product/QA deployments do not expose command-driven model management. */
+  readOnly?: boolean;
   onSelectProviderModel: (
     provider: LLMProvider,
     model: string,
@@ -138,11 +144,21 @@ function SearchField({
   );
 }
 
-function HelpContent({ data }: { data: HelpCommandData }) {
+function HelpContent({
+  data,
+  canManageSettings,
+}: {
+  data: HelpCommandData;
+  canManageSettings: boolean;
+}) {
   const [query, setQuery] = useState('');
-  const commands = (Array.isArray(data.commands) && data.commands.length > 0
+  const availableCommands = (Array.isArray(data.commands) && data.commands.length > 0
     ? data.commands
     : FALLBACK_COMMANDS) as CommandEntry[];
+  const commands = availableCommands.filter((command) => (
+    (!comicRuntimeOnly || command.name !== '/models')
+    && (canManageSettings || command.name !== '/config')
+  ));
 
   const filteredCommands = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -228,6 +244,9 @@ function ModelsContent({
   activeProviderModel,
   currentSessionId,
   onSelectProviderModel,
+  // Model selection may persist provider/session configuration. Fail closed
+  // when this modal is mounted without the server-authorized capability.
+  canManageProviderModels = false,
 }: {
   data: ModelCommandData;
   providerModelCatalog: Partial<Record<LLMProvider, ProviderModelsDefinition>>;
@@ -236,6 +255,7 @@ function ModelsContent({
   activeProviderModel: string;
   currentSessionId: string | null;
   onSelectProviderModel: CommandResultModalProps['onSelectProviderModel'];
+  canManageProviderModels?: boolean;
 }) {
   const [query, setQuery] = useState('');
   const [changingModel, setChangingModel] = useState<string | null>(null);
@@ -276,6 +296,9 @@ function ModelsContent({
   const showSearch = availableOptions.length > 6;
 
   const handleSelectModel = async (model: string) => {
+    if (!canManageProviderModels) {
+      return;
+    }
     setChangingModel(model);
     try {
       const result = await onSelectProviderModel(currentProvider, model, currentSessionId);
@@ -295,7 +318,7 @@ function ModelsContent({
     }
   };
 
-  if (managingModels) {
+  if (managingModels && canManageProviderModels) {
     return (
       <ModelLibraryPanel
         initialProvider={currentProvider}
@@ -322,16 +345,18 @@ function ModelsContent({
             )}
           </p>
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => setManagingModels(true)}
-          className="h-9 shrink-0 rounded-xl bg-background px-3 text-xs"
-        >
-          <Plus className="h-3.5 w-3.5" />
-          Manage models
-        </Button>
+        {canManageProviderModels && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setManagingModels(true)}
+            className="h-9 shrink-0 rounded-xl bg-background px-3 text-xs"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            Manage models
+          </Button>
+        )}
       </div>
 
       {showSearch && (
@@ -350,7 +375,7 @@ function ModelsContent({
                   key={option.value}
                   type="button"
                   onClick={() => handleSelectModel(option.value)}
-                  disabled={Boolean(changingModel)}
+                  disabled={!canManageProviderModels || Boolean(changingModel)}
                   aria-label={`Select model ${option.value}`}
                   className={`settings-content-enter group flex min-h-16 flex-col rounded-2xl border p-3 text-left shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:opacity-60 ${
                     isCurrent
@@ -474,15 +499,17 @@ function CostContent({ data }: { data: CostCommandData }) {
       </div>
 
       <div className="rounded-2xl border border-border/70 bg-muted/20 p-4">
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className={`grid gap-3 ${comicRuntimeOnly ? '' : 'sm:grid-cols-2'}`}>
           <div>
             <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Provider</p>
             <p className="mt-1 text-sm font-semibold text-foreground">{provider}</p>
           </div>
-          <div>
-            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Model</p>
-            <p className="mt-1 break-all font-mono text-sm text-foreground">{model}</p>
-          </div>
+          {!comicRuntimeOnly && (
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Model</p>
+              <p className="mt-1 break-all font-mono text-sm text-foreground">{model}</p>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -496,7 +523,7 @@ function StatusContent({ data }: { data: StatusCommandData }) {
     { label: 'Version', value: data.version || 'Unknown', icon: BadgeCheck, tone: 'success' as const },
     { label: 'Uptime', value: data.uptime || 'Unknown', icon: Timer },
     { label: 'Provider', value: getProviderLabel(data.provider, data.provider || 'Unknown'), icon: Server, tone: 'primary' as const },
-    { label: 'Model', value: data.model || 'Unknown', icon: Cpu },
+    ...(!comicRuntimeOnly ? [{ label: 'Model', value: data.model || 'Unknown', icon: Cpu }] : []),
     { label: 'Node.js', value: data.nodeVersion || 'Unknown', icon: TerminalSquare },
     { label: 'Platform', value: data.platform || 'Unknown', icon: Activity },
     { label: 'Memory', value: typeof memoryRssMb === 'number' ? `${memoryRssMb} MB RSS` : 'Unknown', icon: Gauge },
@@ -539,10 +566,16 @@ function CommandResultModal({
   activeProvider,
   activeProviderModel,
   currentSessionId,
+  canManageSettings = false,
+  canManageProviderModels = false,
+  readOnly = false,
   onSelectProviderModel,
 }: CommandResultModalProps) {
-  const isOpen = Boolean(payload);
-  const kind = payload?.kind;
+  // A stale or forged `/models` result must not reopen the hidden model library
+  // in a Runtime-only/read-only build.
+  const visiblePayload = (comicRuntimeOnly || readOnly) && payload?.kind === 'models' ? null : payload;
+  const isOpen = Boolean(visiblePayload);
+  const kind = visiblePayload?.kind;
   const isModelsModal = kind === 'models';
 
   const modalMeta = {
@@ -619,20 +652,26 @@ function CommandResultModal({
         </div>
 
         <div className="settings-content-enter min-h-0 flex-1 overflow-hidden px-4 py-4 sm:px-6 sm:py-5">
-          {payload?.kind === 'help' && <HelpContent data={payload.data as HelpCommandData} />}
-          {payload?.kind === 'models' && (
+          {visiblePayload?.kind === 'help' && (
+            <HelpContent
+              data={visiblePayload.data as HelpCommandData}
+              canManageSettings={canManageSettings}
+            />
+          )}
+          {visiblePayload?.kind === 'models' && (
             <ModelsContent
-              data={payload.data as ModelCommandData}
+              data={visiblePayload.data as ModelCommandData}
               providerModelCatalog={providerModelCatalog}
               providerModelActions={providerModelActions}
               activeProvider={activeProvider}
               activeProviderModel={activeProviderModel}
               currentSessionId={currentSessionId}
+              canManageProviderModels={canManageProviderModels}
               onSelectProviderModel={onSelectProviderModel}
             />
           )}
-          {payload?.kind === 'cost' && <CostContent data={payload.data as CostCommandData} />}
-          {payload?.kind === 'status' && <StatusContent data={payload.data as StatusCommandData} />}
+          {visiblePayload?.kind === 'cost' && <CostContent data={visiblePayload.data as CostCommandData} />}
+          {visiblePayload?.kind === 'status' && <StatusContent data={visiblePayload.data as StatusCommandData} />}
         </div>
 
         <div className="flex shrink-0 flex-col gap-3 border-t border-border/70 bg-muted/20 px-4 py-3 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between sm:px-6">

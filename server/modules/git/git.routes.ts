@@ -1,10 +1,16 @@
 // @ts-nocheck -- temporary while Git workflows are extracted into the injected service.
 import path from 'path';
 
-import express from 'express';
+import express, { type RequestHandler } from 'express';
 
+import { executionAttributionService } from '@/modules/collaboration/index.js';
+import {
+  createDeploymentPolicyGuard,
+  DEPLOYMENT_CAPABILITIES,
+  parseDeploymentPolicy,
+} from '@/modules/deployment-policy/index.js';
 import type { ProviderRunFunction } from '@/shared/types.js';
-import { AppError } from '@/shared/utils.js';
+import { AppError, readAuthenticatedHttpUserId } from '@/shared/utils.js';
 
 // cross-spawn: drop-in spawn with Windows .cmd/PATHEXT resolution.
 import { parseGitLogWithStats, parseGitStatusOutput } from './git-parsing.service.js';
@@ -14,9 +20,41 @@ type GitRouterDependencies = {
   fileSystem: typeof import('node:fs/promises');
   spawnProcess: typeof import('cross-spawn').default;
   resolveProjectPathById(projectId: string): string | null;
+  isProtectedBaselinePath(projectPath: string): boolean;
+  /** Optional deployment capability resolver supplied by the composition root. */
+  capabilityGuard?: (operation: string) => RequestHandler;
   queryClaude: ProviderRunFunction;
   queryCursor: ProviderRunFunction;
 };
+
+/**
+ * Return the least-privilege capabilities for a Git request.
+ *
+ * `fetch` updates remote-tracking refs but does not change the checked-out
+ * worktree, so it has its own capability. `pull` performs both a fetch and a
+ * merge/rebase and therefore requires both capabilities. All other POST
+ * endpoints can alter the index, worktree, refs, or invoke a commit helper and
+ * require the broader `git.write` capability.
+ */
+export function requiredCapabilitiesForGitRequest(request: { method: string; path: string }): string[] {
+  const method = request.method.toUpperCase();
+  // OPTIONS is a transport preflight and must remain unauthorised so browser
+  // CORS negotiation works even when a deployment disables Git reads. GET and
+  // HEAD, however, expose repository state and therefore require git.read.
+  if (method === 'GET' || method === 'HEAD') {
+    return [DEPLOYMENT_CAPABILITIES.GIT_READ];
+  }
+  if (method !== 'POST') return [];
+  const routePath = request.path.replace(/\/+$/, '').toLowerCase() || '/';
+  if (routePath === '/fetch') return [DEPLOYMENT_CAPABILITIES.GIT_FETCH];
+  if (routePath === '/pull') {
+    return [
+      DEPLOYMENT_CAPABILITIES.GIT_FETCH,
+      DEPLOYMENT_CAPABILITIES.GIT_WRITE,
+    ];
+  }
+  return [DEPLOYMENT_CAPABILITIES.GIT_WRITE];
+}
 
 /** Creates Git routes around explicit repository, filesystem, subprocess, and AI adapters. */
 export function createGitRouter(dependencies: GitRouterDependencies): express.Router {
@@ -27,6 +65,51 @@ const queryClaudeSDK = dependencies.queryClaude;
 const spawnCursor = dependencies.queryCursor;
 const router = express.Router();
 const COMMIT_DIFF_CHARACTER_LIMIT = 500_000;
+
+// Keep alternate/standalone mounts subject to the same trusted deployment
+// policy as the production composition root.  A missing adapter must not turn
+// Git POST endpoints into an unguarded write surface; the policy is captured
+// once when the router is built so later environment changes cannot reopen it.
+const effectiveCapabilityGuard = dependencies.capabilityGuard ?? (() => {
+  const fallbackPolicy = parseDeploymentPolicy();
+  return (operation: string) => createDeploymentPolicyGuard({
+    policy: fallbackPolicy,
+    capability: operation,
+  });
+})();
+
+/**
+ * Enforce the deployment boundary before any Git handler runs. Guards are
+ * applied serially so a denied first capability prevents the second capability
+ * and the handler from running.
+ */
+router.use((req, res, next) => {
+  const requiredCapabilities = requiredCapabilitiesForGitRequest(req);
+  if (requiredCapabilities.length === 0) {
+    next();
+    return;
+  }
+  let capabilityIndex = 0;
+
+  const applyNextCapability = (error?) => {
+    if (error) {
+      next(error);
+      return;
+    }
+    const operation = requiredCapabilities[capabilityIndex++];
+    if (!operation) {
+      next();
+      return;
+    }
+    try {
+      effectiveCapabilityGuard(operation)(req, res, applyNextCapability);
+    } catch (guardError) {
+      next(guardError);
+    }
+  };
+
+  applyNextCapability();
+});
 
 function spawnAsync(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -81,16 +164,19 @@ function validateBranchName(branch) {
   return branch;
 }
 
-function validateFilePath(file, projectPath) {
+function validateFilePath(file, projectPath, repositoryRootPath = projectPath) {
   if (!file || file.includes('\0')) {
     throw new Error('Invalid file path');
   }
   // Prevent path traversal: resolve the file relative to the project root
-  // and ensure the result stays within the project directory
-  if (projectPath) {
+  // and ensure the result stays within the repository directory. Git status
+  // from a nested checkout can legitimately return paths such as
+  // `../README.md`; checking against the repository root preserves that
+  // behavior while still rejecting escapes above the repository.
+  if (projectPath && repositoryRootPath) {
     const resolved = path.resolve(projectPath, file);
-    const normalizedRoot = path.resolve(projectPath) + path.sep;
-    if (!resolved.startsWith(normalizedRoot) && resolved !== path.resolve(projectPath)) {
+    const normalizedRoot = path.resolve(repositoryRootPath);
+    if (resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}${path.sep}`)) {
       throw new Error('Invalid file path: path traversal detected');
     }
   }
@@ -136,6 +222,76 @@ async function getActualProjectPath(projectId) {
   }
   return validateProjectPath(projectPath);
 }
+
+const BASELINE_MUTATION_ROUTES = new Set([
+  '/init',
+  '/initial-commit',
+  '/commit',
+  '/stage',
+  '/unstage',
+  '/revert-local-commit',
+  '/checkout',
+  '/create-branch',
+  '/delete-branch',
+  '/pull',
+  '/push',
+  '/publish',
+  '/discard',
+  '/delete-untracked',
+]);
+
+/**
+ * Express route matching is case-insensitive and accepts a trailing slash by
+ * default.  Keep the protected-baseline lookup on the same canonical route
+ * form; otherwise `/COMMIT` or `/commit/` reaches the mutation handler while
+ * skipping the baseline guard.  `req.path` is already separated from the
+ * query string, so no query data can influence this security decision.
+ */
+function canonicalMutationRoute(routePath) {
+  const normalized = String(routePath ?? '').trim().toLowerCase();
+  if (!normalized || normalized === '/') return '/';
+  return `/${normalized.replace(/^\/+/u, '').replace(/\/+$/u, '')}`;
+}
+
+// Configured source checkouts are stable baselines. All write operations run
+// against hidden session projects instead; fetch remains read-only with
+// respect to their working trees and is intentionally allowed.
+router.use(async (req, res, next) => {
+  if (req.method.toUpperCase() !== 'POST'
+    || !BASELINE_MUTATION_ROUTES.has(canonicalMutationRoute(req.path))) {
+    next();
+    return;
+  }
+  // Project ids are persisted as text, but older clients (and hand-written
+  // requests) can send a numeric JSON value.  Do not skip the baseline check
+  // merely because the transport representation is not a string: doing so
+  // would let a numeric id reach a mutation handler without checking whether
+  // it resolves to a protected source checkout.
+  const rawProjectId = req.body?.project;
+  const projectId = typeof rawProjectId === 'string'
+    ? rawProjectId.trim()
+    : typeof rawProjectId === 'number' && Number.isFinite(rawProjectId)
+      ? String(rawProjectId)
+      : '';
+  if (!projectId) {
+    next();
+    return;
+  }
+  try {
+    const projectPath = await getActualProjectPath(projectId);
+    if (dependencies.isProtectedBaselinePath(projectPath)) {
+      res.status(409).json({
+        error: 'Baseline workspace is read-only',
+        code: 'SESSION_WORKSPACE_BASELINE_MUTATION_DISABLED',
+        details: 'Create or open a session workspace before changing Git state.',
+      });
+      return;
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 // Helper function to strip git diff headers
 function stripDiffHeaders(diff) {
@@ -209,6 +365,81 @@ async function validateGitRepository(projectPath) {
 
 function getGitErrorDetails(error) {
   return `${error?.message || ''} ${error?.stderr || ''} ${error?.stdout || ''}`;
+}
+
+/**
+ * Converts subprocess/filesystem failures into a safe HTTP diagnostic. Git's
+ * raw error text commonly contains absolute repository paths, remote URLs,
+ * command arguments, and sometimes credential-bearing transport details. Keep
+ * those details in server logs only; callers receive a stable, actionable
+ * category instead.
+ */
+function publicGitError(error, fallback = 'Git operation failed') {
+  const rawDetails = getGitErrorDetails(error);
+  const details = rawDetails.toLowerCase();
+
+  // These are the only AppError values produced by this module.  Return
+  // fixed text by code rather than trusting an arbitrary message supplied by
+  // an injected adapter (which could contain a path, URL, or secret).
+  if (error instanceof AppError) {
+    switch (error.code) {
+      case 'NOT_A_GIT_REPOSITORY':
+        return 'Not a git repository';
+      case 'PATH_OUTSIDE_CANONICAL_ROOT':
+        return 'File path resolves outside the repository.';
+      case 'PROJECT_NOT_FOUND':
+        return 'Repository path is no longer available.';
+      case 'GIT_CURRENT_BRANCH_DELETE':
+        return 'Cannot delete the currently checked-out branch';
+      default:
+        break;
+    }
+  }
+
+  // Preserve actionable input-validation diagnostics, but only as fixed
+  // allow-listed strings.  Never echo the original message itself.
+  if (details.includes('path traversal detected')) return 'Invalid file path: path traversal detected';
+  if (details.includes('invalid commit reference')) return 'Invalid commit reference';
+  if (details.includes('invalid branch name')) return 'Invalid branch name';
+  if (details.includes('invalid remote name')) return 'Invalid remote name';
+  if (details.includes('invalid project path')) return 'Invalid project path';
+  if (details.includes('invalid file path')) return 'Invalid file path';
+  if (details.includes('outside the repository')) return 'File path resolves outside the repository.';
+  if (details.includes('cannot show diff for directories')) return 'Cannot show diff for directories';
+  if (details.includes('not a git repository')) return 'Not a git repository';
+  if (details.includes('permission denied') || details.includes('eacces')) {
+    return 'Permission denied while accessing the repository.';
+  }
+  if (details.includes('enoent') || details.includes('no such file or directory')) {
+    return 'Repository path is not available.';
+  }
+  if (details.includes('could not resolve hostname') || details.includes('network is unreachable')) {
+    return 'Unable to connect to the remote repository.';
+  }
+  return fallback;
+}
+
+function publicRemoteFailureDetails(error, fallback = 'The Git operation could not be completed.') {
+  const details = getGitErrorDetails(error).toLowerCase();
+  if (details.includes('could not resolve hostname') || details.includes('network is unreachable')) {
+    return 'Unable to connect to the remote repository. Check the deployment network.';
+  }
+  if (details.includes('does not appear to be a git repository')) {
+    return 'No remote repository is configured for this project.';
+  }
+  if (details.includes('permission denied') || details.includes('authentication failed') || details.includes('access denied')) {
+    return 'Remote authentication failed. Check the repository credentials.';
+  }
+  if (details.includes('no upstream branch')) {
+    return 'No upstream branch is configured for the current branch.';
+  }
+  if (details.includes('non-fast-forward') || details.includes('rejected')) {
+    return 'The remote rejected this update because it is not a fast-forward.';
+  }
+  // Reuse the local Git allow-list for validation/path failures, while still
+  // keeping arbitrary subprocess diagnostics out of the response.
+  const safeGitMessage = publicGitError(error, '');
+  return safeGitMessage || fallback;
 }
 
 function isMissingHeadRevisionError(error) {
@@ -289,18 +520,125 @@ function buildFilePathCandidates(projectPath, repositoryRootPath, filePath) {
   return Array.from(new Set(candidates.filter(Boolean)));
 }
 
-async function resolveRepositoryFilePath(projectPath, filePath) {
-  validateFilePath(filePath);
+function isPathInsideOrEqual(parentPath, candidatePath) {
+  const relativePath = path.relative(path.resolve(parentPath), path.resolve(candidatePath));
+  return relativePath === ''
+    || (!relativePath.startsWith(`..${path.sep}`)
+      && relativePath !== '..'
+      && !path.isAbsolute(relativePath));
+}
 
+function canonicalPathBoundaryError() {
+  return new AppError('File path resolves outside the repository.', {
+    code: 'PATH_OUTSIDE_CANONICAL_ROOT',
+    statusCode: 403,
+  });
+}
+
+/**
+ * Canonicalizes a repository-relative path before any filesystem operation.
+ *
+ * `validateFilePath` protects against lexical `..` traversal, but that is not
+ * enough for a checked-out symlink (`docs/current -> /etc`, for example).
+ * Resolve both the repository root and the selected path and compare their
+ * canonical locations.  The canonical path is returned to callers so a
+ * successful check is not immediately undone by reopening the original
+ * symlink path.  Missing files are retained lexically, but every existing
+ * ancestor is inspected for symlinks; this keeps an untracked/new-file path
+ * from bypassing the boundary through a dangling link.
+ *
+ * The injected filesystem adapter is intentionally optional for legacy route
+ * tests that only exercise Git subprocess behavior. Production always uses
+ * Node's fs/promises adapter, which provides `realpath` and `lstat`.
+ */
+async function resolveCanonicalRepositoryFilePath(fileSystem, repositoryRootPath, repositoryRelativeFilePath) {
+  const lexicalRoot = path.resolve(repositoryRootPath);
+  const lexicalPath = path.resolve(lexicalRoot, repositoryRelativeFilePath);
+  if (!isPathInsideOrEqual(lexicalRoot, lexicalPath)) {
+    throw canonicalPathBoundaryError();
+  }
+
+  if (typeof fileSystem.realpath !== 'function') {
+    // Lightweight test adapters from older integrations do not expose
+    // realpath. They cannot represent a production filesystem and therefore
+    // retain the already-enforced lexical check only.
+    return { filePath: lexicalPath, canonicalRootPath: lexicalRoot };
+  }
+
+  let canonicalRootPath;
+  try {
+    canonicalRootPath = path.resolve(await fileSystem.realpath(lexicalRoot));
+  } catch (error) {
+    const code = error?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      throw new AppError('Repository path is no longer available.', {
+        code: 'PROJECT_NOT_FOUND',
+        statusCode: 404,
+      });
+    }
+    throw error;
+  }
+
+  let canonicalFilePath;
+  try {
+    canonicalFilePath = path.resolve(await fileSystem.realpath(lexicalPath));
+  } catch (error) {
+    const code = error?.code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+      throw error;
+    }
+
+    // A missing target is normal for a newly-created/untracked path. Walk
+    // existing ancestors and reject any symlink encountered on that route;
+    // otherwise a dangling intermediate/final link could become an escape
+    // after a later filesystem mutation.
+    if (typeof fileSystem.lstat === 'function') {
+      let cursor = lexicalPath;
+      while (isPathInsideOrEqual(lexicalRoot, cursor) && cursor !== lexicalRoot) {
+        try {
+          const stats = await fileSystem.lstat(cursor);
+          if (stats.isSymbolicLink()) {
+            throw canonicalPathBoundaryError();
+          }
+        } catch (lstatError) {
+          if (lstatError instanceof AppError) throw lstatError;
+          const lstatCode = lstatError?.code;
+          if (lstatCode !== 'ENOENT' && lstatCode !== 'ENOTDIR') {
+            throw lstatError;
+          }
+        }
+        cursor = path.dirname(cursor);
+      }
+    }
+
+    const relativePath = path.relative(lexicalRoot, lexicalPath);
+    canonicalFilePath = path.resolve(canonicalRootPath, relativePath);
+  }
+
+  if (!isPathInsideOrEqual(canonicalRootPath, canonicalFilePath)) {
+    throw canonicalPathBoundaryError();
+  }
+
+  return { filePath: canonicalFilePath, canonicalRootPath };
+}
+
+async function resolveRepositoryFilePath(fileSystem, projectPath, filePath) {
   const repositoryRootPath = await getRepositoryRootPath(projectPath);
+  // Every caller eventually feeds this path into either a Git pathspec or a
+  // filesystem read. Keep the resolved repository root in the validation call;
+  // omitting it silently disabled the lexical `..` containment check and let an
+  // untracked path escape through `path.join(repositoryRootPath, ...)`.
+  validateFilePath(filePath, projectPath, repositoryRootPath);
   const candidateFilePaths = buildFilePathCandidates(projectPath, repositoryRootPath, filePath);
 
   for (const candidateFilePath of candidateFilePaths) {
     const { stdout } = await spawnAsync('git', ['status', '--porcelain', '--', candidateFilePath], { cwd: repositoryRootPath });
     if (stdout.trim()) {
+      const canonical = await resolveCanonicalRepositoryFilePath(fileSystem, repositoryRootPath, candidateFilePath);
       return {
         repositoryRootPath,
         repositoryRelativeFilePath: candidateFilePath,
+        filesystemPath: canonical.filePath,
       };
     }
   }
@@ -315,16 +653,20 @@ async function resolveRepositoryFilePath(projectPath, filePath) {
     );
 
     if (suffixMatches.length === 1) {
+      const canonical = await resolveCanonicalRepositoryFilePath(fileSystem, repositoryRootPath, suffixMatches[0]);
       return {
         repositoryRootPath,
         repositoryRelativeFilePath: suffixMatches[0],
+        filesystemPath: canonical.filePath,
       };
     }
   }
 
+  const canonical = await resolveCanonicalRepositoryFilePath(fileSystem, repositoryRootPath, candidateFilePaths[0]);
   return {
     repositoryRootPath,
     repositoryRelativeFilePath: candidateFilePaths[0],
+    filesystemPath: canonical.filePath,
   };
 }
 
@@ -367,7 +709,7 @@ router.get('/status', async (req, res) => {
     }
     res.json({
       error: isNotGitRepository ? 'Not a git repository' : 'Git operation failed',
-      details: isNotGitRepository ? error.message : `Failed to get git status: ${error.message}`,
+      details: publicGitError(error, 'Failed to get Git status.'),
       notGitRepository: isNotGitRepository
     });
   }
@@ -403,7 +745,7 @@ router.post('/init', async (req, res) => {
     res.json({ success: true, output: stdout.trim() || stderr.trim() });
   } catch (error) {
     console.error('Git init error:', error);
-    res.json({ success: false, error: error.stderr?.trim() || error.message });
+    res.json({ success: false, error: publicGitError(error, 'Git initialization failed.') });
   }
 });
 
@@ -424,7 +766,8 @@ router.get('/diff', async (req, res) => {
     const {
       repositoryRootPath,
       repositoryRelativeFilePath,
-    } = await resolveRepositoryFilePath(projectPath, file);
+      filesystemPath,
+    } = await resolveRepositoryFilePath(fs, projectPath, file);
 
     // Check if file is untracked or deleted
     const { stdout: statusOutput } = await spawnAsync(
@@ -438,7 +781,7 @@ router.get('/diff', async (req, res) => {
     let diff;
     if (isUntracked) {
       // For untracked files, show the entire file content as additions
-      const filePath = path.join(repositoryRootPath, repositoryRelativeFilePath);
+      const filePath = filesystemPath;
       const stats = await fs.stat(filePath);
 
       if (stats.isDirectory()) {
@@ -486,7 +829,7 @@ router.get('/diff', async (req, res) => {
     res.json({ diff });
   } catch (error) {
     console.error('Git diff error:', error);
-    res.json({ error: error.message });
+    res.json({ error: publicGitError(error, 'Unable to read the Git diff.') });
   }
 });
 
@@ -507,7 +850,8 @@ router.get('/file-with-diff', async (req, res) => {
     const {
       repositoryRootPath,
       repositoryRelativeFilePath,
-    } = await resolveRepositoryFilePath(projectPath, file);
+      filesystemPath,
+    } = await resolveRepositoryFilePath(fs, projectPath, file);
 
     // Check file status
     const { stdout: statusOutput } = await spawnAsync(
@@ -532,7 +876,7 @@ router.get('/file-with-diff', async (req, res) => {
       currentContent = headContent; // Show the deleted content in editor
     } else {
       // Get current file content
-      const filePath = path.join(repositoryRootPath, repositoryRelativeFilePath);
+      const filePath = filesystemPath;
       const stats = await fs.stat(filePath);
 
       if (stats.isDirectory()) {
@@ -566,7 +910,7 @@ router.get('/file-with-diff', async (req, res) => {
     });
   } catch (error) {
     console.error('Git file-with-diff error:', error);
-    res.json({ error: error.message });
+    res.json({ error: publicGitError(error, 'Unable to read the file and Git diff.') });
   }
 });
 
@@ -595,8 +939,26 @@ router.post('/initial-commit', async (req, res) => {
     // Add all files
     await spawnAsync('git', ['add', '.'], { cwd: projectPath });
 
-    // Create initial commit
-    const { stdout } = await spawnAsync('git', ['commit', '-m', 'Initial commit'], { cwd: projectPath });
+    const execution = executionAttributionService.beginExecution({
+      userId: readAuthenticatedHttpUserId(req),
+      sessionId: null,
+      provider: 'cloudcli-git-ui',
+      projectPath,
+    });
+    let commitSucceeded = false;
+    let stdout;
+    try {
+      ({ stdout } = await spawnAsync('git', ['commit', '-m', 'Initial commit'], {
+        cwd: projectPath,
+        env: { ...process.env, ...execution.environment },
+      }));
+      commitSucceeded = true;
+    } finally {
+      executionAttributionService.completeExecution(
+        execution.runId,
+        commitSucceeded ? 'succeeded' : 'failed',
+      );
+    }
 
     res.json({ success: true, output: stdout, message: 'Initial commit created successfully' });
   } catch (error) {
@@ -610,7 +972,7 @@ router.post('/initial-commit', async (req, res) => {
       });
     }
 
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Git initial commit failed.') });
   }
 });
 
@@ -631,17 +993,35 @@ router.post('/commit', async (req, res) => {
     
     // Stage selected files
     for (const file of files) {
-      const { repositoryRelativeFilePath } = await resolveRepositoryFilePath(projectPath, file);
+      const { repositoryRelativeFilePath } = await resolveRepositoryFilePath(fs, projectPath, file);
       await spawnAsync('git', ['add', '--', repositoryRelativeFilePath], { cwd: repositoryRootPath });
     }
 
-    // Commit with message
-    const { stdout } = await spawnAsync('git', ['commit', '-m', message], { cwd: repositoryRootPath });
+    const execution = executionAttributionService.beginExecution({
+      userId: readAuthenticatedHttpUserId(req),
+      sessionId: null,
+      provider: 'cloudcli-git-ui',
+      projectPath: repositoryRootPath,
+    });
+    let commitSucceeded = false;
+    let stdout;
+    try {
+      ({ stdout } = await spawnAsync('git', ['commit', '-m', message], {
+        cwd: repositoryRootPath,
+        env: { ...process.env, ...execution.environment },
+      }));
+      commitSucceeded = true;
+    } finally {
+      executionAttributionService.completeExecution(
+        execution.runId,
+        commitSucceeded ? 'succeeded' : 'failed',
+      );
+    }
     
     res.json({ success: true, output: stdout });
   } catch (error) {
     console.error('Git commit error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Git commit failed.') });
   }
 });
 
@@ -660,14 +1040,14 @@ router.post('/stage', async (req, res) => {
     const repositoryRootPath = await getRepositoryRootPath(projectPath);
 
     for (const file of files) {
-      const { repositoryRelativeFilePath } = await resolveRepositoryFilePath(projectPath, file);
+      const { repositoryRelativeFilePath } = await resolveRepositoryFilePath(fs, projectPath, file);
       await spawnAsync('git', ['add', '--', repositoryRelativeFilePath], { cwd: repositoryRootPath });
     }
 
     res.json({ success: true });
   } catch (error) {
     console.error('Git stage error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Git staging failed.') });
   }
 });
 
@@ -686,7 +1066,7 @@ router.post('/unstage', async (req, res) => {
     const hasCommits = await repositoryHasCommits(projectPath);
 
     for (const file of files) {
-      const { repositoryRelativeFilePath } = await resolveRepositoryFilePath(projectPath, file);
+      const { repositoryRelativeFilePath } = await resolveRepositoryFilePath(fs, projectPath, file);
       if (hasCommits) {
         await spawnAsync('git', ['reset', 'HEAD', '--', repositoryRelativeFilePath], { cwd: repositoryRootPath });
       } else {
@@ -699,7 +1079,7 @@ router.post('/unstage', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Git unstage error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Git unstaging failed.') });
   }
 });
 
@@ -746,7 +1126,7 @@ router.post('/revert-local-commit', async (req, res) => {
     });
   } catch (error) {
     console.error('Git revert local commit error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Git revert failed.') });
   }
 });
 
@@ -790,7 +1170,7 @@ router.get('/branches', async (req, res) => {
     res.json({ branches, localBranches, remoteBranches });
   } catch (error) {
     console.error('Git branches error:', error);
-    res.json({ error: error.message });
+    res.json({ error: publicGitError(error, 'Unable to list Git branches.') });
   }
 });
 
@@ -812,7 +1192,7 @@ router.post('/checkout', async (req, res) => {
     res.json({ success: true, output: stdout });
   } catch (error) {
     console.error('Git checkout error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Git checkout failed.') });
   }
 });
 
@@ -834,7 +1214,7 @@ router.post('/create-branch', async (req, res) => {
     res.json({ success: true, output: stdout });
   } catch (error) {
     console.error('Git create branch error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Git branch creation failed.') });
   }
 });
 
@@ -864,9 +1244,9 @@ router.post('/delete-branch', async (req, res) => {
   } catch (error) {
     console.error('Git delete branch error:', error);
     if (error instanceof AppError) {
-      return res.status(error.statusCode).json({ error: error.message });
+      return res.status(error.statusCode).json({ error: publicGitError(error) });
     }
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Git branch deletion failed.') });
   }
 });
 
@@ -913,7 +1293,7 @@ router.get('/commits', async (req, res) => {
     res.json({ commits: parseGitLogWithStats(stdout) });
   } catch (error) {
     console.error('Git commits error:', error);
-    res.json({ error: error.message });
+    res.json({ error: publicGitError(error, 'Unable to list Git commits.') });
   }
 });
 
@@ -945,7 +1325,7 @@ router.get('/commit-diff', async (req, res) => {
     res.json({ diff, isTruncated });
   } catch (error) {
     console.error('Git commit diff error:', error);
-    res.json({ error: error.message });
+    res.json({ error: publicGitError(error, 'Unable to read the Git commit diff.') });
   }
 });
 
@@ -971,7 +1351,7 @@ router.post('/generate-commit-message', async (req, res) => {
     let diffContext = '';
     for (const file of files) {
       try {
-        const { repositoryRelativeFilePath } = await resolveRepositoryFilePath(projectPath, file);
+        const { repositoryRelativeFilePath } = await resolveRepositoryFilePath(fs, projectPath, file);
         const { stdout } = await spawnAsync(
           'git', ['diff', 'HEAD', '--', repositoryRelativeFilePath],
           { cwd: repositoryRootPath }
@@ -989,8 +1369,8 @@ router.post('/generate-commit-message', async (req, res) => {
       // Try to get content of untracked files
       for (const file of files) {
         try {
-          const { repositoryRelativeFilePath } = await resolveRepositoryFilePath(projectPath, file);
-          const filePath = path.join(repositoryRootPath, repositoryRelativeFilePath);
+          const { repositoryRelativeFilePath, filesystemPath } = await resolveRepositoryFilePath(fs, projectPath, file);
+          const filePath = filesystemPath;
           const stats = await fs.stat(filePath);
 
           if (!stats.isDirectory()) {
@@ -1011,7 +1391,7 @@ router.post('/generate-commit-message', async (req, res) => {
     res.json({ message });
   } catch (error) {
     console.error('Generate commit message error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Unable to generate a commit message.') });
   }
 });
 
@@ -1228,7 +1608,7 @@ router.get('/remote-status', async (req, res) => {
     });
   } catch (error) {
     console.error('Git remote status error:', error);
-    res.json({ error: error.message });
+    res.json({ error: publicRemoteFailureDetails(error, 'Unable to read remote status.') });
   }
 });
 
@@ -1262,13 +1642,12 @@ router.post('/fetch', async (req, res) => {
     res.json({ success: true, output: stdout || 'Fetch completed successfully', remoteName });
   } catch (error) {
     console.error('Git fetch error:', error);
-    res.status(500).json({ 
-      error: 'Fetch failed', 
-      details: error.message.includes('Could not resolve hostname') 
-        ? 'Unable to connect to remote repository. Check your internet connection.'
-        : error.message.includes('fatal: \'origin\' does not appear to be a git repository')
-        ? 'No remote repository configured. Add a remote with: git remote add origin <url>'
-        : error.message
+    res.status(500).json({
+      error: 'Fetch failed',
+      details: publicRemoteFailureDetails(
+        error,
+        'Unable to fetch from the remote repository.',
+      ),
     });
   }
 });
@@ -1313,23 +1692,28 @@ router.post('/pull', async (req, res) => {
   } catch (error) {
     console.error('Git pull error:', error);
 
-    // Enhanced error handling for common pull scenarios
+    // Enhanced error handling for common pull scenarios.  Match against the
+    // combined subprocess diagnostic (message/stderr/stdout), but never send
+    // that raw diagnostic back to the caller: Git may include local paths or
+    // credential-bearing remote details.
+    const errorDetails = getGitErrorDetails(error);
+    const normalizedErrorDetails = errorDetails.toLowerCase();
     let errorMessage = 'Pull failed';
-    let details = error.message;
+    let details = publicRemoteFailureDetails(error, 'Unable to pull from the remote repository.');
     
-    if (error.message.includes('CONFLICT')) {
+    if (normalizedErrorDetails.includes('conflict')) {
       errorMessage = 'Merge conflicts detected';
       details = 'Pull created merge conflicts. Please resolve conflicts manually in the editor, then commit the changes.';
-    } else if (error.message.includes('Please commit your changes or stash them')) {
+    } else if (normalizedErrorDetails.includes('please commit your changes or stash them')) {
       errorMessage = 'Uncommitted changes detected';  
       details = 'Please commit or stash your local changes before pulling.';
-    } else if (error.message.includes('Could not resolve hostname')) {
+    } else if (normalizedErrorDetails.includes('could not resolve hostname')) {
       errorMessage = 'Network error';
       details = 'Unable to connect to remote repository. Check your internet connection.';
-    } else if (error.message.includes('fatal: \'origin\' does not appear to be a git repository')) {
+    } else if (normalizedErrorDetails.includes("fatal: 'origin' does not appear to be a git repository")) {
       errorMessage = 'Remote not configured';
       details = 'No remote repository configured. Add a remote with: git remote add origin <url>';
-    } else if (error.message.includes('diverged')) {
+    } else if (normalizedErrorDetails.includes('diverged')) {
       errorMessage = 'Branches have diverged';
       details = 'Your local branch and remote branch have diverged. Consider fetching first to review changes.';
     }
@@ -1381,26 +1765,29 @@ router.post('/push', async (req, res) => {
   } catch (error) {
     console.error('Git push error:', error);
     
-    // Enhanced error handling for common push scenarios
+    // Enhanced error handling for common push scenarios.  Keep raw Git
+    // diagnostics in server logs only; responses use stable categories.
+    const errorDetails = getGitErrorDetails(error);
+    const normalizedErrorDetails = errorDetails.toLowerCase();
     let errorMessage = 'Push failed';
-    let details = error.message;
+    let details = publicRemoteFailureDetails(error, 'Unable to push to the remote repository.');
     
-    if (error.message.includes('rejected')) {
+    if (normalizedErrorDetails.includes('rejected')) {
       errorMessage = 'Push rejected';
       details = 'The remote has newer commits. Pull first to merge changes before pushing.';
-    } else if (error.message.includes('non-fast-forward')) {
+    } else if (normalizedErrorDetails.includes('non-fast-forward')) {
       errorMessage = 'Non-fast-forward push';
       details = 'Your branch is behind the remote. Pull the latest changes first.';
-    } else if (error.message.includes('Could not resolve hostname')) {
+    } else if (normalizedErrorDetails.includes('could not resolve hostname')) {
       errorMessage = 'Network error';
       details = 'Unable to connect to remote repository. Check your internet connection.';
-    } else if (error.message.includes('fatal: \'origin\' does not appear to be a git repository')) {
+    } else if (normalizedErrorDetails.includes("fatal: 'origin' does not appear to be a git repository")) {
       errorMessage = 'Remote not configured';
       details = 'No remote repository configured. Add a remote with: git remote add origin <url>';
-    } else if (error.message.includes('Permission denied')) {
+    } else if (normalizedErrorDetails.includes('permission denied')) {
       errorMessage = 'Authentication failed';
       details = 'Permission denied. Check your credentials or SSH keys.';
-    } else if (error.message.includes('no upstream branch')) {
+    } else if (normalizedErrorDetails.includes('no upstream branch')) {
       errorMessage = 'No upstream branch';
       details = 'No upstream branch configured. Use: git push --set-upstream origin <branch>';
     }
@@ -1466,20 +1853,23 @@ router.post('/publish', async (req, res) => {
   } catch (error) {
     console.error('Git publish error:', error);
     
-    // Enhanced error handling for common publish scenarios
+    // Enhanced error handling for common publish scenarios.  Do not expose
+    // the raw remote URL, command line, or filesystem path in `details`.
+    const errorDetails = getGitErrorDetails(error);
+    const normalizedErrorDetails = errorDetails.toLowerCase();
     let errorMessage = 'Publish failed';
-    let details = error.message;
+    let details = publicRemoteFailureDetails(error, 'Unable to publish the branch to the remote repository.');
     
-    if (error.message.includes('rejected')) {
+    if (normalizedErrorDetails.includes('rejected')) {
       errorMessage = 'Publish rejected';
       details = 'The remote branch already exists and has different commits. Use push instead.';
-    } else if (error.message.includes('Could not resolve hostname')) {
+    } else if (normalizedErrorDetails.includes('could not resolve hostname')) {
       errorMessage = 'Network error';
       details = 'Unable to connect to remote repository. Check your internet connection.';
-    } else if (error.message.includes('Permission denied')) {
+    } else if (normalizedErrorDetails.includes('permission denied')) {
       errorMessage = 'Authentication failed';
       details = 'Permission denied. Check your credentials or SSH keys.';
-    } else if (error.message.includes('fatal:') && error.message.includes('does not appear to be a git repository')) {
+    } else if (normalizedErrorDetails.includes('fatal:') && normalizedErrorDetails.includes('does not appear to be a git repository')) {
       errorMessage = 'Remote not configured';
       details = 'Remote repository not properly configured. Check your remote URL.';
     }
@@ -1505,7 +1895,7 @@ router.post('/discard', async (req, res) => {
     const {
       repositoryRootPath,
       repositoryRelativeFilePath,
-    } = await resolveRepositoryFilePath(projectPath, file);
+    } = await resolveRepositoryFilePath(fs, projectPath, file);
 
     // Check file status to determine correct discard command
     const { stdout: statusOutput } = await spawnAsync(
@@ -1522,6 +1912,10 @@ router.post('/discard', async (req, res) => {
 
     if (status === '??') {
       // Untracked file or directory - delete it
+      // Keep the lexical path for deletion: if a tracked/untracked symlink
+      // points inside the repository, deleting its canonical target would
+      // remove the target rather than the link itself. The resolver has
+      // already rejected links that escape the repository.
       const filePath = path.join(repositoryRootPath, repositoryRelativeFilePath);
       const stats = await fs.stat(filePath);
 
@@ -1541,7 +1935,7 @@ router.post('/discard', async (req, res) => {
     res.json({ success: true, message: `Changes discarded for ${repositoryRelativeFilePath}` });
   } catch (error) {
     console.error('Git discard error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Unable to discard Git changes.') });
   }
 });
 
@@ -1559,7 +1953,7 @@ router.post('/delete-untracked', async (req, res) => {
     const {
       repositoryRootPath,
       repositoryRelativeFilePath,
-    } = await resolveRepositoryFilePath(projectPath, file);
+    } = await resolveRepositoryFilePath(fs, projectPath, file);
 
     // Check if file is actually untracked
     const { stdout: statusOutput } = await spawnAsync(
@@ -1579,6 +1973,8 @@ router.post('/delete-untracked', async (req, res) => {
     }
 
     // Delete the untracked file or directory
+    // Preserve symlink semantics for this mutation (unlink/rm removes the
+    // link, not its canonical target). The resolver enforces containment.
     const filePath = path.join(repositoryRootPath, repositoryRelativeFilePath);
     const stats = await fs.stat(filePath);
 
@@ -1592,7 +1988,7 @@ router.post('/delete-untracked', async (req, res) => {
     }
   } catch (error) {
     console.error('Git delete untracked error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: publicGitError(error, 'Unable to delete the untracked file.') });
   }
 });
 

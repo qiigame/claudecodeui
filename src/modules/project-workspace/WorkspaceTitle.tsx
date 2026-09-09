@@ -21,6 +21,10 @@ function getTabTitle(activeTab: AppTab, shouldShowTasksTab: boolean, t: (key: st
     return t('mainContent.projectFiles');
   }
 
+  if (activeTab === 'guide') {
+    return t('tabs.guide');
+  }
+
   if (activeTab === 'git') {
     return t('tabs.git');
   }

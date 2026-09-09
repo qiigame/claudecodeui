@@ -12,7 +12,12 @@ type TaskmasterServiceDependencies = {
  */
 export function createTaskmasterService(dependencies: TaskmasterServiceDependencies) {
     return {
-        /** Detects TaskMaster in the user's Claude MCP configuration without exposing secret values. */
+        /**
+         * Detects TaskMaster in the service-owned Claude MCP configuration.
+         * This is an internal metadata result: the route is responsible for
+         * redacting command, URL, path, and argument fields before returning
+         * it to a managed/read-only caller.
+         */
         async detectMcpServer() {
             const homeDirectory = dependencies.getHomeDirectory();
             const configurationPaths = [

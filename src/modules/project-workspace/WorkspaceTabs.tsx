@@ -1,17 +1,37 @@
-import { MessageSquare, Terminal, Folder, GitBranch, ClipboardCheck, MonitorPlay, type LucideIcon } from 'lucide-react';
+import {
+  BookOpen,
+  ClipboardCheck,
+  Folder,
+  GitBranch,
+  MessageSquare,
+  MonitorPlay,
+  Terminal,
+  type LucideIcon,
+} from 'lucide-react';
 import { Fragment } from 'react';
 import type { Dispatch, KeyboardEvent, SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { Tooltip, PillBar, Pill } from '@/shared/ui';
 import type { AppTab } from '@/shared/types';
-import { usePlugins,PluginIcon } from '@/modules/plugins';
+import { isProductQaReadOnlyPlugin, PluginIcon, usePlugins } from '@/modules/plugins';
 
 type WorkspaceTabsProps = {
   activeTab: AppTab;
   setActiveTab: Dispatch<SetStateAction<AppTab>>;
   shouldShowTasksTab: boolean;
   shouldShowBrowserTab: boolean;
+  /** Server-authorized read capability for the file browser. */
+  canReadFiles?: boolean;
+  /** Server-authorized read capability for source-control metadata. */
+  canReadGit?: boolean;
+  /** Interactive terminals are intentionally absent from product/QA deployments. */
+  canUseTerminal?: boolean;
+  /** Server-authorized read capability for browser/plugin panes. */
+  canReadBrowser?: boolean;
+  canReadPlugins?: boolean;
+  /** Executing third-party plugin code requires a separate server grant. */
+  canUsePlugins?: boolean;
 };
 
 type BuiltInTab = {
@@ -31,12 +51,14 @@ type PluginTab = {
 
 type TabDefinition = BuiltInTab | PluginTab;
 
-const BASE_TABS: BuiltInTab[] = [
+const CHAT_AND_GUIDE_TABS: BuiltInTab[] = [
   { kind: 'builtin', id: 'chat',  labelKey: 'tabs.chat',  icon: MessageSquare },
-  { kind: 'builtin', id: 'shell', labelKey: 'tabs.shell', icon: Terminal },
-  { kind: 'builtin', id: 'files', labelKey: 'tabs.files', icon: Folder },
-  { kind: 'builtin', id: 'git',   labelKey: 'tabs.git',   icon: GitBranch },
+  { kind: 'builtin', id: 'guide', labelKey: 'tabs.guide', icon: BookOpen },
 ];
+
+const SHELL_TAB: BuiltInTab = { kind: 'builtin', id: 'shell', labelKey: 'tabs.shell', icon: Terminal };
+const FILES_TAB: BuiltInTab = { kind: 'builtin', id: 'files', labelKey: 'tabs.files', icon: Folder };
+const GIT_TAB: BuiltInTab = { kind: 'builtin', id: 'git', labelKey: 'tabs.git', icon: GitBranch };
 
 const BROWSER_TAB: BuiltInTab = {
   kind: 'builtin',
@@ -58,18 +80,31 @@ export default function WorkspaceTabs({
   setActiveTab,
   shouldShowTasksTab,
   shouldShowBrowserTab,
+  canReadFiles = false,
+  canReadGit = false,
+  canUseTerminal = false,
+  canReadBrowser = false,
+  canReadPlugins = false,
+  canUsePlugins = false,
 }: WorkspaceTabsProps) {
   const { t } = useTranslation();
   const { plugins } = usePlugins();
 
   const builtInTabs: BuiltInTab[] = [
-    ...BASE_TABS,
-    ...(shouldShowBrowserTab ? [BROWSER_TAB] : []),
+    ...CHAT_AND_GUIDE_TABS,
+    ...(canUseTerminal ? [SHELL_TAB] : []),
+    ...(canReadFiles ? [FILES_TAB] : []),
+    ...(canReadGit ? [GIT_TAB] : []),
+    ...(shouldShowBrowserTab && canReadBrowser ? [BROWSER_TAB] : []),
     ...(shouldShowTasksTab ? [TASKS_TAB] : []),
   ];
 
   const pluginTabs: PluginTab[] = plugins
-    .filter((p) => p.enabled)
+    // Generic plugin bundles still require plugin.use. Product/QA exposes only
+    // the operator-installed coordination mirror, whose backend RPC is GET-only.
+    .filter((p) => p.enabled
+      && canReadPlugins
+      && (canUsePlugins || isProductQaReadOnlyPlugin(p)))
     .map((p) => ({
       kind: 'plugin',
       id: `plugin:${p.name}` as AppTab,

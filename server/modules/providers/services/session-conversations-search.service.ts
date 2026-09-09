@@ -1,4 +1,3 @@
-import fsSync from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 
@@ -6,6 +5,15 @@ import { spawn } from 'cross-spawn';
 import { rgPath } from '@vscode/ripgrep';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import {
+  closeProviderTranscriptReadHandle,
+  openProviderTranscriptReadHandle,
+  openValidatedProviderTranscript,
+  readFirstJsonlRecordFromHandle,
+  resolveClaudeConfigDirectory,
+  resolveCodexHomeDirectory,
+  validateProviderTranscriptRecord,
+} from '@/shared/utils.js';
 
 type AnyRecord = Record<string, any>;
 type SearchableProvider = 'claude' | 'codex';
@@ -63,9 +71,15 @@ type SearchSessionConversationsInput = {
 };
 
 type SessionRepositoryRow = ReturnType<typeof sessionsDb.getAllSessions>[number];
-type SearchableSessionRow = SessionRepositoryRow & {
+type SearchableSessionRow = Omit<SessionRepositoryRow, 'provider_session_id'> & {
   provider: SearchableProvider;
+  /** Normalization only admits rows with a verified provider-native id. */
+  provider_session_id: string;
   jsonl_path: string;
+  /** Production search rows carry the authenticated transcript identity. */
+  transcript_identity?: { device: number; inode: number };
+  /** Canonical provider root captured with the authenticated transcript. */
+  transcript_root?: string;
 };
 
 type SearchRuntime = {
@@ -82,6 +96,7 @@ type SearchRuntime = {
 type SearchablePathEntry = {
   normalizedPath: string;
   absolutePath: string;
+  transcriptIdentities: Array<{ device: number; inode: number }>;
 };
 
 type ProjectBucket = {
@@ -526,9 +541,55 @@ function extractCodexText(content: unknown): string {
     .join(' ');
 }
 
-function normalizeSearchableSessions(rows: SessionRepositoryRow[]): SearchableSessionRow[] {
+/**
+ * Re-checks the opening provider envelope after an external pathname scan.
+ * Ripgrep cannot consume our authenticated descriptor, so a replacement can
+ * occur between normalization and parsing. Keep this check in the shared
+ * validator so Claude project-key and Codex subagent rules stay identical to
+ * the normalize/synchronizer boundary.
+ */
+function matchesExpectedTranscriptEnvelope(
+  session: SearchableSessionRow,
+  firstRecord: unknown,
+): boolean {
+  if (!session.transcript_identity || !session.transcript_root) {
+    return false;
+  }
+
+  const expectedProjectPath = typeof session.runtime_path === 'string' && session.runtime_path.trim()
+    ? session.runtime_path.trim()
+    : typeof session.project_path === 'string' && session.project_path.trim()
+      ? session.project_path.trim()
+      : null;
+
+  return validateProviderTranscriptRecord({
+    provider: session.provider,
+    preflight: {
+      canonicalPath: session.jsonl_path,
+      canonicalRoot: session.transcript_root,
+      device: session.transcript_identity.device,
+      inode: session.transcript_identity.inode,
+    },
+    firstRecord,
+    providerSessionId: session.provider_session_id,
+    expectedSubagent: false,
+    expectedProjectPath,
+  });
+}
+
+async function normalizeSearchableSessions(
+  rows: SessionRepositoryRow[],
+): Promise<SearchableSessionRow[]> {
   const normalizedRows: SearchableSessionRow[] = [];
   const projectArchiveStateByPath = new Map<string, boolean>();
+  const claudeProjectsRoot = path.join(
+    resolveClaudeConfigDirectory(),
+    'projects',
+  );
+  const codexSessionsRoot = path.join(
+    resolveCodexHomeDirectory(),
+    'sessions',
+  );
 
   for (const row of rows) {
     const provider = row.provider as SearchableProvider;
@@ -541,8 +602,44 @@ function normalizeSearchableSessions(rows: SessionRepositoryRow[]): SearchableSe
       continue;
     }
 
-    const absoluteJsonlPath = path.resolve(rawJsonlPath);
-    if (!fsSync.existsSync(absoluteJsonlPath)) {
+    // An app-created row can have a perfectly valid-looking `jsonl_path` while
+    // its first provider run is still pending. Its app id is not a provider
+    // key, so never reinterpret it as one during a filesystem search.
+    const providerSessionId = typeof row.provider_session_id === 'string'
+      ? row.provider_session_id.trim()
+      : '';
+    if (!providerSessionId) {
+      continue;
+    }
+    // `project_path` is the stable sidebar owner.  Isolated sessions execute
+    // from their private runtime checkout, so bind the transcript envelope
+    // to runtime_path first; otherwise a stale source-checkout jsonl_path can
+    // make global search expose another session's messages.
+    const expectedProjectPath = typeof row.runtime_path === 'string' && row.runtime_path.trim()
+      ? row.runtime_path.trim()
+      : typeof row.project_path === 'string' && row.project_path.trim()
+        ? row.project_path.trim()
+        : null;
+    let canonicalJsonlPath: string | null = null;
+    let transcriptIdentity: { device: number; inode: number } | undefined;
+    let transcriptRoot: string | undefined;
+    const authenticated = await openValidatedProviderTranscript({
+      provider,
+      candidatePath: rawJsonlPath,
+      rootPath: provider === 'claude' ? claudeProjectsRoot : codexSessionsRoot,
+      providerSessionId,
+      expectedProjectPath,
+    });
+    if (authenticated) {
+      try {
+        canonicalJsonlPath = authenticated.canonicalPath;
+        transcriptIdentity = { device: authenticated.device, inode: authenticated.inode };
+        transcriptRoot = authenticated.canonicalRoot;
+      } finally {
+        await closeProviderTranscriptReadHandle(authenticated.handle);
+      }
+    }
+    if (!canonicalJsonlPath) {
       continue;
     }
 
@@ -570,7 +667,10 @@ function normalizeSearchableSessions(rows: SessionRepositoryRow[]): SearchableSe
     normalizedRows.push({
       ...row,
       provider,
-      jsonl_path: absoluteJsonlPath,
+      provider_session_id: providerSessionId,
+      jsonl_path: canonicalJsonlPath,
+      transcript_identity: transcriptIdentity,
+      transcript_root: transcriptRoot,
     });
   }
 
@@ -638,6 +738,7 @@ function buildProjectBuckets(searchableSessions: SearchableSessionRow[]): Projec
 async function runRipgrepFilesWithMatches(
   pattern: string,
   filePaths: string[],
+  transcriptIdentitiesByPath: ReadonlyMap<string, readonly { device: number; inode: number }[]>,
   signal?: AbortSignal,
 ): Promise<Set<string>> {
   if (!pattern || filePaths.length === 0 || signal?.aborted) {
@@ -721,7 +822,27 @@ async function runRipgrepFilesWithMatches(
         matchedPaths.add(normalizeComparablePath(trimmed));
       }
 
-      resolve(matchedPaths);
+      // ripgrep must open pathname arguments itself.  Re-authenticate every
+      // reported path against the identity captured during normalization before
+      // allowing the parser to attribute a match to a session row.  The parser
+      // performs the same identity check again, so a replacement after this
+      // filter is rejected rather than exposed in the result stream.
+      void (async () => {
+        const authenticatedMatches = new Set<string>();
+        for (const matchedPath of matchedPaths) {
+          const expectedIdentities = transcriptIdentitiesByPath.get(matchedPath) ?? [];
+          for (const expectedIdentity of expectedIdentities) {
+            const opened = await openProviderTranscriptReadHandle(matchedPath, expectedIdentity);
+            if (!opened) {
+              continue;
+            }
+            await closeProviderTranscriptReadHandle(opened.handle);
+            authenticatedMatches.add(matchedPath);
+            break;
+          }
+        }
+        resolve(authenticatedMatches);
+      })().catch(reject);
     });
   });
 }
@@ -738,6 +859,9 @@ async function findMatchedFileKeys(
 
   const normalizedQuery = rawQuery.trim().replace(/\s+/g, ' ');
   const requireExactPhrase = words.length > 1 && normalizedQuery.length > 0;
+  const transcriptIdentitiesByPath = new Map(
+    searchablePathEntries.map((entry) => [entry.normalizedPath, entry.transcriptIdentities] as const),
+  );
 
   if (requireExactPhrase) {
     let matchedForPhrase = searchablePathEntries.slice();
@@ -762,7 +886,12 @@ async function findMatchedFileKeys(
         while (nextChunkIndex < fileChunks.length && !signal?.aborted) {
           const currentIndex = nextChunkIndex;
           nextChunkIndex += 1;
-          const chunkMatches = await runRipgrepFilesWithMatches(word, fileChunks[currentIndex], signal);
+          const chunkMatches = await runRipgrepFilesWithMatches(
+            word,
+            fileChunks[currentIndex],
+            transcriptIdentitiesByPath,
+            signal,
+          );
           for (const matchedPath of chunkMatches) {
             matchedForWord.add(matchedPath);
           }
@@ -805,7 +934,12 @@ async function findMatchedFileKeys(
       while (nextChunkIndex < fileChunks.length && !signal?.aborted) {
         const currentIndex = nextChunkIndex;
         nextChunkIndex += 1;
-        const chunkMatches = await runRipgrepFilesWithMatches(word, fileChunks[currentIndex], signal);
+        const chunkMatches = await runRipgrepFilesWithMatches(
+          word,
+          fileChunks[currentIndex],
+          transcriptIdentitiesByPath,
+          signal,
+        );
         for (const matchedPath of chunkMatches) {
           matchedForWord.add(matchedPath);
         }
@@ -865,7 +999,7 @@ async function parseClaudeSessionMatches(
     const providerToInternalId = new Map<string, string>();
     const customNameBySessionId = new Map<string, string | null>();
     for (const candidate of targetSessions) {
-      const providerId = candidate.provider_session_id || candidate.session_id;
+      const providerId = candidate.provider_session_id;
       providerToInternalId.set(providerId, candidate.session_id);
       customNameBySessionId.set(providerId, candidate.custom_name ?? null);
     }
@@ -895,11 +1029,32 @@ async function parseClaudeSessionMatches(
 
     let currentSessionId: string | null = null;
 
+    const opened = await openProviderTranscriptReadHandle(
+      session.jsonl_path,
+      session.transcript_identity,
+    );
+    if (!opened) {
+      runtime.claudeFileResultsCache.set(fileKey, new Map());
+      return null;
+    }
+
     try {
-      const fileStream = fsSync.createReadStream(session.jsonl_path);
+      const firstRecord = await readFirstJsonlRecordFromHandle(opened.handle);
+      if (!matchesExpectedTranscriptEnvelope(session, firstRecord)) {
+        runtime.claudeFileResultsCache.set(fileKey, new Map());
+        return null;
+      }
+      // Keep the handle cleanup outside stream construction: either
+      // createReadStream or readline.createInterface can throw synchronously.
+      const fileStream = opened.handle.createReadStream({
+        start: 0,
+        autoClose: false,
+        encoding: 'utf8',
+      });
       const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
-      for await (const line of rl) {
+      try {
+        for await (const line of rl) {
         if (runtime.totalMatches >= runtime.limit || runtime.isAborted()) {
           break;
         }
@@ -978,10 +1133,16 @@ async function parseClaudeSessionMatches(
           provider: 'claude',
           messageUuid: entry.uuid ? String(entry.uuid) : null,
         });
+        }
+      } finally {
+        rl.close();
+        fileStream.destroy();
       }
     } catch {
       runtime.claudeFileResultsCache.set(fileKey, new Map());
       return null;
+    } finally {
+      await closeProviderTranscriptReadHandle(opened.handle);
     }
 
     const fileResults = new Map<string, SessionConversationResult>();
@@ -1029,11 +1190,30 @@ async function parseCodexSessionMatches(
   let latestUserMessageText: string | null = null;
   const seenMessageFingerprints = new Set<string>();
 
+  const opened = await openProviderTranscriptReadHandle(
+    session.jsonl_path,
+    session.transcript_identity,
+  );
+  if (!opened) {
+    return null;
+  }
+
   try {
-    const fileStream = fsSync.createReadStream(session.jsonl_path);
+    const firstRecord = await readFirstJsonlRecordFromHandle(opened.handle);
+    if (!matchesExpectedTranscriptEnvelope(session, firstRecord)) {
+      return null;
+    }
+    // As above, the outer finally owns the descriptor even if stream setup
+    // fails before an inner stream-cleanup block can be installed.
+    const fileStream = opened.handle.createReadStream({
+      start: 0,
+      autoClose: false,
+      encoding: 'utf8',
+    });
     const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
-    for await (const line of rl) {
+    try {
+      for await (const line of rl) {
       if (runtime.totalMatches >= runtime.limit || runtime.isAborted()) {
         break;
       }
@@ -1112,9 +1292,15 @@ async function parseCodexSessionMatches(
         timestamp: entry.timestamp ? String(entry.timestamp) : null,
         provider: 'codex',
       });
+      }
+    } finally {
+      rl.close();
+      fileStream.destroy();
     }
   } catch {
     return null;
+  } finally {
+    await closeProviderTranscriptReadHandle(opened.handle);
   }
 
   if (matches.length === 0) {
@@ -1175,7 +1361,7 @@ export async function searchConversations(
   const titleResults = findSessionTitleResults(activeSessions, safeQuery, safeLimit);
   onTitleResults?.(titleResults);
 
-  const searchableSessions = normalizeSearchableSessions(activeSessions);
+  const searchableSessions = await normalizeSearchableSessions(activeSessions);
   if (searchableSessions.length === 0) {
     return { results: [], titleResults, totalMatches: 0, query: safeQuery };
   }
@@ -1194,7 +1380,18 @@ export async function searchConversations(
       searchablePathEntries.push({
         normalizedPath,
         absolutePath: session.jsonl_path,
+        transcriptIdentities: session.transcript_identity
+          ? [session.transcript_identity]
+          : [],
       });
+    } else if (session.transcript_identity) {
+      const existingEntry = searchablePathEntries.find((entry) => entry.normalizedPath === normalizedPath);
+      if (existingEntry && !existingEntry.transcriptIdentities.some((identity) =>
+        identity.device === session.transcript_identity?.device
+        && identity.inode === session.transcript_identity?.inode
+      )) {
+        existingEntry.transcriptIdentities.push(session.transcript_identity);
+      }
     }
 
     const pathSessions = sessionsByPathKey.get(normalizedPath) as SearchableSessionRow[];

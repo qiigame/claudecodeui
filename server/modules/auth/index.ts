@@ -7,3 +7,18 @@ export { authenticateToken } from './auth.middleware.js';
 export { authenticateWebSocket } from './auth.middleware.js';
 // validateApiKey: used by the server entrypoint for optional API-wide key validation.
 export { validateApiKey } from './auth.middleware.js';
+
+// resolveAuthDeploymentMode: used by the server composition root and
+// websocket gateway to distinguish legacy platform bypass from SSO sessions.
+export {
+  AUTH_DEPLOYMENT_MODE,
+  extractBearerToken,
+  resolveAuthDeploymentMode,
+  type AuthDeploymentMode,
+} from './auth-policy.js';
+
+// createSettingsAdminRouteGuard: used by the server entrypoint to protect configuration mutations.
+export {
+  createSettingsAdminRouteGuard,
+  normalizeRoutePath,
+} from './settings-access.middleware.js';

@@ -2,6 +2,7 @@ import os from 'node:os';
 
 import spawn from 'cross-spawn';
 import type { Router } from 'express';
+import type { DeploymentPolicySource } from '@/modules/deployment-policy/index.js';
 
 import { createSystemRouter } from './system.routes.js';
 import { createSystemUpdateService } from './system.service.js';
@@ -10,6 +11,8 @@ type SystemModuleOptions = {
   appRoot: string;
   installMode: 'git' | 'npm';
   isPlatform: boolean;
+  /** Startup policy supplied by the composition root. */
+  deploymentPolicy?: DeploymentPolicySource;
 };
 
 function runShellCommand(
@@ -58,5 +61,7 @@ export function createSystemModule(options: SystemModuleOptions): Router {
     logError: (message, detail) => console.error(message, detail ?? ''),
   });
 
-  return createSystemRouter(systemUpdateService);
+  return createSystemRouter(systemUpdateService, {
+    deploymentPolicy: options.deploymentPolicy,
+  });
 }

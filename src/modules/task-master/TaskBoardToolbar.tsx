@@ -20,6 +20,7 @@ import TaskQuickSortBar from '@/modules/task-master/TaskQuickSortBar';
 type TaskBoardToolbarProps = {
   hasProject: boolean;
   hasTaskMasterConfigured: boolean;
+  canMutate?: boolean;
   totalTaskCount: number;
   filteredTaskCount: number;
   searchTerm: string;
@@ -50,6 +51,7 @@ type TaskBoardToolbarProps = {
 export default function TaskBoardToolbar({
   hasProject,
   hasTaskMasterConfigured,
+  canMutate = false,
   totalTaskCount,
   filteredTaskCount,
   searchTerm,
@@ -189,18 +191,22 @@ export default function TaskBoardToolbar({
                     {isPrdDropdownOpen && (
                       <div className="absolute right-0 top-full z-30 mt-2 w-56 rounded-lg border border-gray-200 bg-white shadow-xl dark:border-gray-700 dark:bg-gray-800">
                         <div className="p-2">
-                          <button
-                            onClick={() => {
-                              onCreatePrd();
-                              setIsPrdDropdownOpen(false);
-                            }}
-                            className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm font-medium text-purple-700 hover:bg-purple-50 dark:text-purple-300 dark:hover:bg-purple-900/30"
-                          >
-                            <Plus className="h-4 w-4" />
-                            {t('buttons.createNewPRD')}
-                          </button>
+                          {canMutate && (
+                            <>
+                              <button
+                                onClick={() => {
+                                  onCreatePrd();
+                                  setIsPrdDropdownOpen(false);
+                                }}
+                                className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm font-medium text-purple-700 hover:bg-purple-50 dark:text-purple-300 dark:hover:bg-purple-900/30"
+                              >
+                                <Plus className="h-4 w-4" />
+                                {t('buttons.createNewPRD')}
+                              </button>
 
-                          <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
+                              <div className="my-1 border-t border-gray-200 dark:border-gray-700" />
+                            </>
+                          )}
 
                           {existingPrds.map((prd) => (
                             <button
@@ -219,19 +225,19 @@ export default function TaskBoardToolbar({
                       </div>
                     )}
                   </>
-                ) : (
-                  <button
-                    onClick={onCreatePrd}
-                    className="flex items-center gap-2 rounded-lg bg-purple-600 px-3 py-2 font-medium text-white hover:bg-purple-700"
-                    title={t('buttons.addPRD')}
-                  >
-                    <FileText className="h-4 w-4" />
-                    <span className="hidden sm:inline">{t('buttons.addPRD')}</span>
-                  </button>
-                )}
+                ) : canMutate ? (
+                    <button
+                      onClick={onCreatePrd}
+                      className="flex items-center gap-2 rounded-lg bg-purple-600 px-3 py-2 font-medium text-white hover:bg-purple-700"
+                      title={t('buttons.addPRD')}
+                    >
+                      <FileText className="h-4 w-4" />
+                      <span className="hidden sm:inline">{t('buttons.addPRD')}</span>
+                    </button>
+                ) : null}
               </div>
 
-              {(hasTaskMasterConfigured || totalTaskCount > 0) && (
+              {canMutate && (hasTaskMasterConfigured || totalTaskCount > 0) && (
                 <button
                   onClick={onOpenCreateTask}
                   className="flex items-center gap-2 rounded-lg bg-blue-600 px-3 py-2 font-medium text-white hover:bg-blue-700"

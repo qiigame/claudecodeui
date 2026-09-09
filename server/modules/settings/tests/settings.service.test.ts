@@ -52,3 +52,20 @@ test('subscribeToPush persists the subscription and enables Web Push', () => {
   });
   assert.deepEqual(operations, ['save:https://push.example.test', 'preferences', 'notify']);
 });
+
+test('unsubscribeFromPush scopes deletion to the authenticated user', () => {
+  const removals: Array<{ userId: number; endpoint: string }> = [];
+  const service = createSettingsService(dependencies({
+    pushSubscriptions: {
+      save: () => undefined,
+      remove: (userId, endpoint) => removals.push({ userId, endpoint }),
+    },
+  }));
+
+  service.unsubscribeFromPush(42, 'https://push.example.test/user-42');
+
+  assert.deepEqual(removals, [{
+    userId: 42,
+    endpoint: 'https://push.example.test/user-42',
+  }]);
+});

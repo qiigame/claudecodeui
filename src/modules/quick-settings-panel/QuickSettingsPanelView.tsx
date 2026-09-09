@@ -1,9 +1,11 @@
-import { memo, useCallback, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 
 import { useDeviceSettings } from '@/shared/hooks/useDeviceSettings';
 import { useUiPreferences, useSetUiPreference } from '@/shared/context/UiPreferencesContext';
 import { useTheme } from '@/shared/context/ThemeContext';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 import { useQuickSettingsDrag } from '@/modules/quick-settings-panel/hooks/useQuickSettingsDrag';
 import type { PreferenceToggleKey, QuickSettingsPreferences } from '@/shared/types';
 import QuickSettingsContent from '@/modules/quick-settings-panel/QuickSettingsContent';
@@ -13,10 +15,25 @@ import QuickSettingsPanelHeader from '@/modules/quick-settings-panel/QuickSettin
 /** Exported as QuickSettingsPanel and rendered by the project-workspace module as its slide-out quick settings drawer. */
 function QuickSettingsPanelView() {
   const [isOpen, setIsOpen] = useState(false);
+  const { authMode, user } = useAuth();
   const { isMobile } = useDeviceSettings({ trackPWA: false });
   const { isDarkMode } = useTheme();
   const preferences = useUiPreferences();
   const setPreference = useSetUiPreference();
+  // Pending/ambiguous managed actors may read the workspace but the server
+  // rejects all authenticated mutation requests until identity enrollment is
+  // complete. Quick settings persist through that same preference endpoint;
+  // remove the handle entirely instead of presenting toggles that can only
+  // fail with IDENTITY_ENROLLMENT_REQUIRED. Verified DingTalk and local
+  // developer sessions retain the existing panel.
+  const managedIdentityRestricted = isManagedIdentityRestricted(authMode, user);
+  const { can, status: deploymentPolicyStatus } = useDeploymentPolicy();
+  // Personal UI preferences use the user/session mutation boundary. They are
+  // intentionally available to verified product/QA actors even though the
+  // deployment remains read-only for source, Git, Shell, and admin settings.
+  const canWritePreferences = deploymentPolicyStatus === 'ready'
+    && can('session.write')
+    && !managedIdentityRestricted;
   const {
     isDragging,
     handleStyle,
@@ -38,9 +55,12 @@ function QuickSettingsPanelView() {
 
   const handlePreferenceChange = useCallback(
     (key: PreferenceToggleKey, value: boolean) => {
+      if (!canWritePreferences) {
+        return;
+      }
       setPreference(key, value);
     },
-    [setPreference],
+    [canWritePreferences, setPreference],
   );
 
   const handleToggleFromHandle = useCallback(
@@ -51,10 +71,25 @@ function QuickSettingsPanelView() {
         return;
       }
 
+      if (!canWritePreferences) {
+        event.preventDefault();
+        return;
+      }
+
       setIsOpen((previous) => !previous);
     },
-    [consumeSuppressedClick],
+    [canWritePreferences, consumeSuppressedClick],
   );
+
+  useEffect(() => {
+    if (!canWritePreferences) {
+      setIsOpen(false);
+    }
+  }, [canWritePreferences]);
+
+  if (!canWritePreferences) {
+    return null;
+  }
 
   return (
     <>

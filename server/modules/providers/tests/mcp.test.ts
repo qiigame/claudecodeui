@@ -112,6 +112,7 @@ test('providerMcpService handles codex MCP TOML config and capability validation
       env: { API_KEY: 'x' },
       envVars: ['API_KEY'],
       cwd: '/tmp',
+      defaultToolsApprovalMode: 'approve',
     });
 
     await providerMcpService.upsertProviderMcpServer('codex', {
@@ -123,6 +124,7 @@ test('providerMcpService handles codex MCP TOML config and capability validation
       envHttpHeaders: { 'X-API-Key': 'MY_API_KEY_ENV' },
       bearerTokenEnvVar: 'MY_API_TOKEN',
       workspacePath,
+      defaultToolsApprovalMode: 'writes',
     });
 
     const userTomlPath = path.join(tempRoot, '.codex', 'config.toml');
@@ -130,12 +132,24 @@ test('providerMcpService handles codex MCP TOML config and capability validation
     const userServers = userConfig.mcp_servers as Record<string, unknown>;
     const userStdio = userServers['codex-user-stdio'] as Record<string, unknown>;
     assert.equal(userStdio.command, 'python');
+    assert.equal(userStdio.default_tools_approval_mode, 'approve');
 
     const projectTomlPath = path.join(workspacePath, '.codex', 'config.toml');
     const projectConfig = TOML.parse(await fs.readFile(projectTomlPath, 'utf8')) as Record<string, unknown>;
     const projectServers = projectConfig.mcp_servers as Record<string, unknown>;
     const projectHttp = projectServers['codex-project-http'] as Record<string, unknown>;
     assert.equal(projectHttp.url, 'https://codex.example.com/mcp');
+    assert.equal(projectHttp.default_tools_approval_mode, 'writes');
+
+    const grouped = await providerMcpService.listProviderMcpServers('codex', { workspacePath });
+    assert.equal(
+      grouped.user.find((server) => server.name === 'codex-user-stdio')?.defaultToolsApprovalMode,
+      'approve',
+    );
+    assert.equal(
+      grouped.project.find((server) => server.name === 'codex-project-http')?.defaultToolsApprovalMode,
+      'writes',
+    );
 
     await assert.rejects(
       providerMcpService.upsertProviderMcpServer('codex', {
@@ -148,6 +162,21 @@ test('providerMcpService handles codex MCP TOML config and capability validation
         error instanceof AppError &&
         error.code === 'MCP_SCOPE_NOT_SUPPORTED' &&
         error.statusCode === 400,
+    );
+
+    await assert.rejects(
+      providerMcpService.upsertProviderMcpServer('codex', {
+        name: 'codex-invalid-approval',
+        scope: 'project',
+        transport: 'stdio',
+        command: 'node',
+        workspacePath,
+        defaultToolsApprovalMode: 'always' as never,
+      }),
+      (error: unknown) =>
+        error instanceof AppError
+        && error.code === 'INVALID_MCP_TOOLS_APPROVAL_MODE'
+        && error.statusCode === 400,
     );
 
     await assert.rejects(
@@ -311,16 +340,20 @@ test('providerMcpService global adder writes to all providers and rejects unsupp
       transport: 'http',
       url: 'https://global.example.com/mcp',
       workspacePath,
+      defaultToolsApprovalMode: 'approve',
     });
 
     assert.equal(globalResult.length, 4);
     assert.ok(globalResult.every((entry) => entry.created === true));
 
     const claudeProject = await readJson(path.join(workspacePath, '.mcp.json'));
-    assert.ok((claudeProject.mcpServers as Record<string, unknown>)['global-http']);
+    const claudeGlobal = (claudeProject.mcpServers as Record<string, unknown>)['global-http'] as Record<string, unknown>;
+    assert.ok(claudeGlobal);
+    assert.equal(claudeGlobal.default_tools_approval_mode, undefined);
 
     const codexProject = TOML.parse(await fs.readFile(path.join(workspacePath, '.codex', 'config.toml'), 'utf8')) as Record<string, unknown>;
-    assert.ok((codexProject.mcp_servers as Record<string, unknown>)['global-http']);
+    const codexGlobal = (codexProject.mcp_servers as Record<string, unknown>)['global-http'] as Record<string, unknown>;
+    assert.equal(codexGlobal.default_tools_approval_mode, 'approve');
 
     const opencodeProject = await readJson(path.join(workspacePath, 'opencode.json'));
     assert.ok((opencodeProject.mcp as Record<string, unknown>)['global-http']);
@@ -346,4 +379,3 @@ test('providerMcpService global adder writes to all providers and rejects unsupp
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
 });
-

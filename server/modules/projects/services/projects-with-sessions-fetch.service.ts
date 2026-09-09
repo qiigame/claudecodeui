@@ -1,10 +1,15 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { collaborationService } from '@/modules/collaboration/index.js';
+import { projectsDb, sessionsDb, sessionWorkspacesDb } from '@/modules/database/index.js';
 import { sessionSynchronizerService } from '@/modules/providers/index.js';
 import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
-import type { RealtimeClientConnection } from '@/shared/types.js';
+import type {
+  RealtimeClientConnection,
+  SessionAttributionSummary,
+  SessionWorkspaceSummary,
+} from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
 
 type SessionSummary = {
@@ -13,6 +18,8 @@ type SessionSummary = {
   summary: string;
   messageCount: number;
   lastActivity: string;
+  attribution?: SessionAttributionSummary;
+  workspace?: SessionWorkspaceSummary;
 };
 
 type SessionRepositoryRow = {
@@ -127,11 +134,28 @@ function mapSessionRowToSummary(row: SessionRepositoryRow): SessionSummary {
   };
 }
 
+function enrichSessionSummaries(sessions: SessionSummary[]): SessionSummary[] {
+  const sessionIds = sessions.map((session) => session.id);
+  const attributions = collaborationService.getSessionAttributions(
+    sessionIds,
+  );
+  const workspaces = sessionWorkspacesDb.getBySessionIds(sessionIds);
+  return sessions.map((session) => {
+    const attribution = attributions.get(session.id);
+    const workspace = workspaces.get(session.id);
+    return {
+      ...session,
+      ...(attribution ? { attribution } : {}),
+      ...(workspace ? { workspace } : {}),
+    };
+  });
+}
+
 function readProjectSessionsIncludingArchived(projectPath: string): ProjectSessionsPageResult {
   const rows = sessionsDb.getSessionsByProjectPathIncludingArchived(projectPath) as SessionRepositoryRow[];
 
   return {
-    sessions: rows.map(mapSessionRowToSummary),
+    sessions: enrichSessionSummaries(rows.map(mapSessionRowToSummary)),
     total: rows.length,
     hasMore: false,
   };
@@ -153,7 +177,7 @@ function readProjectSessionsPageByPath(
   const total = sessionsDb.countSessionsByProjectPath(projectPath);
 
   return {
-    sessions: rows.map(mapSessionRowToSummary),
+    sessions: enrichSessionSummaries(rows.map(mapSessionRowToSummary)),
     total,
     hasMore: pagination.offset + rows.length < total,
   };

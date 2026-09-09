@@ -2,6 +2,8 @@ import { Folder } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import MobileMenuButton from '@/modules/project-workspace/MobileMenuButton';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type WorkspaceStateViewProps = {
   mode: 'loading' | 'empty';
@@ -12,6 +14,9 @@ type WorkspaceStateViewProps = {
 /** Rendered by WorkspaceMain instead of the workspace while projects load or when none is selected. */
 export default function WorkspaceStateView({ mode, isMobile, onMenuClick }: WorkspaceStateViewProps) {
   const { t } = useTranslation();
+  const { authMode, user } = useAuth();
+  const { isReadOnly } = useDeploymentPolicy();
+  const restrictedWorkspace = isReadOnly || isManagedIdentityRestricted(authMode, user);
 
   const isLoading = mode === 'loading';
 
@@ -47,10 +52,21 @@ export default function WorkspaceStateView({ mode, isMobile, onMenuClick }: Work
               <Folder className="h-7 w-7 text-muted-foreground" />
             </div>
             <h2 className="mb-2 text-xl font-semibold text-foreground">{t('mainContent.chooseProject')}</h2>
-            <p className="mb-5 text-sm leading-relaxed text-muted-foreground">{t('mainContent.selectProjectDescription')}</p>
+            <p className="mb-5 text-sm leading-relaxed text-muted-foreground">
+              {restrictedWorkspace
+                ? t('mainContent.readOnlySelectProjectDescription', {
+                    defaultValue: 'Select a project to browse its files and conversation history. Creating or changing projects is disabled in this deployment.',
+                  })
+                : t('mainContent.selectProjectDescription')}
+            </p>
             <div className="rounded-xl border border-primary/10 bg-primary/5 p-3.5">
               <p className="text-sm text-primary">
-                <strong>{t('mainContent.tip')}:</strong> {isMobile ? t('mainContent.createProjectMobile') : t('mainContent.createProjectDesktop')}
+                <strong>{t('mainContent.tip')}:</strong>{' '}
+                {restrictedWorkspace
+                  ? t('mainContent.readOnlyProjectTip', {
+                      defaultValue: 'Project creation is restricted. Contact an administrator if you need another workspace.',
+                    })
+                  : isMobile ? t('mainContent.createProjectMobile') : t('mainContent.createProjectDesktop')}
               </p>
             </div>
           </div>

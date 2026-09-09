@@ -13,6 +13,10 @@ type UseGitPanelControllerOptions = {
   selectedProject: Project | null;
   activeView: GitPanelView;
   onFileOpen?: FileOpenHandler;
+  /** Server-authorized Git mutation capability. */
+  canMutateGit?: boolean;
+  /** Server-authorized remote metadata fetch capability. */
+  canFetchGit?: boolean;
 };
 
 type GitPanelController = {
@@ -103,6 +107,8 @@ export function useGitPanelController({
   selectedProject,
   activeView,
   onFileOpen,
+  canMutateGit = false,
+  canFetchGit = false,
 }: UseGitPanelControllerOptions): GitPanelController {
   const [gitStatus, setGitStatus] = useState<GitStatusResponse | null>(null);
   const [gitDiff, setGitDiff] = useState<GitDiffMap>({});
@@ -285,7 +291,7 @@ export function useGitPanelController({
 
   const switchBranch = useCallback(
     async (branchName: string) => {
-      if (!selectedProject) {
+      if (!canMutateGit || !selectedProject) {
         return false;
       }
 
@@ -306,13 +312,13 @@ export function useGitPanelController({
         return false;
       }
     },
-    [fetchGitStatus, selectedProject],
+    [canMutateGit, fetchGitStatus, selectedProject],
   );
 
   const createBranch = useCallback(
     async (branchName: string) => {
       const trimmedBranchName = branchName.trim();
-      if (!selectedProject || !trimmedBranchName) {
+      if (!canMutateGit || !selectedProject || !trimmedBranchName) {
         return false;
       }
 
@@ -337,12 +343,12 @@ export function useGitPanelController({
         setIsCreatingBranch(false);
       }
     },
-    [fetchBranches, fetchGitStatus, selectedProject],
+    [canMutateGit, fetchBranches, fetchGitStatus, selectedProject],
   );
 
   const deleteBranch = useCallback(
     async (branchName: string, force = false) => {
-      if (!selectedProject) return false;
+      if (!canMutateGit || !selectedProject) return false;
 
       try {
         const response = await api.git.deleteBranch(selectedProject.projectId, branchName, force);
@@ -360,11 +366,11 @@ export function useGitPanelController({
         return false;
       }
     },
-    [fetchBranches, selectedProject],
+    [canMutateGit, fetchBranches, selectedProject],
   );
 
   const handleFetch = useCallback(async () => {
-    if (!selectedProject) {
+    if (!canFetchGit || !selectedProject) {
       return;
     }
 
@@ -386,10 +392,10 @@ export function useGitPanelController({
     } finally {
       setIsFetching(false);
     }
-  }, [fetchBranches, fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [canFetchGit, fetchBranches, fetchGitStatus, fetchRemoteStatus, selectedProject]);
 
   const handlePull = useCallback(async () => {
-    if (!selectedProject) {
+    if (!canMutateGit || !selectedProject) {
       return;
     }
 
@@ -410,10 +416,10 @@ export function useGitPanelController({
     } finally {
       setIsPulling(false);
     }
-  }, [fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [canMutateGit, fetchGitStatus, fetchRemoteStatus, selectedProject]);
 
   const handlePush = useCallback(async () => {
-    if (!selectedProject) {
+    if (!canMutateGit || !selectedProject) {
       return;
     }
 
@@ -434,10 +440,10 @@ export function useGitPanelController({
     } finally {
       setIsPushing(false);
     }
-  }, [fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [canMutateGit, fetchGitStatus, fetchRemoteStatus, selectedProject]);
 
   const handlePublish = useCallback(async () => {
-    if (!selectedProject) {
+    if (!canMutateGit || !selectedProject) {
       return;
     }
 
@@ -458,11 +464,11 @@ export function useGitPanelController({
     } finally {
       setIsPublishing(false);
     }
-  }, [currentBranch, fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [canMutateGit, currentBranch, fetchGitStatus, fetchRemoteStatus, selectedProject]);
 
   const discardChanges = useCallback(
     async (filePath: string) => {
-      if (!selectedProject) {
+      if (!canMutateGit || !selectedProject) {
         return;
       }
 
@@ -480,12 +486,12 @@ export function useGitPanelController({
         console.error('Error discarding changes:', error);
       }
     },
-    [fetchGitStatus, selectedProject],
+    [canMutateGit, fetchGitStatus, selectedProject],
   );
 
   const deleteUntrackedFile = useCallback(
     async (filePath: string) => {
-      if (!selectedProject) {
+      if (!canMutateGit || !selectedProject) {
         return;
       }
 
@@ -503,12 +509,12 @@ export function useGitPanelController({
         console.error('Error deleting untracked file:', error);
       }
     },
-    [fetchGitStatus, selectedProject],
+    [canMutateGit, fetchGitStatus, selectedProject],
   );
 
   const stageFiles = useCallback(
     async (files: string[]) => {
-      if (!selectedProject || files.length === 0) {
+      if (!canMutateGit || !selectedProject || files.length === 0) {
         return false;
       }
 
@@ -529,12 +535,12 @@ export function useGitPanelController({
         return false;
       }
     },
-    [fetchGitStatus, selectedProject],
+    [canMutateGit, fetchGitStatus, selectedProject],
   );
 
   const unstageFiles = useCallback(
     async (files: string[]) => {
-      if (!selectedProject || files.length === 0) {
+      if (!canMutateGit || !selectedProject || files.length === 0) {
         return false;
       }
 
@@ -554,7 +560,7 @@ export function useGitPanelController({
         return false;
       }
     },
-    [fetchGitStatus, selectedProject],
+    [canMutateGit, fetchGitStatus, selectedProject],
   );
 
   const fetchRecentCommits = useCallback(async () => {
@@ -639,7 +645,7 @@ export function useGitPanelController({
 
   const commitChanges = useCallback(
     async (message: string, files: string[]) => {
-      if (!selectedProject || !message.trim() || files.length === 0) {
+      if (!canMutateGit || !selectedProject || !message.trim() || files.length === 0) {
         return false;
       }
 
@@ -660,11 +666,11 @@ export function useGitPanelController({
         return false;
       }
     },
-    [fetchGitStatus, fetchRemoteStatus, selectedProject],
+    [canMutateGit, fetchGitStatus, fetchRemoteStatus, selectedProject],
   );
 
   const createInitialCommit = useCallback(async () => {
-    if (!selectedProject) {
+    if (!canMutateGit || !selectedProject) {
       throw new Error('No project selected');
     }
 
@@ -686,10 +692,10 @@ export function useGitPanelController({
     } finally {
       setIsCreatingInitialCommit(false);
     }
-  }, [fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [canMutateGit, fetchGitStatus, fetchRemoteStatus, selectedProject]);
 
   const initRepository = useCallback(async () => {
-    if (!selectedProject) {
+    if (!canMutateGit || !selectedProject) {
       return false;
     }
     const projectId = selectedProject.projectId;
@@ -719,7 +725,7 @@ export function useGitPanelController({
     } finally {
       setIsInitializingRepository(false);
     }
-  }, [fetchBranches, fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [canMutateGit, fetchBranches, fetchGitStatus, fetchRemoteStatus, selectedProject]);
 
   const openFile = useCallback(
     async (filePath: string) => {

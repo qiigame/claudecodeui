@@ -25,6 +25,8 @@ type PluginDependencies = {
   stopServer(pluginName: string): Promise<void>;
   getServerPort(pluginName: string): number | undefined;
   isServerRunning(pluginName: string): boolean;
+  getActiveProjectPaths(): string[];
+  normalizeProjectPath(projectPath: string): string;
   joinPath(...parts: string[]): string;
   logError(message: string, error: unknown): void;
 };
@@ -54,6 +56,28 @@ function normalizePluginManifest(value: unknown): PluginManifest {
 
 /** Creates plugin-management workflows around loader and process adapters. */
 export function createPluginsService(dependencies: PluginDependencies) {
+  function authorizeProjectStatsPath(pluginName: string, pathInput: unknown): string | null {
+    if (pluginName !== 'project-stats') {
+      return null;
+    }
+
+    const requestedPath = typeof pathInput === 'string'
+      ? dependencies.normalizeProjectPath(pathInput)
+      : '';
+    const activeProjectPaths = new Set(
+      dependencies.getActiveProjectPaths()
+        .map((projectPath) => dependencies.normalizeProjectPath(projectPath))
+        .filter(Boolean),
+    );
+    if (!requestedPath || !activeProjectPaths.has(requestedPath)) {
+      throw new AppError('Project Stats can only access an active registered project.', {
+        code: 'PLUGIN_PROJECT_PATH_DENIED',
+        statusCode: 403,
+      });
+    }
+    return requestedPath;
+  }
+
   async function startServerIfAvailable(plugin: PluginManifest): Promise<void> {
     if (!plugin.server || dependencies.isServerRunning(plugin.name)) return;
     const pluginDirectory = dependencies.getPluginDirectory(plugin.name);
@@ -121,9 +145,18 @@ export function createPluginsService(dependencies: PluginDependencies) {
       if (wasRunning) await startServerIfAvailable(plugin);
       return { success: true, plugin };
     },
-    async prepareRpc(pluginName: string) {
+    async prepareRpc(pluginName: string, projectPathInput?: unknown) {
       validatePluginName(pluginName);
+      const authorizedProjectPath = authorizeProjectStatsPath(pluginName, projectPathInput);
       let port = dependencies.getServerPort(pluginName);
+      // Keep ownership of an implicit startup with this request.  The route
+      // performs a second managed-actor check after the await below; if that
+      // check observes a revocation, it must be able to tear down only the
+      // process it caused to start instead of leaving third-party plugin code
+      // running after the caller lost execution authority.  The property is
+      // omitted for already-running plugins to preserve the historical return
+      // shape for standalone callers/tests.
+      let startedByRequest = false;
       if (!port) {
         const plugin = this.getManifest(pluginName);
         if (!plugin.server) throw new AppError('Plugin server is not running', { code: 'PLUGIN_SERVER_UNAVAILABLE', statusCode: 503 });
@@ -133,9 +166,26 @@ export function createPluginsService(dependencies: PluginDependencies) {
           plugin.dirName ?? plugin.name,
         );
         port = await dependencies.startServer(pluginName, pluginDirectory, plugin.server);
+        startedByRequest = true;
       }
       const secrets = dependencies.readConfig()[pluginName]?.secrets ?? {};
-      return { port, secrets };
+      return {
+        port,
+        secrets,
+        ...(authorizedProjectPath ? { authorizedProjectPath } : {}),
+        ...(startedByRequest ? { startedByRequest: true } : {}),
+      };
+    },
+    /**
+     * Stops a server that this service started on behalf of a request.  This
+     * narrow wrapper is intentionally kept on the service boundary (rather
+     * than reaching into the dependency from the router) so the revocation
+     * cleanup path can tear down an implicitly started process while retaining
+     * the same plugin-name validation as the other lifecycle operations.
+     */
+    async stopServer(pluginName: string): Promise<void> {
+      validatePluginName(pluginName);
+      await dependencies.stopServer(pluginName);
     },
     async uninstall(pluginName: string) {
       validatePluginName(pluginName);

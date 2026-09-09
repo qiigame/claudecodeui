@@ -4,6 +4,8 @@ import type { PendingPermissionRequest } from '@/shared/types';
 
 export type PermissionContextValue = {
   pendingPermissionRequests: PendingPermissionRequest[];
+  /** Read-only deployments can deny stale prompts but cannot approve tools. */
+  canApproveTools?: boolean;
   handlePermissionDecision: (
     requestIds: string | string[],
     decision: { allow?: boolean; message?: string; rememberEntry?: string | null; updatedInput?: unknown },

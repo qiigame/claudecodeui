@@ -41,13 +41,17 @@ export const PlanDisplay: React.FC<PlanDisplayProps> = ({
   toolName: _toolName,
 }) => {
   const permissionCtx = usePermission();
+  // A plan approval is a provider-tool execution. If this renderer is used
+  // outside ChatInterface or the capability context is unavailable, hide the
+  // build action rather than assuming a writable deployment.
+  const canApproveTools = permissionCtx?.canApproveTools ?? false;
 
   const pendingRequest = permissionCtx?.pendingPermissionRequests.find(
     (r) => r.toolName === 'ExitPlanMode' || r.toolName === 'exit_plan_mode'
   );
 
   const handleBuild = () => {
-    if (pendingRequest && permissionCtx) {
+    if (pendingRequest && permissionCtx && canApproveTools) {
       permissionCtx.handlePermissionDecision(pendingRequest.requestId, { allow: true });
     }
   };
@@ -118,6 +122,11 @@ export const PlanDisplay: React.FC<PlanDisplayProps> = ({
         {/* Footer — always visible when permission is pending */}
         {pendingRequest && (
           <CardFooter className="justify-end gap-2 border-t border-border/40 px-4 pb-3 pt-3">
+            {!canApproveTools && (
+              <span className="mr-auto text-xs text-amber-700 dark:text-amber-300">
+                Read-only deployment: build approval is disabled.
+              </span>
+            )}
             <Button
               variant="ghost"
               size="sm"
@@ -126,12 +135,14 @@ export const PlanDisplay: React.FC<PlanDisplayProps> = ({
             >
               Revise
             </Button>
-            <Button size="sm" onClick={handleBuild}>
-              Build{' '}
-              <kbd className="ml-1 rounded bg-primary-foreground/20 px-1 py-0.5 font-mono text-[10px]">
-                ⌘↩
-              </kbd>
-            </Button>
+            {canApproveTools && (
+              <Button size="sm" onClick={handleBuild}>
+                Build{' '}
+                <kbd className="ml-1 rounded bg-primary-foreground/20 px-1 py-0.5 font-mono text-[10px]">
+                  ⌘↩
+                </kbd>
+              </Button>
+            )}
           </CardFooter>
         )}
       </Card>

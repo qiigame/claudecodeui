@@ -8,6 +8,8 @@ import { MCP_GLOBAL_SUPPORTED_TRANSPORTS, MCP_PROVIDER_NAMES } from '@/shared/co
 import { useMcpServers } from '@/modules/mcp/hooks/useMcpServers';
 import { maskSecret } from '@/modules/mcp/utils/mcpFormatting';
 import McpServerFormModal from '@/modules/mcp/McpServerFormModal';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
 
 type McpServersProps = {
   selectedProvider: McpProvider;
@@ -106,6 +108,11 @@ function TeamMcpFeatureCard() {
 /** Rendered by the settings module's agents tab to list and manage one provider's MCP servers. */
 export default function McpServers({ selectedProvider, currentProjects }: McpServersProps) {
   const { t } = useTranslation('settings');
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const { authMode, user } = useAuth();
+  const canManageMcp = can('mcp.write')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
   const {
     servers,
     isLoading,
@@ -120,7 +127,7 @@ export default function McpServers({ selectedProvider, currentProjects }: McpSer
     submitForm,
     submitGlobalForm,
     deleteServer,
-  } = useMcpServers({ selectedProvider, currentProjects });
+  } = useMcpServers({ selectedProvider, currentProjects, canManage: canManageMcp });
 
   const providerName = MCP_PROVIDER_NAMES[selectedProvider];
   const description = t(`mcpServers.description.${selectedProvider}`, {
@@ -143,28 +150,30 @@ export default function McpServers({ selectedProvider, currentProjects }: McpSer
             <p className="text-sm text-muted-foreground">{description}</p>
           </div>
         </div>
-        <ActionMenu
-          label="Add MCP Server"
-          icon={Plus}
-          className="w-full sm:w-auto"
-          triggerClassName={`w-full sm:w-auto ${MCP_PROVIDER_BUTTON_CLASSES[selectedProvider]}`}
-          items={[
-            {
-              key: 'global',
-              label: globalButtonLabel,
-              description: globalAddDescription,
-              icon: Globe,
-              onSelect: openGlobalForm,
-            },
-            {
-              key: 'provider',
-              label: providerButtonLabel,
-              description: providerAddDescription,
-              icon: Server,
-              onSelect: () => openForm(),
-            },
-          ]}
-        />
+        {canManageMcp && (
+          <ActionMenu
+            label="Add MCP Server"
+            icon={Plus}
+            className="w-full sm:w-auto"
+            triggerClassName={`w-full sm:w-auto ${MCP_PROVIDER_BUTTON_CLASSES[selectedProvider]}`}
+            items={[
+              {
+                key: 'global',
+                label: globalButtonLabel,
+                description: globalAddDescription,
+                icon: Globe,
+                onSelect: openGlobalForm,
+              },
+              {
+                key: 'provider',
+                label: providerButtonLabel,
+                description: providerAddDescription,
+                icon: Server,
+                onSelect: () => openForm(),
+              },
+            ]}
+          />
+        )}
 
       </div>
 
@@ -250,7 +259,7 @@ export default function McpServers({ selectedProvider, currentProjects }: McpSer
                   </div>
                 </div>
 
-                {!managed && (
+                {!managed && canManageMcp && (
                   <div className="ml-4 flex items-center gap-2">
                     <Button
                       onClick={() => openForm(server)}
@@ -292,7 +301,7 @@ export default function McpServers({ selectedProvider, currentProjects }: McpSer
       {selectedProvider === 'claude' && !IS_PLATFORM && <TeamMcpFeatureCard />}
 
       {/* Mounted only while open: each instance runs a full useMcpServerForm. */}
-      {serverForm?.scope === 'provider' && (
+      {canManageMcp && serverForm?.scope === 'provider' && (
         <McpServerFormModal
           provider={selectedProvider}
           editingServer={serverForm.editingServer}
@@ -304,7 +313,7 @@ export default function McpServers({ selectedProvider, currentProjects }: McpSer
         />
       )}
 
-      {serverForm?.scope === 'global' && (
+      {canManageMcp && serverForm?.scope === 'global' && (
         <McpServerFormModal
           provider={selectedProvider}
           mode="global"

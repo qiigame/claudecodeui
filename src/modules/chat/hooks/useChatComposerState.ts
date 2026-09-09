@@ -13,8 +13,9 @@ import { useDropzone } from 'react-dropzone';
 
 import { api } from '@/shared/api';
 import { PROVIDER_PERMISSION_PREFERENCE_KEYS } from '@/shared/constants';
+import { comicRuntimeOnly } from '@/shared/utils';
 import { readUserPreference } from '@/shared/userSettings';
-import type { CommandModalPayload, CostCommandData, HelpCommandData, MarkSessionProcessing, ModelCommandData, QueuedDraft, SessionActivityMap, StatusCommandData,QueuedSendOptions,ChatAttachment,ChatMessage,PendingPermissionRequest,PermissionMode,SessionEstablishedContext,Project,ProjectSession,LLMProvider,SlashCommand } from '@/shared/types';
+import type { CommandModalPayload, CostCommandData, HelpCommandData, MarkSessionProcessing, ModelCommandData, QueuedDraft, SessionActivityMap, SessionWorkspacePlan, SessionWorkspaceSummary, StatusCommandData,QueuedSendOptions,ChatAttachment,ChatMessage,PendingPermissionRequest,PermissionMode,SessionEstablishedContext,Project,ProjectSession,LLMProvider,SlashCommand } from '@/shared/types';
 import { grantClaudeToolPermission } from '@/modules/chat/utils/chatPermissions';
 import {
   clearQueuedMessage,
@@ -60,6 +61,18 @@ type UseChatComposerStateArgs = {
   onSessionEstablished?: (sessionId: string, context: SessionEstablishedContext) => void;
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   onShowSettings?: () => void;
+  /** Server-authorized capability for slash/custom command execution. */
+  canExecuteCommands?: boolean;
+  /** Whether a new session may provision a filesystem worktree. */
+  canProvisionWorkspace?: boolean;
+  /** Deployment-level read-only state; worktree planning is forbidden when true. */
+  readOnly?: boolean;
+  /** Whether chat attachments may be uploaded to the server store. */
+  canUploadAttachments?: boolean;
+  /** Whether the current provider/session can accept a new chat turn. */
+  canSendMessages?: boolean;
+  /** Whether the caller may approve a provider tool request. */
+  canApproveTools?: boolean;
   scrollToBottom: () => void;
   addMessage: (msg: ChatMessage) => void;
   setIsUserScrolledUp: (isScrolledUp: boolean) => void;
@@ -90,7 +103,8 @@ const createFakeSubmitEvent = () => {
 };
 
 const MAX_ATTACHMENT_COUNT = 10;
-const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_SIZE_MB = 50;
+const MAX_ATTACHMENT_SIZE = MAX_ATTACHMENT_SIZE_MB * 1024 * 1024;
 
 const isImageAttachment = (attachment: ChatAttachment) => {
   if (attachment.mimeType?.startsWith('image/')) return true;
@@ -171,11 +185,28 @@ export function useChatComposerState({
   onSessionEstablished,
   onFileOpen,
   onShowSettings,
+  // Capability props are optional for older embedders, but an omitted server
+  // decision must never grant a mutating or executable affordance. The main
+  // ChatInterface passes the authoritative values explicitly.
+  canExecuteCommands = false,
+  canProvisionWorkspace: requestedCanProvisionWorkspace = false,
+  readOnly = false,
+  canUploadAttachments = false,
+  canSendMessages = false,
+  canApproveTools = false,
   scrollToBottom,
   addMessage,
   setIsUserScrolledUp,
   setPendingPermissionRequests,
 }: UseChatComposerStateArgs) {
+  // Keep the hook boundary defensive for direct/legacy consumers too.  The
+  // ChatInterface passes the server-authorized deployment value explicitly,
+  // while a read-only transition immediately disables both planning and the
+  // repository keys sent to session creation.
+  const canProvisionWorkspace = requestedCanProvisionWorkspace && !readOnly;
+  // WorkspaceMain only supplies this server-authorized callback to the settings
+  // administrator. Missing callbacks fail closed for direct hook consumers too.
+  const canManageSettings = Boolean(onShowSettings);
   // The composer text together with the chat scope it belongs to. They are one
   // state rather than a value plus a ref because they have to move in lockstep:
   // on a session switch there is one commit where the scope has already changed
@@ -211,11 +242,24 @@ export function useChatComposerState({
   const [fileErrors, setFileErrors] = useState<Map<string, string>>(new Map());
   const [isTextareaExpanded, setIsTextareaExpanded] = useState(false);
   const [commandModalPayload, setCommandModalPayload] = useState<CommandModalPayload | null>(null);
+  // A multi-repository project needs one explicit choice before its first
+  // session is created. The draft stays in the composer while this modal is
+  // open; only stable policy keys (never paths) are sent back to the server.
+  const [workspaceSelectionPlan, setWorkspaceSelectionPlan] = useState<SessionWorkspacePlan | null>(null);
+  const [workspaceSelectionKeys, setWorkspaceSelectionKeys] = useState<string[]>([]);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputHighlightRef = useRef<HTMLDivElement>(null);
   const textareaLineHeightRef = useRef<number | null>(null);
   const lastAutosizedInputRef = useRef<string | null>(null);
+  const provisionRepositoryKeysRef = useRef<string[] | null>(null);
+  // Async planning can outlive a policy refresh.  Reading this ref at the
+  // request/response boundary prevents an old writable closure from handing
+  // repository keys to session creation after the deployment became read-only.
+  const canProvisionWorkspaceRef = useRef(canProvisionWorkspace);
+  canProvisionWorkspaceRef.current = canProvisionWorkspace;
+  const workspacePlanRequestRef = useRef(false);
+  const sessionCreationRequestRef = useRef(false);
   const handleSubmitRef = useRef<
     ((
       event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
@@ -267,10 +311,12 @@ export function useChatComposerState({
           break;
 
         case 'models':
-          setCommandModalPayload({
-            kind: 'models',
-            data: (data || {}) as ModelCommandData,
-          });
+          if (!comicRuntimeOnly) {
+            setCommandModalPayload({
+              kind: 'models',
+              data: (data || {}) as ModelCommandData,
+            });
+          }
           break;
 
         case 'cost': {
@@ -309,21 +355,60 @@ export function useChatComposerState({
           break;
 
         case 'config':
-          onShowSettings?.();
+          if (canManageSettings) {
+            onShowSettings?.();
+          }
           break;
 
         default:
           console.warn('Unknown built-in command action:', action);
       }
     },
-    [onFileOpen, onShowSettings, addMessage],
+    [canManageSettings, onFileOpen, onShowSettings, addMessage],
   );
 
   const closeCommandModal = useCallback(() => {
     setCommandModalPayload(null);
   }, []);
 
+  const closeWorkspaceSelection = useCallback(() => {
+    setWorkspaceSelectionPlan(null);
+    setWorkspaceSelectionKeys([]);
+  }, []);
+
+  const toggleWorkspaceRepository = useCallback((repositoryKey: string) => {
+    if (!canProvisionWorkspaceRef.current) {
+      return;
+    }
+    setWorkspaceSelectionKeys((previous) => previous.includes(repositoryKey)
+      ? previous.filter((key) => key !== repositoryKey)
+      : [...previous, repositoryKey]);
+  }, [canProvisionWorkspace]);
+
+  const confirmWorkspaceSelection = useCallback(() => {
+    if (!canProvisionWorkspaceRef.current || workspaceSelectionKeys.length === 0) {
+      return;
+    }
+    provisionRepositoryKeysRef.current = workspaceSelectionKeys;
+    closeWorkspaceSelection();
+    setTimeout(() => handleSubmitRef.current?.(createFakeSubmitEvent()), 0);
+  }, [canProvisionWorkspace, closeWorkspaceSelection, workspaceSelectionKeys]);
+
+  useEffect(() => {
+    if (!canProvisionWorkspace && workspaceSelectionPlan) {
+      // Close a stale worktree selector if deployment policy or managed
+      // identity changes while the planning request is open. The server will
+      // reject the mutation, so keeping the dialog visible would be a false
+      // affordance; clear both the plan and selected repository keys.
+      closeWorkspaceSelection();
+    }
+  }, [canProvisionWorkspace, closeWorkspaceSelection, workspaceSelectionPlan]);
+
   const handleCustomCommand = useCallback(async (result: CommandExecutionResult) => {
+    if (!canExecuteCommands) {
+      return;
+    }
+
     const { content, hasBashCommands } = result;
 
     if (hasBashCommands) {
@@ -350,11 +435,15 @@ export function useChatComposerState({
         handleSubmitRef.current(createFakeSubmitEvent());
       }
     }, 0);
-  }, [addMessage]);
+  }, [addMessage, canExecuteCommands]);
 
   const executeCommand = useCallback(
     async (command: SlashCommand, rawInput?: string, options?: { preserveInput?: boolean }) => {
-      if (!command || !selectedProject) {
+      if (!canExecuteCommands || !command || !selectedProject) {
+        return;
+      }
+
+      if (command.name === '/config' && !canManageSettings) {
         return;
       }
 
@@ -371,7 +460,7 @@ export function useChatComposerState({
           projectId: selectedProject.projectId,
           sessionId: currentSessionId || selectedSession?.id || null,
           provider,
-          model: currentProviderModel,
+          ...(!comicRuntimeOnly ? { model: currentProviderModel } : {}),
           tokenUsage: tokenBudget,
         };
 
@@ -416,6 +505,8 @@ export function useChatComposerState({
     [
       currentProviderModel,
       currentSessionId,
+      canExecuteCommands,
+      canManageSettings,
       handleBuiltInCommand,
       handleCustomCommand,
       input,
@@ -456,6 +547,8 @@ export function useChatComposerState({
   } = useSlashCommands({
     selectedProject,
     provider,
+    canManageSettings,
+    canExecuteCommands,
     input,
     setInput,
     textareaRef,
@@ -502,6 +595,10 @@ export function useChatComposerState({
   }, []);
 
   const handleAttachmentFiles = useCallback((files: File[]) => {
+    if (!canUploadAttachments || !canSendMessages) {
+      return;
+    }
+
     const validFiles = files.filter((file) => {
       try {
         if (!file || typeof file !== 'object') {
@@ -513,7 +610,7 @@ export function useChatComposerState({
           const fileName = file.name || 'Unknown file';
           setFileErrors((previous) => {
             const next = new Map(previous);
-            next.set(fileName, 'File too large (max 10MB)');
+            next.set(fileName, `File too large (max ${MAX_ATTACHMENT_SIZE_MB}MB)`);
             return next;
           });
           return false;
@@ -529,31 +626,44 @@ export function useChatComposerState({
     if (validFiles.length > 0) {
       setAttachedFiles((previous) => [...previous, ...validFiles].slice(0, MAX_ATTACHMENT_COUNT));
     }
-  }, []);
+  }, [canSendMessages, canUploadAttachments]);
 
   const handlePaste = useCallback(
     (event: ClipboardEvent<HTMLTextAreaElement>) => {
-      const items = Array.from(event.clipboardData.items);
+      if (!canUploadAttachments || !canSendMessages) {
+        // Leave ordinary clipboard text untouched when this deployment does
+        // not expose the attachment store. The textarea's native paste path
+        // remains available for product/QA text-only conversations.
+        return;
+      }
 
-      items.forEach((item) => {
-        if (!item.type.startsWith('image/')) {
-          return;
-        }
-        const file = item.getAsFile();
-        if (file) {
-          handleAttachmentFiles([file]);
-        }
+      // Clipboard items can represent any file type (PDF, ZIP, text, etc.),
+      // not only images. `getAsFile()` returning null is how browsers mark
+      // ordinary text/HTML clipboard entries, so those entries keep the
+      // textarea's native paste behavior.
+      const itemFiles = Array.from(event.clipboardData.items)
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => Boolean(file));
+      const clipboardFiles = Array.from(event.clipboardData.files ?? []);
+      const files = [...itemFiles, ...clipboardFiles];
+      const uniqueFiles = files.filter((file, index, allFiles) => {
+        const key = `${file.name}\0${file.size}\0${file.lastModified}\0${file.type}`;
+        return allFiles.findIndex((candidate) =>
+          `${candidate.name}\0${candidate.size}\0${candidate.lastModified}\0${candidate.type}` === key,
+        ) === index;
       });
 
-      if (items.length === 0 && event.clipboardData.files.length > 0) {
-        const files = Array.from(event.clipboardData.files);
-        const imageFiles = files.filter((file) => file.type.startsWith('image/'));
-        if (imageFiles.length > 0) {
-          handleAttachmentFiles(imageFiles);
-        }
+      if (uniqueFiles.length === 0) {
+        return;
       }
+
+      // Without cancelling the browser default, some browsers insert a file
+      // name or image representation into the textarea in addition to the
+      // attachment chip.
+      event.preventDefault();
+      handleAttachmentFiles(uniqueFiles);
     },
-    [handleAttachmentFiles],
+    [canSendMessages, canUploadAttachments, handleAttachmentFiles],
   );
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
@@ -562,6 +672,8 @@ export function useChatComposerState({
     onDrop: handleAttachmentFiles,
     noClick: true,
     noKeyboard: true,
+    noDrag: !canUploadAttachments || !canSendMessages,
+    disabled: !canUploadAttachments || !canSendMessages,
   });
 
   // Snapshot of everything `chat.send` needs beyond the text itself. Built at
@@ -581,8 +693,12 @@ export function useChatComposerState({
     const toolsSettings = getToolsSettings();
 
     return {
-      model: currentProviderModel,
-      effort: currentProviderEffort,
+      // In the focused experience these are server-owned Runtime details, not
+      // browser preferences. Omitting both also prevents a crafted UI choice
+      // from being persisted as misleading session metadata.
+      ...(!comicRuntimeOnly
+        ? { model: currentProviderModel, effort: currentProviderEffort }
+        : {}),
       permissionMode: resolvePermissionModeForProvider(provider, permissionMode),
       toolsSettings,
       skipPermissions: toolsSettings?.skipPermissions || false,
@@ -603,6 +719,14 @@ export function useChatComposerState({
       queuedSubmission?: QueuedDraft,
     ) => {
       event.preventDefault();
+      // A read-only deployment may still render a historical transcript whose
+      // provider has no safe read-only runtime (for example Cursor/OpenCode).
+      // Keep the transcript readable, but never upload files, allocate a
+      // session, queue a draft, or emit a chat frame that the server will
+      // deterministically reject.
+      if (!canSendMessages) {
+        return;
+      }
       const currentInput = queuedSubmission?.content ?? inputValueRef.current;
       const currentAttachments = queuedSubmission?.attachments ?? attachedFiles;
       const previouslyUploadedAttachments = queuedSubmission?.uploadedAttachments ?? [];
@@ -614,6 +738,15 @@ export function useChatComposerState({
         )
         || !selectedProject
       ) {
+        return;
+      }
+
+      if (!canUploadAttachments && (currentAttachments.length > 0 || previouslyUploadedAttachments.length > 0)) {
+        addMessage({
+          type: 'error',
+          content: 'Attachments are disabled for this deployment.',
+          timestamp: new Date(),
+        });
         return;
       }
 
@@ -690,7 +823,7 @@ export function useChatComposerState({
       // Also accept exact "help" as a convenience alias for users who expect CLI-style help.
       const commandInput = currentInput.trimEnd();
       const isHelpAlias = commandInput.trim().toLowerCase() === 'help';
-      if (commandInput.startsWith('/') || isHelpAlias) {
+      if (canExecuteCommands && (commandInput.startsWith('/') || isHelpAlias)) {
         const firstSpace = commandInput.indexOf(' ');
         const commandName = isHelpAlias
           ? '/help'
@@ -705,6 +838,12 @@ export function useChatComposerState({
                 metadata: { type: 'builtin' },
               } as SlashCommand)
             : undefined);
+        if (commandName === '/config' && !canManageSettings) {
+          setInput('');
+          inputValueRef.current = '';
+          resetCommandMenuState();
+          return;
+        }
         if (matchedCommand && matchedCommand.type !== 'skill') {
           executeCommand(matchedCommand, isHelpAlias ? '/help' : commandInput);
           setInput('');
@@ -717,6 +856,53 @@ export function useChatComposerState({
             textareaRef.current.style.height = 'auto';
           }
           return;
+        }
+      }
+
+      const isBrandNewSession = !selectedSession?.id && !currentSessionId;
+      if (isBrandNewSession && provisionRepositoryKeysRef.current === null) {
+        if (!canProvisionWorkspaceRef.current) {
+          // Product/QA sessions deliberately run against the immutable source
+          // checkout. Do not even call the planning endpoint, which would
+          // otherwise advertise a worktree picker that the server must reject.
+          provisionRepositoryKeysRef.current = [];
+        } else {
+          if (workspacePlanRequestRef.current) {
+            return;
+          }
+          workspacePlanRequestRef.current = true;
+          try {
+            const response = await api.worktrees.sessionPlan(selectedProject.projectId);
+            const body = await response.json().catch(() => null);
+            if (!response.ok) {
+              throw new Error(body?.error?.message || body?.message || `Workspace planning failed (${response.status})`);
+            }
+            const plan = body?.data as SessionWorkspacePlan | undefined;
+            if (!canProvisionWorkspaceRef.current) {
+              // The policy may have changed while the request was in flight;
+              // discard any writable repository selection before session
+              // creation continues.
+              provisionRepositoryKeysRef.current = [];
+            } else if (plan?.enabled && plan.requiresSelection) {
+              setWorkspaceSelectionPlan(plan);
+              setWorkspaceSelectionKeys(plan.defaultRepositoryKeys);
+              return;
+            } else {
+              provisionRepositoryKeysRef.current = plan?.enabled
+                ? plan.defaultRepositoryKeys
+                : [];
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : 'Unknown error';
+            addMessage({
+              type: 'error',
+              content: `Failed to prepare the session workspace: ${message}`,
+              timestamp: new Date(),
+            });
+            return;
+          } finally {
+            workspacePlanRequestRef.current = false;
+          }
         }
       }
 
@@ -747,18 +933,26 @@ export function useChatComposerState({
       // handoff later — this id stays valid for the conversation's lifetime.
       let targetSessionId = selectedSession?.id || currentSessionId || null;
       if (!targetSessionId) {
+        if (sessionCreationRequestRef.current) {
+          return;
+        }
+        sessionCreationRequestRef.current = true;
         let createdSessionName = sessionSummary;
+        let createdWorkspace: SessionWorkspaceSummary | null = null;
         try {
           const response = await api.providers.createSession({
             provider,
+            projectId: selectedProject.projectId,
             projectPath: resolvedProjectPath,
             initialMessage: messageContent,
+            repositoryKeys: provisionRepositoryKeysRef.current ?? [],
           });
+          const body = await response.json().catch(() => null);
           if (!response.ok) {
-            throw new Error(`Failed to create session (${response.status})`);
+            throw new Error(body?.error?.message || body?.message || `Failed to create session (${response.status})`);
           }
-          const body = await response.json();
           targetSessionId = body?.data?.sessionId || null;
+          createdWorkspace = body?.data?.workspace ?? null;
           // A blank server name would leave the session unlabeled, so the local
           // summary stays the fallback unless a real name comes back.
           const returnedSessionName = typeof body?.data?.sessionName === 'string'
@@ -776,6 +970,8 @@ export function useChatComposerState({
             timestamp: new Date(),
           });
           return;
+        } finally {
+          sessionCreationRequestRef.current = false;
         }
 
         if (!targetSessionId) {
@@ -791,6 +987,7 @@ export function useChatComposerState({
           provider,
           project: selectedProject,
           summary: createdSessionName,
+          workspace: createdWorkspace,
         });
       }
 
@@ -853,6 +1050,11 @@ export function useChatComposerState({
       }
     },
     [
+      canExecuteCommands,
+      canProvisionWorkspace,
+      canUploadAttachments,
+      canSendMessages,
+      canManageSettings,
       selectedSession,
       attachedFiles,
       buildSendOptions,
@@ -877,6 +1079,12 @@ export function useChatComposerState({
   useEffect(() => {
     handleSubmitRef.current = handleSubmit;
   }, [handleSubmit]);
+
+  useEffect(() => {
+    provisionRepositoryKeysRef.current = null;
+    setWorkspaceSelectionPlan(null);
+    setWorkspaceSelectionKeys([]);
+  }, [selectedProjectId, sessionKey]);
 
   // The VPS dispatcher owns sending. While the card is visible, periodically
   // reconcile only its removal so the UI notices when the server claims it.
@@ -918,12 +1126,15 @@ export function useChatComposerState({
   // user tapped "stop and send", is submitted straight away. Mirror the value into
   // inputValueRef synchronously so handleSubmit reads the new text, not the stale state.
   const handleVoiceTranscript = useCallback((text: string, send?: boolean) => {
+    if (!canSendMessages) {
+      return;
+    }
     const base = inputValueRef.current.trim();
     const next = base ? `${base} ${text}` : text;
     setInput(next);
     inputValueRef.current = next;
     if (send) handleSubmitRef.current?.(createFakeSubmitEvent());
-  }, [setInput]);
+  }, [canSendMessages, setInput]);
 
   useEffect(() => {
     inputValueRef.current = input;
@@ -1017,6 +1228,9 @@ export function useChatComposerState({
 
   const handleInputChange = useCallback(
     (event: ChangeEvent<HTMLTextAreaElement>) => {
+      if (!canSendMessages) {
+        return;
+      }
       const newValue = event.target.value;
       const cursorPos = event.target.selectionStart;
 
@@ -1033,11 +1247,22 @@ export function useChatComposerState({
 
       handleCommandInputChange(newValue, cursorPos);
     },
-    [handleCommandInputChange, resetCommandMenuState, setCursorPosition],
+    [canSendMessages, handleCommandInputChange, resetCommandMenuState, setCursorPosition],
   );
 
   const handleKeyDown = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>) => {
+      // A historical transcript can remain mounted after the deployment
+      // policy switches to read-only (for example when a DingTalk account is
+      // changed in another tab).  The textarea is marked readOnly in the
+      // presenter, but key handlers still fire on a read-only control.  Stop
+      // command/file-mention menus, permission cycling, and queued submits
+      // from mutating local composer state in that window; the server-side
+      // capability check remains authoritative for forged frames.
+      if (!canSendMessages) {
+        return;
+      }
+
       if (handleCommandMenuKeyDown(event)) {
         return;
       }
@@ -1068,6 +1293,7 @@ export function useChatComposerState({
     },
     [
       cyclePermissionMode,
+      canSendMessages,
       handleCommandMenuKeyDown,
       handleFileMentionsKeyDown,
       handleSubmit,
@@ -1126,12 +1352,12 @@ export function useChatComposerState({
 
   const handleGrantToolPermission = useCallback(
     (suggestion: { entry: string; toolName: string }) => {
-      if (!suggestion || provider !== 'claude') {
+      if (!canApproveTools || !suggestion || provider !== 'claude') {
         return { success: false };
       }
       return grantClaudeToolPermission(suggestion.entry);
     },
-    [provider],
+    [canApproveTools, provider],
   );
 
   const handlePermissionDecision = useCallback(
@@ -1142,6 +1368,13 @@ export function useChatComposerState({
       const ids = Array.isArray(requestIds) ? requestIds : [requestIds];
       const validIds = ids.filter(Boolean);
       if (validIds.length === 0) {
+        return;
+      }
+
+      // A read-only deployment may still need to deny a stale prompt, but an
+      // approval would cross the provider-tool execution boundary. Keep the
+      // guard here even when a forged caller bypasses the banner UI.
+      if (decision?.allow && !canApproveTools) {
         return;
       }
 
@@ -1160,7 +1393,7 @@ export function useChatComposerState({
         previous.filter((request) => !validIds.includes(request.requestId)),
       );
     },
-    [sendMessage, setPendingPermissionRequests],
+    [canApproveTools, sendMessage, setPendingPermissionRequests],
   );
 
   const [isInputFocused, setIsInputFocused] = useState(false);
@@ -1236,6 +1469,11 @@ export function useChatComposerState({
     isInputFocused,
     commandModalPayload,
     closeCommandModal,
+    workspaceSelectionPlan,
+    workspaceSelectionKeys,
+    toggleWorkspaceRepository,
+    confirmWorkspaceSelection,
+    closeWorkspaceSelection,
     showCostModal,
   };
 }

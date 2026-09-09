@@ -130,6 +130,62 @@ test('Codex synchronizer skips sub-agent rollout files', { concurrency: false },
   }
 });
 
+test('Codex synchronizer requires a session_meta envelope before indexing a rollout', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-metadata-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const sessionsDir = path.join(tempRoot, '.codex', 'sessions', '2026', '07', '07');
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(
+      path.join(sessionsDir, 'rollout-payload-id-only.jsonl'),
+      `${JSON.stringify({
+        type: 'event_msg',
+        payload: { id: 'payload-id-only', cwd: workspacePath, type: 'user_message', message: 'not metadata' },
+      })}\n`,
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      const processed = await new CodexSessionSynchronizer().synchronize();
+
+      assert.equal(processed, 0);
+      assert.equal(sessionsDb.getSessionById('payload-id-only'), null);
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Codex synchronizer does not borrow another provider app row on native-id collision', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-collision-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const sharedId = 'shared-native-id';
+    await writeCodexTranscript(tempRoot, sharedId, workspacePath);
+
+    await withIsolatedDatabase(async () => {
+      // The native Codex id is already used as another provider's app id. Do
+      // not borrow that row or report a successful upsert that SQLite ignored.
+      sessionsDb.createAppSession(sharedId, 'claude', workspacePath, 'Claude owner');
+
+      const processed = await new CodexSessionSynchronizer().synchronize();
+
+      assert.equal(processed, 0);
+      assert.equal(sessionsDb.getSessionById(sharedId)?.provider, 'claude');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('Codex synchronizer leaves indexed sessions untitled when no name is available', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-indexed-'));
   const workspacePath = path.join(tempRoot, 'workspace');
@@ -550,4 +606,20 @@ test('an exec script that updates the plan yields the steps it set', () => {
       { content: 'Identify the project', status: 'pending' },
     ],
   }]);
+});
+
+test('live Codex turn completion is not emitted as a second terminal message', () => {
+  const provider = new CodexSessionsProvider();
+
+  // The runtime sends the SDK `turn.completed` event for usage accounting and
+  // then emits one final createCompleteMessage with exitCode/actualSessionId.
+  // A normalized terminal row here would clear the UI spinner too early and
+  // race the authoritative completion.
+  assert.deepEqual(
+    provider.normalizeMessage({
+      type: 'turn_complete',
+      usage: { total_token_usage: { total_tokens: 12 } },
+    }, 'codex-live-1'),
+    [],
+  );
 });

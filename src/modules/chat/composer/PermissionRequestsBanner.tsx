@@ -23,6 +23,8 @@ type PermissionRequestsBannerProps = {
     decision: { allow?: boolean; message?: string; rememberEntry?: string | null; updatedInput?: unknown },
   ) => void;
   handleGrantToolPermission: (suggestion: { entry: string; toolName: string }) => { success: boolean };
+  /** Read-only deployments may deny stale prompts but cannot approve tools. */
+  canApproveTools?: boolean;
 };
 
 /**
@@ -33,6 +35,10 @@ export default function PermissionRequestsBanner({
   pendingPermissionRequests,
   handlePermissionDecision,
   handleGrantToolPermission,
+  // A missing capability document must not expose an approval action to a
+  // direct/legacy consumer. ChatComposer passes the server decision explicitly
+  // for the normal application path.
+  canApproveTools = false,
 }: PermissionRequestsBannerProps) {
   // Filter out plan tool requests — they are handled inline by PlanDisplay
   const filteredRequests = pendingPermissionRequests.filter(
@@ -47,7 +53,7 @@ export default function PermissionRequestsBanner({
     <div className="mb-3 space-y-2">
       {filteredRequests.map((request) => {
         const CustomPanel = getPermissionPanel(request.toolName);
-        if (CustomPanel) {
+        if (CustomPanel && canApproveTools) {
           return (
             <CustomPanel
               key={request.requestId}
@@ -101,6 +107,12 @@ export default function PermissionRequestsBanner({
               </details>
             )}
 
+            {!canApproveTools && (
+              <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                Tool approvals are disabled in the read-only deployment. Deny this request to continue.
+              </p>
+            )}
+
             <ConfirmationActions>
               <ConfirmationAction
                 variant="outline"
@@ -108,24 +120,28 @@ export default function PermissionRequestsBanner({
               >
                 Deny
               </ConfirmationAction>
-              <ConfirmationAction
-                variant="outline"
-                onClick={() => {
-                  if (permissionEntry && !alreadyAllowed) {
-                    handleGrantToolPermission({ entry: permissionEntry, toolName: request.toolName });
-                  }
-                  handlePermissionDecision(matchingRequestIds, { allow: true, rememberEntry: permissionEntry });
-                }}
-                disabled={!permissionEntry}
-              >
-                {rememberLabel}
-              </ConfirmationAction>
-              <ConfirmationAction
-                variant="default"
-                onClick={() => handlePermissionDecision(request.requestId, { allow: true })}
-              >
-                Allow once
-              </ConfirmationAction>
+              {canApproveTools && (
+                <>
+                  <ConfirmationAction
+                    variant="outline"
+                    onClick={() => {
+                      if (permissionEntry && !alreadyAllowed) {
+                        handleGrantToolPermission({ entry: permissionEntry, toolName: request.toolName });
+                      }
+                      handlePermissionDecision(matchingRequestIds, { allow: true, rememberEntry: permissionEntry });
+                    }}
+                    disabled={!permissionEntry}
+                  >
+                    {rememberLabel}
+                  </ConfirmationAction>
+                  <ConfirmationAction
+                    variant="default"
+                    onClick={() => handlePermissionDecision(request.requestId, { allow: true })}
+                  >
+                    Allow once
+                  </ConfirmationAction>
+                </>
+              )}
             </ConfirmationActions>
           </Confirmation>
         );

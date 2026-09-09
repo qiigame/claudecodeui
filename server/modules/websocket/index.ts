@@ -1,5 +1,18 @@
 export { WS_OPEN_STATE, connectedClients } from './services/websocket-state.service.js';
-export { createWebSocketServer } from './services/websocket-server.service.js';
+export {
+  createWebSocketServer,
+  resolveWebSocketDeploymentPolicy,
+} from './services/websocket-server.service.js';
+export type {
+  WebSocketDeploymentPolicyCandidates,
+} from './services/websocket-server.service.js';
+// Identity predicates are shared by transport adapters and focused tests; the
+// upgrade itself only checks actor presence, while execution handlers require
+// the verified predicate.
+export {
+  hasDingTalkActor,
+  hasVerifiedDingTalkActor,
+} from './services/websocket-auth.service.js';
 export { chatRunRegistry } from './services/chat-run-registry.service.js';
 // Consumed by the providers module's sessions watcher, which announces the
 // sessions it (re)indexed from disk through the same builder the chat gateway

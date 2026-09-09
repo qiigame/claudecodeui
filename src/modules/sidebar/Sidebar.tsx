@@ -79,6 +79,9 @@ function Sidebar({
   const activeSessions = useBusySessionIdSet();
 
   const {
+    canMutateProjects,
+    canWriteSessions,
+    canWriteSessionFiles,
     isSidebarCollapsed,
     expandedProjects,
     activeRename,
@@ -184,6 +187,13 @@ function Sidebar({
     [updateSessionSummary],
   );
 
+  const handleNewSession = useCallback((project: Project) => {
+    if (!canWriteSessions) {
+      return;
+    }
+    onNewSession(project);
+  }, [canWriteSessions, onNewSession]);
+
   const projectListProps: SidebarProjectListProps = {
     projects,
     filteredProjects,
@@ -216,10 +226,13 @@ function Sidebar({
     onDeleteSession: showDeleteSessionConfirmation,
     onForkSession: forkSession,
     onLoadMoreSessions: loadMoreSessionsForProject,
-    onNewSession,
+    onNewSession: handleNewSession,
     onStartEditingSession: startEditingSession,
     onCancelEditingSession: cancelRename,
     onSaveEditingSession: handleSaveSessionName,
+    canMutateProjects,
+    canWriteSessions,
+    canWriteSessionFiles,
     t,
   };
 
@@ -243,6 +256,9 @@ function Sidebar({
         currentVersion={currentVersion}
         latestVersion={latestVersion}
         installMode={installMode}
+        canMutateProjects={canMutateProjects}
+        canWriteSessions={canWriteSessions}
+        canWriteSessionFiles={canWriteSessionFiles}
         t={t}
       />
 
@@ -327,13 +343,15 @@ function Sidebar({
               void refreshProjects();
             }}
             isRefreshing={isRefreshing}
+            // Keep the controller-level capability guard in the callback as
+            // well as in SidebarHeader's visibility check.  This covers stale
+            // keyboard/event handlers after a policy switch to read-only.
             onCreateProject={() => setShowNewProject(true)}
             onCollapseSidebar={handleCollapseSidebar}
             updateAvailable={updateAvailable}
             restartRequired={restartRequired}
             releaseInfo={releaseInfo}
             latestVersion={latestVersion}
-            currentVersion={currentVersion}
             onShowVersionModal={() => setShowVersionModal(true)}
             onShowSettings={onShowSettings}
             projectListProps={projectListProps}

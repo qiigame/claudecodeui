@@ -16,6 +16,10 @@ type GitPanelHeaderProps = {
   isPushing: boolean;
   isPublishing: boolean;
   isRevertingLocalCommit: boolean;
+  /** Allows branch/commit/push/pull/publish mutations in this deployment. */
+  canMutateGit: boolean;
+  /** Fetch is independently controlled because it refreshes remote metadata. */
+  canFetchGit: boolean;
   operationError: string | null;
   onRefresh: () => void;
   onRevertLocalCommit: () => Promise<void>;
@@ -42,6 +46,8 @@ export default function GitPanelHeader({
   isPushing,
   isPublishing,
   isRevertingLocalCommit,
+  canMutateGit,
+  canFetchGit,
   operationError,
   onRefresh,
   onRevertLocalCommit,
@@ -141,8 +147,9 @@ export default function GitPanelHeader({
         {/* Branch selector */}
         <div className="relative" ref={dropdownRef}>
           <button
-            onClick={() => setShowBranchDropdown((prev) => !prev)}
-            className={`flex items-center rounded-lg transition-colors hover:bg-accent ${isMobile ? 'space-x-1 px-2 py-1' : 'space-x-2 px-3 py-1.5'}`}
+            onClick={() => canMutateGit && setShowBranchDropdown((prev) => !prev)}
+            disabled={!canMutateGit}
+            className={`flex items-center rounded-lg transition-colors hover:bg-accent disabled:cursor-default disabled:opacity-80 ${isMobile ? 'space-x-1 px-2 py-1' : 'space-x-2 px-3 py-1.5'}`}
           >
             <GitBranch className={`text-muted-foreground ${isMobile ? 'h-3 w-3' : 'h-4 w-4'}`} />
             <span className="flex items-center gap-1">
@@ -168,7 +175,7 @@ export default function GitPanelHeader({
             <ChevronDown className={`h-3 w-3 text-muted-foreground transition-transform ${showBranchDropdown ? 'rotate-180' : ''}`} />
           </button>
 
-          {showBranchDropdown && (
+          {showBranchDropdown && canMutateGit && (
             <div className="absolute left-0 top-full z-50 mt-1 w-64 overflow-hidden rounded-xl border border-border bg-card shadow-lg">
               <div className="flex items-center gap-2 border-b border-border px-3 py-2">
                 <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -228,9 +235,10 @@ export default function GitPanelHeader({
 
         {/* Action buttons */}
         <div className={`flex items-center ${isMobile ? 'gap-1' : 'gap-2'}`}>
-          {remoteStatus?.hasRemote && (
+          {remoteStatus?.hasRemote && (canMutateGit || canFetchGit) && (
             <>
               {!remoteStatus.hasUpstream ? (
+                canMutateGit && (
                 <button
                   onClick={requestPublishConfirmation}
                   disabled={anyPending}
@@ -240,10 +248,11 @@ export default function GitPanelHeader({
                   <Upload className={`h-3 w-3 ${isPublishing ? 'animate-pulse' : ''}`} />
                   {!isMobile && <span>{isPublishing ? 'Publishing…' : 'Publish'}</span>}
                 </button>
+                )
               ) : (
                 <>
                   {/* Fetch — always visible when remote exists */}
-                  <button
+                  {canFetchGit && <button
                     onClick={() => void onFetch()}
                     disabled={anyPending}
                     className="flex items-center gap-1 rounded-lg bg-primary px-2.5 py-1 text-sm text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
@@ -251,9 +260,9 @@ export default function GitPanelHeader({
                   >
                     <RefreshCw className={`h-3 w-3 ${isFetching ? 'animate-spin' : ''}`} />
                     {!isMobile && <span>{isFetching ? 'Fetching…' : 'Fetch'}</span>}
-                  </button>
+                  </button>}
 
-                  {behindCount > 0 && (
+                  {canMutateGit && behindCount > 0 && (
                     <button
                       onClick={requestPullConfirmation}
                       disabled={anyPending}
@@ -265,7 +274,7 @@ export default function GitPanelHeader({
                     </button>
                   )}
 
-                  {aheadCount > 0 && (
+                  {canMutateGit && aheadCount > 0 && (
                     <button
                       onClick={requestPushConfirmation}
                       disabled={anyPending}
@@ -281,16 +290,18 @@ export default function GitPanelHeader({
             </>
           )}
 
-          <button
-            onClick={requestRevertLocalCommitConfirmation}
-            disabled={isRevertingLocalCommit}
-            className={`rounded-lg transition-colors hover:bg-accent disabled:opacity-50 ${isMobile ? 'p-1' : 'p-1.5'}`}
-            title="Revert latest local commit"
-          >
-            <RotateCcw
-              className={`text-muted-foreground ${isRevertingLocalCommit ? 'animate-pulse' : ''} ${isMobile ? 'h-3 w-3' : 'h-4 w-4'}`}
-            />
-          </button>
+          {canMutateGit && (
+            <button
+              onClick={requestRevertLocalCommitConfirmation}
+              disabled={isRevertingLocalCommit}
+              className={`rounded-lg transition-colors hover:bg-accent disabled:opacity-50 ${isMobile ? 'p-1' : 'p-1.5'}`}
+              title="Revert latest local commit"
+            >
+              <RotateCcw
+                className={`text-muted-foreground ${isRevertingLocalCommit ? 'animate-pulse' : ''} ${isMobile ? 'h-3 w-3' : 'h-4 w-4'}`}
+              />
+            </button>
+          )}
 
           <button
             onClick={onRefresh}
@@ -319,7 +330,7 @@ export default function GitPanelHeader({
       )}
 
       <NewBranchModal
-        isOpen={showNewBranchModal}
+        isOpen={canMutateGit && showNewBranchModal}
         currentBranch={currentBranch}
         isCreatingBranch={isCreatingBranch}
         onClose={() => setShowNewBranchModal(false)}

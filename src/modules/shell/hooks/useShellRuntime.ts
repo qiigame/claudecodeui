@@ -6,6 +6,7 @@ import type { Terminal } from '@xterm/xterm';
 import type { Project, ProjectSession } from '@/shared/types';
 import { useShellConnection } from '@/modules/shell/hooks/useShellConnection';
 import { useShellTerminal } from '@/modules/shell/hooks/useShellTerminal';
+import { readSelectedProvider } from '@/shared/selectedProvider';
 
 type UseShellRuntimeOptions = {
   selectedProject: Project | null | undefined;
@@ -55,6 +56,10 @@ export function useShellRuntime({
   const bypassPermissionsRef = useRef(bypassPermissions);
   const onProcessCompleteRef = useRef(onProcessComplete);
   const lastSessionIdRef = useRef<string | null>(selectedSession?.id ?? null);
+  const runtimeProvider = isPlainShell
+    ? 'plain-shell'
+    : selectedSession?.__provider || readSelectedProvider();
+  const lastRuntimeProviderRef = useRef(runtimeProvider);
 
   // Keep mutable values in refs so websocket handlers always read current data.
   useEffect(() => {
@@ -130,12 +135,15 @@ export function useShellRuntime({
 
   useEffect(() => {
     const currentSessionId = selectedSession?.id ?? null;
-    if (lastSessionIdRef.current !== currentSessionId && isInitialized) {
+    const sessionChanged = lastSessionIdRef.current !== currentSessionId;
+    const providerChanged = lastRuntimeProviderRef.current !== runtimeProvider;
+    if ((sessionChanged || providerChanged) && isInitialized) {
       disconnectFromShell();
     }
 
     lastSessionIdRef.current = currentSessionId;
-  }, [disconnectFromShell, isInitialized, selectedSession?.id]);
+    lastRuntimeProviderRef.current = runtimeProvider;
+  }, [disconnectFromShell, isInitialized, runtimeProvider, selectedSession?.id]);
 
   return {
     terminalContainerRef,

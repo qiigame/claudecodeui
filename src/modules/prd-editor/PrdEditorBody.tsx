@@ -12,6 +12,8 @@ type PrdEditorBodyProps = {
   previewMode: boolean;
   isDarkMode: boolean;
   wordWrap: boolean;
+  /** Makes CodeMirror a non-editable viewer while preserving markdown preview. */
+  readOnly?: boolean;
 };
 
 /** Rendered by PrdEditorWorkspace inside the prd-editor module to switch the PRD between markdown editing and rendered preview. */
@@ -21,6 +23,7 @@ export default function PrdEditorBody({
   previewMode,
   isDarkMode,
   wordWrap,
+  readOnly = false,
 }: PrdEditorBodyProps) {
   const extensions = useMemo(
     () => [markdown(), ...(wordWrap ? [EditorView.lineWrapping] : [])],
@@ -38,7 +41,9 @@ export default function PrdEditorBody({
   return (
     <CodeMirror
       value={content}
-      onChange={onContentChange}
+      onChange={readOnly ? undefined : onContentChange}
+      editable={!readOnly}
+      readOnly={readOnly}
       extensions={extensions}
       theme={isDarkMode ? oneDark : undefined}
       height="100%"

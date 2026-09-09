@@ -1,5 +1,11 @@
 import express from 'express';
 
+import {
+  captureDeploymentPolicy,
+  createDeploymentPolicyGuard,
+  DEPLOYMENT_CAPABILITIES,
+  type DeploymentPolicySource,
+} from '@/modules/deployment-policy/index.js';
 import type { createUserService } from './user.service.js';
 
 type AuthenticatedRequest = express.Request & { user?: { id?: number | string } };
@@ -10,8 +16,24 @@ function readUserId(request: express.Request): number {
 }
 
 /** Creates thin user routes that parse authenticated input and call the service. */
-export function createUserRouter(service: ReturnType<typeof createUserService>): express.Router {
+export function createUserRouter(
+  service: ReturnType<typeof createUserService>,
+  options: { deploymentPolicy?: DeploymentPolicySource } = {},
+): express.Router {
   const router = express.Router();
+  // Alternate hosts may mount this router without the composition-root
+  // middleware. Resolve one trusted policy at construction time so profile
+  // restrictions still apply while local self-hosted developer behavior stays
+  // compatible when no restrictive profile is configured.
+  const policy = captureDeploymentPolicy(options.deploymentPolicy);
+  const settingsWriteGuard = createDeploymentPolicyGuard({
+    policy,
+    capability: DEPLOYMENT_CAPABILITIES.SETTINGS_WRITE,
+  });
+  const personalMutationGuard = createDeploymentPolicyGuard({
+    policy,
+    capability: DEPLOYMENT_CAPABILITIES.SESSION_WRITE,
+  });
 
   router.get('/git-config', async (req, res, next) => {
     try {
@@ -21,7 +43,7 @@ export function createUserRouter(service: ReturnType<typeof createUserService>):
     }
   });
 
-  router.post('/git-config', async (req, res, next) => {
+  router.post('/git-config', settingsWriteGuard, async (req, res, next) => {
     try {
       const body = req.body as { gitName?: unknown; gitEmail?: unknown };
       res.json(await service.updateGitConfig(readUserId(req), body.gitName, body.gitEmail));
@@ -30,7 +52,7 @@ export function createUserRouter(service: ReturnType<typeof createUserService>):
     }
   });
 
-  router.post('/complete-onboarding', (req, res, next) => {
+  router.post('/complete-onboarding', personalMutationGuard, (req, res, next) => {
     try {
       res.json(service.completeOnboarding(readUserId(req)));
     } catch (error) {
@@ -54,7 +76,7 @@ export function createUserRouter(service: ReturnType<typeof createUserService>):
     }
   });
 
-  router.patch('/preferences', (req, res, next) => {
+  router.patch('/preferences', personalMutationGuard, (req, res, next) => {
     try {
       res.json(service.savePreferences(readUserId(req), req.body));
     } catch (error) {
@@ -72,7 +94,7 @@ export function createUserRouter(service: ReturnType<typeof createUserService>):
 
   // The scope is a session id or `project:<id>`, so it is read from the body
   // rather than the path: neither form is guaranteed to be URL-path-safe.
-  router.put('/drafts', (req, res, next) => {
+  router.put('/drafts', personalMutationGuard, (req, res, next) => {
     try {
       const body = req.body as { scope?: unknown };
       res.json(service.saveDraft(readUserId(req), body?.scope, req.body));
@@ -81,7 +103,7 @@ export function createUserRouter(service: ReturnType<typeof createUserService>):
     }
   });
 
-  router.delete('/drafts', (req, res, next) => {
+  router.delete('/drafts', personalMutationGuard, (req, res, next) => {
     try {
       const body = req.body as { scope?: unknown };
       res.json(service.deleteDraft(readUserId(req), body?.scope));

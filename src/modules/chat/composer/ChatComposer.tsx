@@ -36,6 +36,7 @@ import { ScheduleMessagePopover } from '@/modules/chat/composer/ScheduleMessageP
 import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageList';
 import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
 import ComposerPermissionMenu from '@/modules/chat/composer/ComposerPermissionMenu';
+import { comicRuntimeOnly } from '@/shared/utils';
 
 type MentionableFile = {
   name: string;
@@ -49,6 +50,22 @@ type ChatComposerProps = {
     decision: { allow?: boolean; message?: string; rememberEntry?: string | null; updatedInput?: unknown },
   ) => void;
   handleGrantToolPermission: (suggestion: { entry: string; toolName: string }) => { success: boolean };
+  /** Whether the server permits slash/custom command execution. */
+  canExecuteCommands?: boolean;
+  /** Whether the server permits uploading files to the chat attachment store. */
+  canUploadAttachments?: boolean;
+  /** Whether the active provider/session can accept a new chat turn. */
+  canSendMessages?: boolean;
+  /** Human-readable reason shown when sending is unavailable. */
+  sendDisabledReason?: string | null;
+  /** Whether the current user may stop an in-flight provider run. */
+  canAbortSession?: boolean;
+  /** Whether the server permits approving provider tool requests. */
+  canApproveTools?: boolean;
+  /** Whether the server may enqueue a future provider run. */
+  canScheduleMessages?: boolean;
+  /** Displays the deployment's read-only runtime state in place of the mode picker. */
+  readOnly?: boolean;
   activity: SessionActivity | null;
   isLoading: boolean;
   onAbortSession: () => void;
@@ -124,6 +141,17 @@ export default function ChatComposer({
   pendingPermissionRequests,
   handlePermissionDecision,
   handleGrantToolPermission,
+  // Keep direct/legacy consumers safe when they do not yet pass the server
+  // capability document: an omitted decision is denied, not implicitly
+  // writable. ChatInterface supplies every value explicitly.
+  canExecuteCommands = false,
+  canUploadAttachments = false,
+  canSendMessages = false,
+  sendDisabledReason = null,
+  canAbortSession = false,
+  canApproveTools = false,
+  canScheduleMessages = false,
+  readOnly = false,
   activity,
   isLoading,
   onAbortSession,
@@ -252,15 +280,21 @@ export default function ChatComposer({
   const hasActivityIndicator = Boolean(activity && !hasPendingPermissions);
 
   const hasQueuedDraft = Boolean(queuedDraft);
-  const canQueueDraft = isLoading && Boolean(input.trim() || attachedFiles.length > 0);
-  const submitHint = canQueueDraft
+  const canQueueDraft = canSendMessages && isLoading && Boolean(input.trim() || attachedFiles.length > 0);
+  const submitHint = !canSendMessages
+    ? sendDisabledReason ?? t('input.sendUnavailable', { defaultValue: 'Sending is unavailable in this deployment.' })
+    : canQueueDraft
     ? hasQueuedDraft
       ? t('input.hintText.updateQueued', { defaultValue: 'Enter to update queued message' })
       : t('input.hintText.queue', { defaultValue: 'Enter to queue your next message' })
     : sendByCtrlEnter
       ? t('input.hintText.ctrlEnter')
       : t('input.hintText.enter');
-  const submitAriaLabel = canQueueDraft
+  const submitAriaLabel = !canSendMessages && !isLoading
+    ? t('input.disabled', { defaultValue: 'Input disabled' })
+    : isLoading && !canAbortSession
+      ? t('input.abortUnavailable', { defaultValue: 'Stopping this run is unavailable for your account.' })
+    : canQueueDraft
     ? hasQueuedDraft
       ? t('input.queue.update', { defaultValue: 'Update queued message' })
       : t('input.queue.sendNext', { defaultValue: 'Queue next message' })
@@ -272,7 +306,11 @@ export default function ChatComposer({
     <div className="chat-composer-shell relative flex-shrink-0 px-2 pb-2 pt-0 sm:px-4 sm:pb-4 md:px-4 md:pb-6">
       {!hasPendingPermissions && (
         <div className="pointer-events-none absolute bottom-full left-1/2 z-10 w-[calc(100%-1rem)] max-w-[54.25rem] -translate-x-1/2 translate-y-px bg-transparent sm:w-[calc(100%-2rem)]">
-          <ActivityIndicator activity={activity} onAbort={onAbortSession} isInputFocused={isInputFocused} />
+          <ActivityIndicator
+            activity={activity}
+            onAbort={canAbortSession ? onAbortSession : undefined}
+            isInputFocused={isInputFocused}
+          />
         </div>
       )}
 
@@ -282,6 +320,7 @@ export default function ChatComposer({
             pendingPermissionRequests={pendingPermissionRequests}
             handlePermissionDecision={handlePermissionDecision}
             handleGrantToolPermission={handleGrantToolPermission}
+            canApproveTools={canApproveTools}
           />
         </div>
       )}
@@ -289,6 +328,7 @@ export default function ChatComposer({
       <ScheduledMessageList
         scheduledMessages={scheduledMessages}
         onCancel={onCancelScheduledMessage}
+        canCancel={canScheduleMessages}
       />
 
       {isEditingSentMessage && (
@@ -318,6 +358,16 @@ export default function ChatComposer({
           onEdit={onEditQueuedDraft}
           onDelete={onDeleteQueuedDraft}
         />
+      )}
+
+      {!canSendMessages && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="mx-auto mb-2 max-w-[54.25rem] rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200"
+        >
+          {sendDisabledReason ?? t('input.sendUnavailable', { defaultValue: 'Sending is unavailable in this deployment.' })}
+        </div>
       )}
 
       {!hasQuestionPanel && <div className="relative mx-auto max-w-[54.25rem]">
@@ -417,6 +467,8 @@ export default function ChatComposer({
               ref={textareaRef}
               dir="auto"
               value={input}
+              readOnly={!canSendMessages}
+              aria-disabled={!canSendMessages}
               onChange={onInputChange}
               onClick={onTextareaClick}
               onKeyDown={onTextareaKeyDown}
@@ -434,31 +486,36 @@ export default function ChatComposer({
             <PromptInputButton
               tooltip={{ content: t('input.attachFiles') }}
               onClick={openAttachmentPicker}
+              disabled={!canUploadAttachments || !canSendMessages}
               aria-label={t('input.attachFiles')}
             >
               <PaperclipIcon />
             </PromptInputButton>
 
-            {onVoiceTranscript && voiceAvailable && (
+            {canSendMessages && onVoiceTranscript && voiceAvailable && (
               <VoiceInputButton state={voiceState} onToggle={voiceToggle} errorMsg={voiceError} />
             )}
 
-            <TokenUsageSummary usage={tokenBudget} onClick={onShowTokenUsage} />
+            {canExecuteCommands && (
+              <TokenUsageSummary usage={tokenBudget} onClick={onShowTokenUsage} />
+            )}
 
-            <PromptInputButton
-              tooltip={{ content: t('input.showAllCommands') }}
-              onClick={onToggleCommandMenu}
-              className="relative"
-            >
-              <MessageSquareIcon />
-              {slashCommandsCount > 0 && (
-                <span
-                  className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground"
-                >
-                  {slashCommandsCount}
-                </span>
-              )}
-            </PromptInputButton>
+            {canExecuteCommands && (
+              <PromptInputButton
+                tooltip={{ content: t('input.showAllCommands') }}
+                onClick={onToggleCommandMenu}
+                className="relative"
+              >
+                <MessageSquareIcon />
+                {slashCommandsCount > 0 && (
+                  <span
+                    className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground"
+                  >
+                    {slashCommandsCount}
+                  </span>
+                )}
+              </PromptInputButton>
+            )}
 
             {hasInput && (
               <PromptInputButton
@@ -473,27 +530,40 @@ export default function ChatComposer({
           </PromptInputTools>
 
           <div className="ml-auto flex shrink-0 items-center gap-1.5 sm:gap-2">
-            <ScheduleMessagePopover
-              disabled={!input.trim()}
-              onSchedule={onScheduleMessage}
-            />
+            {canScheduleMessages && (
+              <ScheduleMessagePopover
+                disabled={!input.trim()}
+                onSchedule={onScheduleMessage}
+              />
+            )}
 
-            <ComposerModelMenu
-              effort={effort}
-              effortOptions={availableEffortOptions}
-              onSelectEffort={onSelectEffort}
-              model={model}
-              modelOptions={availableModelOptions}
-              onSelectModel={onSelectModel}
-              modelsLoading={modelsLoading}
-            />
+            {!comicRuntimeOnly && !readOnly && (
+              <ComposerModelMenu
+                effort={effort}
+                effortOptions={availableEffortOptions}
+                onSelectEffort={onSelectEffort}
+                model={model}
+                modelOptions={availableModelOptions}
+                onSelectModel={onSelectModel}
+                modelsLoading={modelsLoading}
+              />
+            )}
 
             <ComposerPermissionMenu
               permissionMode={permissionMode}
-              permissionModes={availablePermissionModes}
+              permissionModes={readOnly ? [] : availablePermissionModes}
               onSelectPermissionMode={onSelectPermissionMode}
               providerLabel={providerLabel}
             />
+            {readOnly && (
+              <span
+                className="inline-flex h-8 items-center rounded-lg border border-border/60 bg-muted/50 px-2 text-[11px] font-medium text-muted-foreground"
+                title="Read-only runtime"
+                aria-label="Read-only runtime"
+              >
+                Read-only
+              </span>
+            )}
 
             <PromptInputSubmit
               onClick={
@@ -503,7 +573,9 @@ export default function ChatComposer({
                       onSubmit(e);
                     }
                   : isLoading
-                    ? onAbortSession
+                    ? canAbortSession
+                      ? onAbortSession
+                      : undefined
                     : isRecording
                       ? (e: MouseEvent<HTMLButtonElement>) => {
                           e.preventDefault();
@@ -513,12 +585,12 @@ export default function ChatComposer({
               }
               disabled={
                 isLoading
-                  ? false
+                  ? !canAbortSession
                   : isRecording
-                    ? false
+                    ? !canSendMessages
                     : isTranscribing
                       ? true
-                      : !input.trim() && attachedFiles.length === 0
+                      : !canSendMessages || (!input.trim() && attachedFiles.length === 0)
               }
               aria-label={submitAriaLabel}
               title={submitAriaLabel}

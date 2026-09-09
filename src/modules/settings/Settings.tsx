@@ -3,6 +3,7 @@ import { X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { ProviderLoginModal } from '@/modules/provider-auth';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
 import { Button } from '@/shared/ui';
 import SettingsSidebar from '@/modules/settings/SettingsSidebar';
 import AgentsSettingsTab from '@/modules/settings/tabs/agents-settings/AgentsSettingsTab';
@@ -18,6 +19,7 @@ import AboutTab from '@/modules/settings/tabs/AboutTab';
 import { useSettingsController } from '@/modules/settings/hooks/useSettingsController';
 import { useWebPush } from '@/modules/settings/hooks/useWebPush';
 import type { AgentSettingsProject } from '@/shared/types';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type SettingsProps = {
   isOpen: boolean;
@@ -36,6 +38,16 @@ type DesktopNotificationsState = {
 
 /** Exported as the settings module's public entry point and rendered by the sidebar module as its settings dialog. */
 function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: SettingsProps) {
+  const { authMode, user, canManageSettings: authCanManageSettings } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  // Authentication identifies an administrator; the deployment policy is the
+  // second, server-authorized boundary.  A product/QA deployment may expose
+  // the settings route to a signed-in user while still forbidding all config
+  // writes, so keep the whole settings surface closed unless both checks pass.
+  const canManageSettings = authCanManageSettings
+    && can('settings.write')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
   const { t } = useTranslation('settings');
   const desktopNotificationsBridge = useMemo(() => (
     typeof window === 'undefined'
@@ -66,7 +78,12 @@ function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: Set
     loginProvider,
     handleLoginComplete,
   } = useSettingsController({
-    isOpen,
+    // Keep the controller inert until both authentication and the
+    // deployment-level settings.write capability are present.  Passing the
+    // effective value also prevents its debounced preference writer from
+    // firing while a read-only 0.78 session is mounted or while policy is
+    // still loading.
+    isOpen: isOpen && canManageSettings,
     initialTab
   });
 
@@ -135,7 +152,7 @@ function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: Set
     });
   };
 
-  if (!isOpen) {
+  if (!isOpen || !canManageSettings) {
     return null;
   }
 

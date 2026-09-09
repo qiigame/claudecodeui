@@ -1,4 +1,4 @@
-import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
+import { BrowserRouter as Router, Outlet, Route, Routes } from 'react-router-dom';
 import { I18nextProvider } from 'react-i18next';
 
 import { ThemeProvider } from '@/shared/context/ThemeContext';
@@ -6,9 +6,11 @@ import { UiPreferencesProvider } from '@/shared/context/UiPreferencesContext';
 import { AuthProvider, ProtectedRoute } from '@/modules/auth';
 import { TaskMasterProvider,TasksSettingsProvider } from '@/modules/task-master';
 import { WebSocketProvider } from '@/shared/context/WebSocketContext';
-import { PluginsProvider } from '@/modules/plugins';
+import { DeploymentPolicyProvider } from '@/shared/context/DeploymentPolicyContext';
+import { CoordinationStandalonePage, PluginsProvider } from '@/modules/plugins';
 import { ProjectWorkspaceRoute } from '@/modules/project-workspace';
 import { i18n } from '@/modules/i18n';
+import { PublicShareViewer } from '@/modules/collaboration';
 
 const DEPLOYMENT_ASSET_DIRECTORIES = new Set(['assets', 'static', 'icons', 'images']);
 
@@ -105,33 +107,45 @@ function detectRouterBasename() {
   return detectedBasename;
 }
 
-/** Rendered by main.tsx; mounts the shared providers, the auth gate and the project workspace routes. */
+function AuthenticatedApplication() {
+  return (
+    <UiPreferencesProvider>
+      <AuthProvider>
+        <DeploymentPolicyProvider>
+          <WebSocketProvider>
+            <PluginsProvider>
+              <TasksSettingsProvider>
+                <TaskMasterProvider>
+                  <ProtectedRoute>
+                    <Outlet />
+                  </ProtectedRoute>
+                </TaskMasterProvider>
+              </TasksSettingsProvider>
+            </PluginsProvider>
+          </WebSocketProvider>
+        </DeploymentPolicyProvider>
+      </AuthProvider>
+    </UiPreferencesProvider>
+  );
+}
+
+/** Rendered by main.tsx; keeps public shares outside every auth/runtime provider and gates workspace routes normally. */
 export default function App() {
   const routerBasename = detectRouterBasename();
 
   return (
     <I18nextProvider i18n={i18n}>
       <ThemeProvider>
-        <UiPreferencesProvider>
-        <AuthProvider>
-          <WebSocketProvider>
-            <PluginsProvider>
-              <TasksSettingsProvider>
-                <TaskMasterProvider>
-                <ProtectedRoute>
-                  <Router basename={routerBasename}>
-                    <Routes>
-                      <Route path="/" element={<ProjectWorkspaceRoute />} />
-                      <Route path="/session/:sessionId" element={<ProjectWorkspaceRoute />} />
-                    </Routes>
-                  </Router>
-                </ProtectedRoute>
-                </TaskMasterProvider>
-              </TasksSettingsProvider>
-            </PluginsProvider>
-          </WebSocketProvider>
-        </AuthProvider>
-        </UiPreferencesProvider>
+        <Router basename={routerBasename}>
+          <Routes>
+            <Route path="share/:token" element={<PublicShareViewer />} />
+            <Route element={<AuthenticatedApplication />}>
+              <Route index element={<ProjectWorkspaceRoute />} />
+              <Route path="coordination" element={<CoordinationStandalonePage />} />
+              <Route path="session/:sessionId" element={<ProjectWorkspaceRoute />} />
+            </Route>
+          </Routes>
+        </Router>
       </ThemeProvider>
     </I18nextProvider>
   );

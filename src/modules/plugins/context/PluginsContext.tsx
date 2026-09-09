@@ -3,6 +3,8 @@ import type { ReactNode } from 'react';
 
 import { api } from '@/shared/api';
 import type { Plugin } from '@/shared/types';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
 
 
 type PluginsContextValue = {
@@ -28,6 +30,16 @@ export function usePlugins() {
 
 /** Mounted by the app root so the plugins and project-workspace modules can read and mutate installed plugins through usePlugins. */
 export function PluginsProvider({ children }: { children: ReactNode }) {
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const { authMode, user } = useAuth();
+  // Plugin installation, removal, updates and enable/disable all mutate the
+  // host process or its on-disk plugin directory.  Keep the context methods
+  // inert in product/QA deployments as well as hiding their settings tab; a
+  // stale component or an extension callback must not turn a read-only UI
+  // into a write request.  The server remains authoritative.
+  const canManagePlugins = can('plugin.write')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [loading, setLoading] = useState(true);
   const [pluginsError, setPluginsError] = useState<string | null>(null);
@@ -63,6 +75,10 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
   }, [refreshPlugins]);
 
   const installPlugin = useCallback(async (url: string) => {
+    if (!canManagePlugins) {
+      return { success: false, error: 'Plugin installation is disabled for this deployment.' };
+    }
+
     try {
       const res = await api.plugins.install(url);
       const data = await res.json();
@@ -74,9 +90,13 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : 'Install failed' };
     }
-  }, [refreshPlugins]);
+  }, [canManagePlugins, refreshPlugins]);
 
   const uninstallPlugin = useCallback(async (name: string) => {
+    if (!canManagePlugins) {
+      return { success: false, error: 'Plugin removal is disabled for this deployment.' };
+    }
+
     try {
       const res = await api.plugins.uninstall(name);
       const data = await res.json();
@@ -88,9 +108,13 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : 'Uninstall failed' };
     }
-  }, [refreshPlugins]);
+  }, [canManagePlugins, refreshPlugins]);
 
   const updatePlugin = useCallback(async (name: string) => {
+    if (!canManagePlugins) {
+      return { success: false, error: 'Plugin updates are disabled for this deployment.' };
+    }
+
     try {
       const res = await api.plugins.update(name);
       const data = await res.json();
@@ -102,9 +126,13 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : 'Update failed' };
     }
-  }, [refreshPlugins]);
+  }, [canManagePlugins, refreshPlugins]);
 
   const togglePlugin = useCallback(async (name: string, enabled: boolean): Promise<{ success: boolean; error: string | null }> => {
+    if (!canManagePlugins) {
+      return { success: false, error: 'Plugin changes are disabled for this deployment.' };
+    }
+
     try {
       const res = await api.plugins.toggle(name, enabled);
       if (!res.ok) {
@@ -123,7 +151,7 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : 'Toggle failed' };
     }
-  }, [refreshPlugins]);
+  }, [canManagePlugins, refreshPlugins]);
 
   // Built once per change: an inline object would re-render every consumer on
   // any render of this provider.

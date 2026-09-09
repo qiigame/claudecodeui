@@ -13,21 +13,24 @@
  */
 
 import crypto from 'crypto';
-import { promises as fs } from 'fs';
-import os from 'os';
-import path from 'path';
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
 import {
   appendFilesInputTag,
   buildClaudeUserContent,
+  getGlobalImageAssetsDir,
   normalizeImageDescriptors
 } from '@/shared/image-attachments.js';
 import {
   CLAUDE_PREDEFINED_MODELS,
   CLAUDE_ULTRACODE_EFFORT
 } from '@/modules/providers/list/claude/claude-models.provider.js';
+import { ClaudeMcpProvider } from '@/modules/providers/list/claude/claude-mcp.provider.js';
+import {
+  CLAUDE_READ_ONLY_TOOLS,
+  secureClaudeWebSdkOptions,
+} from '@/modules/providers/list/claude/claude-web-runtime-options.provider.js';
 import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import {
   createNotificationEvent,
@@ -36,7 +39,14 @@ import {
   notifyRunStopped,
   notifyUserIfEnabled
 } from '@/modules/notifications/index.js';
-import { createCompleteMessage, createNormalizedMessage } from '@/shared/utils.js';
+import { dataverseRuntimeBridgeService } from '@/modules/runtime-bridge/index.js';
+import {
+  createCompleteMessage,
+  createNormalizedMessage,
+  filterExecutionEnvironmentForReadOnly,
+  filterProviderEnvironmentForReadOnly,
+} from '@/shared/utils.js';
+import { captureClaudeEnvironmentSnapshot } from './claude-config-lock.js';
 
 const activeSessions = new Map();
 const pendingToolApprovals = new Map();
@@ -71,6 +81,14 @@ const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEO
 const BG_WAIT_CEILING_MS = 30 * 60 * 1000;
 
 const TOOLS_REQUIRING_INTERACTION = new Set(['AskUserQuestion', 'ExitPlanMode']);
+const claudeMcpProvider = new ClaudeMcpProvider();
+
+// Claude's `plan` mode is a useful UX hint but is not, by itself, a complete
+// authorization boundary: custom MCP tools and future SDK tools can still be
+// presented to `canUseTool`. Keep an explicit allowlist for product/QA turns;
+// anything not listed (including unknown MCP tools) is denied without waiting
+// for a browser approval that the read-only gateway will never accept.
+const READ_ONLY_WEB_TOOLS = new Set(CLAUDE_READ_ONLY_TOOLS);
 
 // Ultracode is a session-scoped setting rather than an SDK effort level: it pairs xhigh
 // effort with standing dynamic-workflow orchestration, and the CLI only honours it when
@@ -216,19 +234,56 @@ function matchesToolPermission(entry, toolName, input) {
 }
 
 function mapCliOptionsToSDK(options = {}) {
-  const { providerSessionId, cwd, toolsSettings, permissionMode, effort, resumeAnchorId, resumeFromScratch } = options;
+  const {
+    providerSessionId,
+    cwd,
+    toolsSettings,
+    permissionMode,
+    effort,
+    resumeAnchorId,
+    resumeFromScratch,
+    executionEnvironment,
+    environment,
+  } = options;
 
   const sdkOptions = {};
 
+  const deploymentReadOnly = options.deploymentReadOnly === true;
+  // Use the caller's immutable startup snapshot rather than reading the live
+  // process environment after an async bridge lookup. Claude fork support
+  // temporarily overrides CLAUDE_CONFIG_DIR for its SDK call.
+  const baseEnvironment = environment
+    && typeof environment === 'object'
+    && !Array.isArray(environment)
+    ? environment
+    : process.env;
+  const runtimeExecutionEnvironment = deploymentReadOnly
+    ? filterExecutionEnvironmentForReadOnly(executionEnvironment)
+    : executionEnvironment;
+
   // Forward all host env vars (e.g. ANTHROPIC_BASE_URL) to the subprocess.
   // Since SDK 0.2.113, options.env replaces process.env instead of overlaying it.
-  sdkOptions.env = { ...process.env, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(BG_WAIT_CEILING_MS) };
+  sdkOptions.env = {
+    ...baseEnvironment,
+    ...(runtimeExecutionEnvironment && typeof runtimeExecutionEnvironment === 'object'
+      ? runtimeExecutionEnvironment
+      : {}),
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(BG_WAIT_CEILING_MS),
+  };
 
   // Resolve the executable eagerly on Windows because the SDK uses raw child_process.spawn,
   // which does not reliably follow npm's shell wrappers like cross-spawn does.
   // When nothing resolves the option stays unset on purpose: the SDK then falls back to the
   // binary it ships, which beats handing it a bare `claude` that raw spawn can never launch.
-  const claudeExecutablePath = resolveClaudeCodeExecutablePath(process.env.CLAUDE_CLI_PATH);
+  // A readonly child must not inherit an operator/bridge-selected executable
+  // path.  `CLAUDE_CLI_PATH` is deployment configuration, not a request
+  // credential, and on Unix the resolver would otherwise hand an arbitrary
+  // script straight to the SDK.  The SDK's bundled binary remains the safe
+  // fallback for the managed profile; writable developer runs retain the
+  // existing explicit override behavior.
+  const claudeExecutablePath = deploymentReadOnly
+    ? undefined
+    : resolveClaudeCodeExecutablePath(baseEnvironment.CLAUDE_CLI_PATH);
   if (claudeExecutablePath) {
     sdkOptions.pathToClaudeCodeExecutable = claudeExecutablePath;
   }
@@ -237,7 +292,9 @@ function mapCliOptionsToSDK(options = {}) {
     sdkOptions.cwd = cwd;
   }
 
-  if (permissionMode && permissionMode !== 'default') {
+  if (deploymentReadOnly) {
+    sdkOptions.permissionMode = 'plan';
+  } else if (permissionMode && permissionMode !== 'default') {
     sdkOptions.permissionMode = permissionMode;
   }
 
@@ -247,7 +304,7 @@ function mapCliOptionsToSDK(options = {}) {
     skipPermissions: false
   };
 
-  if (settings.skipPermissions && permissionMode !== 'plan') {
+  if (!deploymentReadOnly && settings.skipPermissions && permissionMode !== 'plan') {
     sdkOptions.permissionMode = 'bypassPermissions';
   }
 
@@ -270,6 +327,30 @@ function mapCliOptionsToSDK(options = {}) {
   sdkOptions.tools = { type: 'preset', preset: 'claude_code' };
 
   sdkOptions.disallowedTools = settings.disallowedTools || [];
+
+  if (deploymentReadOnly) {
+    // Preserve only harmless planning/read tools. The callback below repeats
+    // this check because the SDK can bypass `disallowedTools` for built-ins.
+    sdkOptions.allowedTools = [...new Set(
+      sdkOptions.allowedTools.filter((tool) => READ_ONLY_WEB_TOOLS.has(String(tool))),
+    )];
+    // The preset above is useful for writable developer sessions, but it would
+    // expose Bash/Edit and any future built-in tool to a product/QA child.
+    // Use the SDK's exact-name array in addition to canUseTool's defense in
+    // depth; WebFetch/WebSearch are intentionally not present.
+    sdkOptions.tools = [...CLAUDE_READ_ONLY_TOOLS];
+    sdkOptions.disallowedTools = [
+      ...new Set([
+        ...sdkOptions.disallowedTools,
+        'Edit',
+        'Write',
+        'NotebookEdit',
+        'Bash',
+        'Task',
+        'KillShell',
+      ]),
+    ];
+  }
 
   sdkOptions.model = options.model || CLAUDE_PREDEFINED_MODELS.DEFAULT;
 
@@ -586,7 +667,9 @@ function startsBackgroundWork(sdkMessage) {
  * @returns {Promise<Array<Object>>} SDKUserMessage records for the turn
  */
 async function buildPromptMessages(command, images, files, cwd) {
-  const promptWithFiles = appendFilesInputTag(command, files);
+  // Keep the provider-side attachment boundary in place even when a legacy
+  // caller invokes the runtime without going through the websocket filter.
+  const promptWithFiles = appendFilesInputTag(command, files, cwd);
   const content = normalizeImageDescriptors(images).length === 0
     ? promptWithFiles
     : await buildClaudeUserContent(promptWithFiles, images, cwd);
@@ -629,58 +712,19 @@ function createHeldPromptStream(messages) {
 }
 
 /**
- * Loads MCP server configurations from ~/.claude.json
- * @param {string} cwd - Current working directory for project-specific configs
+ * Loads the host-owned MCP definitions managed by ClaudeMcpProvider. The
+ * caller only reaches this helper for a writable/developer Web turn; readonly
+ * turns intentionally skip it altogether.
+ *
+ * Errors stay deliberately generic because JSON parse errors can quote config
+ * contents, including header or environment values.
  * @returns {Object|null} MCP servers object or null if none found
  */
 async function loadMcpConfig(cwd) {
   try {
-    const claudeConfigPath = path.join(os.homedir(), '.claude.json');
-
-    // Check if config file exists
-    try {
-      await fs.access(claudeConfigPath);
-    } catch (error) {
-      // File doesn't exist, return null
-      // No config file
-      return null;
-    }
-
-    // Read and parse config file
-    let claudeConfig;
-    try {
-      const configContent = await fs.readFile(claudeConfigPath, 'utf8');
-      claudeConfig = JSON.parse(configContent);
-    } catch (error) {
-      console.error('Failed to parse ~/.claude.json:', error.message);
-      return null;
-    }
-
-    // Extract MCP servers (merge global and project-specific)
-    let mcpServers = {};
-
-    // Add global MCP servers
-    if (claudeConfig.mcpServers && typeof claudeConfig.mcpServers === 'object') {
-      mcpServers = { ...claudeConfig.mcpServers };
-      // Global MCP servers loaded
-    }
-
-    // Add/override with project-specific MCP servers
-    if (claudeConfig.claudeProjects && cwd) {
-      const projectConfig = claudeConfig.claudeProjects[cwd];
-      if (projectConfig && projectConfig.mcpServers && typeof projectConfig.mcpServers === 'object') {
-        mcpServers = { ...mcpServers, ...projectConfig.mcpServers };
-        // Project MCP servers merged
-      }
-    }
-
-    // Return null if no servers found
-    if (Object.keys(mcpServers).length === 0) {
-      return null;
-    }
-    return mcpServers;
-  } catch (error) {
-    console.error('Error loading MCP config:', error.message);
+    return await claudeMcpProvider.loadDeveloperRuntimeServers(cwd || process.cwd());
+  } catch {
+    console.error('Failed to load Claude MCP configuration.');
     return null;
   }
 }
@@ -756,7 +800,25 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   let queryInstance = null;
 
   try {
+    // Capture before the bridge's helper/config awaits. The shared lock waits
+    // for any in-flight Claude fork to restore process.env, then returns a
+    // detached object that remains stable for the whole turn setup.
+    const environmentSnapshot = await captureClaudeEnvironmentSnapshot();
+    // Resolve the pilot credentials once per turn. A missing helper setting
+    // produces null, preserving the regular Claude SDK environment and model.
+    const runtimeBridge = await dataverseRuntimeBridgeService.resolveClaudeRuntime({
+      // Only the product/QA Web profile forcibly disables Claude's simple
+      // mode. Developer deployments retain the operator's native setting
+      // layers and can intentionally opt into simple mode.
+      omitSimpleMode: options.deploymentReadOnly === true,
+      // A read-only turn may use a Dataverse helper only when the deployment
+      // explicitly opts into that credential boundary. The browser cannot
+      // control this flag.
+      deploymentReadOnly: options.deploymentReadOnly === true,
+      environment: environmentSnapshot,
+    });
     const resolvedModel = await context.resolveResumeModel(sessionId, options.model);
+    const runtimeModel = resolvedModel || runtimeBridge?.model || options.model;
     let effortModels = CLAUDE_PREDEFINED_MODELS;
     try {
       effortModels = await context.getProviderModels();
@@ -767,11 +829,69 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     const sdkOptions = mapCliOptionsToSDK({
       ...options,
       providerSessionId,
-      model: resolvedModel || options.model,
+      model: runtimeModel,
       effortModels,
+      environment: environmentSnapshot,
+    });
+    if (runtimeBridge) {
+      sdkOptions.env = {
+        ...sdkOptions.env,
+        ...runtimeBridge.env,
+        ...(options.deploymentReadOnly === true
+          ? filterExecutionEnvironmentForReadOnly(options.executionEnvironment)
+          : options.executionEnvironment && typeof options.executionEnvironment === 'object'
+            ? options.executionEnvironment
+          : {}),
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(BG_WAIT_CEILING_MS),
+      };
+      if (runtimeBridge.settings) {
+        sdkOptions.settings = {
+          ...runtimeBridge.settings,
+          ...(sdkOptions.settings || {}),
+        };
+      }
+      sdkOptions.model = runtimeModel;
+    }
+    if (options.deploymentReadOnly === true) {
+      // The bridge and host layers are merged above. Scrub the final child
+      // environment as well so a credential accidentally present in either
+      // layer cannot reintroduce Git/receipt/MCP secrets.
+      sdkOptions.env = filterProviderEnvironmentForReadOnly(sdkOptions.env, {
+        // Omitting HOME is not sufficient: native Claude can recover the
+        // service account's passwd-record home and discover personal config.
+        // A shared product/QA deployment must provide a dedicated state root.
+        requireIsolatedHome: true,
+      });
+      if (sdkOptions.settings && typeof sdkOptions.settings === 'object'
+        && !Array.isArray(sdkOptions.settings)
+        && sdkOptions.settings.env && typeof sdkOptions.settings.env === 'object'
+        && !Array.isArray(sdkOptions.settings.env)) {
+        sdkOptions.settings = {
+          ...sdkOptions.settings,
+          env: filterProviderEnvironmentForReadOnly(sdkOptions.settings.env),
+        };
+      }
+    }
+    // Terminals may intentionally use bare/simple mode. Web Chat requires the
+    // full tool catalog and host-owned MCP definitions, so harden both SDK
+    // channels after every environment/settings merge.
+    // The Web/readonly hardening is a deployment boundary, not a property of
+    // every Claude invocation.  Developer sessions must retain Claude Code's
+    // user/local settings, skills, plugins, and MCP scopes; product/QA turns
+    // opt into the isolated project-only posture explicitly.
+    secureClaudeWebSdkOptions(sdkOptions, {
+      readOnly: options.deploymentReadOnly === true,
+      // General attachments are stored outside the project cwd.  Grant the
+      // readonly Claude child exactly that server-owned directory, and no
+      // caller-selected path, so its Read tool can inspect uploaded files.
+      readOnlyAdditionalDirectories: options.deploymentReadOnly === true
+        ? [getGlobalImageAssetsDir()]
+        : undefined,
     });
 
-    const mcpServers = await loadMcpConfig(options.cwd);
+    const mcpServers = options.deploymentReadOnly === true
+      ? null
+      : await loadMcpConfig(options.cwd);
     if (mcpServers) {
       sdkOptions.mcpServers = mcpServers;
     }
@@ -781,26 +901,35 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // own stream because an async generator cannot be replayed once consumed.
     const promptMessages = await buildPromptMessages(command, options.images, options.files, options.cwd);
 
-    sdkOptions.hooks = {
-      Notification: [{
-        matcher: '',
-        hooks: [async (input) => {
-          const message = typeof input?.message === 'string' ? input.message : 'Claude requires your attention.';
-          // Notifications are app-facing, so they carry the app session id.
-          emitNotification(createNotificationEvent({
-            provider: 'claude',
-            sessionId: sessionId || capturedSessionId || null,
-            kind: 'action_required',
-            code: 'agent.notification',
-            meta: { message, sessionName: sessionSummary },
-            severity: 'warning',
-            requiresUserAction: true,
-            dedupeKey: `claude:hook:notification:${sessionId || capturedSessionId || 'none'}:${message}`
-          }));
-          return {};
+    if (options.deploymentReadOnly !== true) {
+      sdkOptions.hooks = {
+        Notification: [{
+          matcher: '',
+          hooks: [async (input) => {
+            const message = typeof input?.message === 'string' ? input.message : 'Claude requires your attention.';
+            // Notifications are app-facing, so they carry the app session id.
+            emitNotification(createNotificationEvent({
+              provider: 'claude',
+              sessionId: sessionId || capturedSessionId || null,
+              kind: 'action_required',
+              code: 'agent.notification',
+              meta: { message, sessionName: sessionSummary },
+              severity: 'warning',
+              requiresUserAction: true,
+              dedupeKey: `claude:hook:notification:${sessionId || capturedSessionId || 'none'}:${message}`
+            }));
+            return {};
+          }]
         }]
-      }]
-    };
+      };
+    } else {
+      // Programmatic SDK hooks are a separate execution channel from project
+      // settings.  Do not register even the app notification hook in the
+      // read-only deployment, so a later SDK upgrade cannot turn it into a
+      // command/plugin bypass.  Terminal states remain reported by the
+      // provider event stream and notification service.
+      delete sdkOptions.hooks;
+    }
 
     // Caveat: in 'auto' and 'bypassPermissions' modes the SDK resolves approval
     // at the permission-mode step and skips this callback, so interactive tools
@@ -809,6 +938,9 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // tools to a PreToolUse hook (runs before the mode check) if we need them
     // to work in those modes.
     sdkOptions.canUseTool = async (toolName, input, context) => {
+      if (options.deploymentReadOnly === true && !READ_ONLY_WEB_TOOLS.has(toolName)) {
+        return { behavior: 'deny', message: 'Tool disabled in the read-only deployment.' };
+      }
       const requiresInteraction = TOOLS_REQUIRING_INTERACTION.has(toolName);
 
       if (!requiresInteraction) {

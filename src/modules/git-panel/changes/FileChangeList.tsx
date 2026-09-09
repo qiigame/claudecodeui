@@ -15,6 +15,7 @@ type FileChangeListProps = {
   onOpenFile: (filePath: string) => void;
   onToggleWrapText: () => void;
   onRequestFileAction: (filePath: string, status: FileStatusCode) => void;
+  canMutateGit?: boolean;
 };
 
 /** Rendered by ChangesView to walk the modified/added/deleted/untracked groups and render a row per file. */
@@ -31,6 +32,7 @@ export default function FileChangeList({
   onOpenFile,
   onToggleWrapText,
   onRequestFileAction,
+  canMutateGit = false,
 }: FileChangeListProps) {
   return (
     <>
@@ -52,6 +54,7 @@ export default function FileChangeList({
               onOpenFile={onOpenFile}
               onToggleWrapText={onToggleWrapText}
               onRequestFileAction={onRequestFileAction}
+              canMutateGit={canMutateGit}
             />
           )),
       )}

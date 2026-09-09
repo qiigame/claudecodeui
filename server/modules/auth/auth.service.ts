@@ -22,6 +22,23 @@ type AuthDependencies = {
   hashPassword(password: string): Promise<string>;
   comparePassword(password: string, passwordHash: string): Promise<boolean>;
   generateToken(user: AuthUser): string;
+  /** Resolves the server-owned settings capability for a newly authenticated user. */
+  getSettingsPermission?: (user: AuthUser) => boolean;
+  getDingTalkStatus?: () => {
+    enabled: boolean;
+    providers: Array<{ key: string; name: string }>;
+  };
+  /**
+   * Deployment-owned switch for local-password authentication. This must be
+   * supplied by the composition root; it is never derived from request data.
+   */
+  isPasswordLoginEnabled?: () => boolean;
+  /** Public auth-mode metadata consumed by the login screen. */
+  getAuthMode?: () => {
+    mode: 'platform' | 'dingtalk' | 'password' | 'unavailable';
+    requiresLogin: boolean;
+    passwordLoginEnabled: boolean;
+  };
 };
 
 function numericUserId(userId: number | bigint): number {
@@ -40,15 +57,53 @@ function isUniqueConstraintError(error: unknown): boolean {
  * transaction, and token dependencies.
  */
 export function createAuthService(dependencies: AuthDependencies) {
+  const passwordLoginEnabled = (): boolean => {
+    // Direct unit/test consumers that do not inject a deployment switch retain
+    // the historical local-password behavior. Production always injects one.
+    return dependencies.isPasswordLoginEnabled?.() ?? true;
+  };
+
+  const passwordAuthDisabledError = (operation: 'login' | 'register'): AppError =>
+    new AppError(
+      operation === 'register'
+        ? 'Password registration is disabled for this deployment. Use DingTalk login.'
+        : 'Password login is disabled for this deployment. Use DingTalk login.',
+      {
+        code: operation === 'register' ? 'AUTH_REGISTRATION_DISABLED' : 'AUTH_PASSWORD_LOGIN_DISABLED',
+        statusCode: 403,
+      },
+    );
+
+  const canManageSettings = (user: AuthUser): boolean =>
+    dependencies.getSettingsPermission?.(user) ?? false;
+
   return {
     getStatus() {
-      return {
-        needsSetup: !dependencies.users.hasUsers(),
+      const dingTalk = dependencies.getDingTalkStatus?.() ?? { enabled: false, providers: [] };
+      const mode = dependencies.getAuthMode?.();
+      const status = {
+        // An SSO/managed deployment must never expose the first-run local
+        // password setup screen, even while its credentials are temporarily
+        // unavailable. Showing setup there would advertise a registration
+        // path that the same deployment correctly rejects.
+        needsSetup: !dependencies.users.hasUsers()
+          && !dingTalk.enabled
+          && mode?.mode !== 'dingtalk'
+          && mode?.mode !== 'platform'
+          && mode?.mode !== 'unavailable',
         isAuthenticated: false,
+        dingTalk,
       };
+      return mode
+        ? { ...status, authMode: mode }
+        : status;
     },
 
     async register(usernameInput: unknown, passwordInput: unknown) {
+      if (!passwordLoginEnabled() || dependencies.getDingTalkStatus?.().enabled) {
+        throw passwordAuthDisabledError('register');
+      }
+
       const username = typeof usernameInput === 'string' ? usernameInput : '';
       const password = typeof passwordInput === 'string' ? passwordInput : '';
 
@@ -82,7 +137,11 @@ export function createAuthService(dependencies: AuthDependencies) {
 
         return {
           success: true,
-          user: { id: user.id, username: user.username },
+          user: {
+            id: user.id,
+            username: user.username,
+            permissions: { manageSettings: canManageSettings(user) },
+          },
           token,
         };
       } catch (error) {
@@ -98,6 +157,10 @@ export function createAuthService(dependencies: AuthDependencies) {
     },
 
     async login(usernameInput: unknown, passwordInput: unknown) {
+      if (!passwordLoginEnabled() || dependencies.getDingTalkStatus?.().enabled) {
+        throw passwordAuthDisabledError('login');
+      }
+
       const username = typeof usernameInput === 'string' ? usernameInput : '';
       const password = typeof passwordInput === 'string' ? passwordInput : '';
       if (!username || !password) {
@@ -108,7 +171,7 @@ export function createAuthService(dependencies: AuthDependencies) {
       }
 
       const user = dependencies.users.getUserByUsername(username);
-      const validPassword = user
+      const validPassword = user && !user.password_hash.startsWith('!dingtalk-oauth:')
         ? await dependencies.comparePassword(password, user.password_hash)
         : false;
       if (!user || !validPassword) {
@@ -121,7 +184,11 @@ export function createAuthService(dependencies: AuthDependencies) {
       dependencies.users.updateLastLogin(numericUserId(user.id));
       return {
         success: true,
-        user: { id: user.id, username: user.username },
+        user: {
+          id: user.id,
+          username: user.username,
+          permissions: { manageSettings: canManageSettings(user) },
+        },
         token: dependencies.generateToken(user),
       };
     },

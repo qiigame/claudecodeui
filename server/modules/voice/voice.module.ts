@@ -1,3 +1,4 @@
+import type { RequestHandler } from 'express';
 import multer from 'multer';
 
 import { createVoiceRouter } from './voice.routes.js';
@@ -45,3 +46,24 @@ export const voiceRoutes = createVoiceRouter({
   voiceService,
   parseAudioUpload: audioUpload.single('audio'),
 });
+
+/**
+ * Creates the production Voice router with an injected deployment guard.
+ * The default `voiceRoutes` export remains available to standalone consumers
+ * and tests; the server composition root should use this factory so 0.78 can
+ * disable outbound voice calls centrally.
+ */
+export function createVoiceModule(
+  capabilityGuard: (operation: string) => RequestHandler,
+  options: { allowRequestOverrides?: boolean } = {},
+) {
+  return createVoiceRouter({
+    voiceService,
+    parseAudioUpload: audioUpload.single('audio'),
+    capabilityGuard,
+    // Production callers must opt in explicitly. The server composition root
+    // enables this only for writable developer deployments; 0.78 leaves it
+    // disabled so browser headers cannot replace operator-owned credentials.
+    allowRequestOverrides: options.allowRequestOverrides === true,
+  });
+}

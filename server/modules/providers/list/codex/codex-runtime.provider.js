@@ -18,10 +18,22 @@ import { Codex } from '@openai/codex-sdk';
 import {
   appendFilesInputTag,
   buildCodexInputItems,
+  getGlobalImageAssetsDir,
   normalizeImageDescriptors
 } from '@/shared/image-attachments.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
-import { createCompleteMessage, createNormalizedMessage } from '@/shared/utils.js';
+import { dataverseRuntimeBridgeService } from '@/modules/runtime-bridge/index.js';
+import {
+  createCompleteMessage,
+  createNormalizedMessage,
+  filterExecutionEnvironmentForReadOnly,
+  filterProviderEnvironmentForReadOnly,
+} from '@/shared/utils.js';
+
+import {
+  mapPermissionModeToCodexOptions,
+  sanitizeCodexReadonlyClientOptions,
+} from './codex-runtime-options.provider.js';
 
 const activeCodexSessions = new Map();
 
@@ -210,32 +222,6 @@ function transformCodexEvent(event) {
 }
 
 /**
- * Map permission mode to Codex SDK options
- * @param {string} permissionMode - 'default', 'acceptEdits', or 'bypassPermissions'
- * @returns {object} - { sandboxMode, approvalPolicy }
- */
-function mapPermissionModeToCodexOptions(permissionMode) {
-  switch (permissionMode) {
-    case 'acceptEdits':
-      return {
-        sandboxMode: 'workspace-write',
-        approvalPolicy: 'never'
-      };
-    case 'bypassPermissions':
-      return {
-        sandboxMode: 'danger-full-access',
-        approvalPolicy: 'never'
-      };
-    case 'default':
-    default:
-      return {
-        sandboxMode: 'workspace-write',
-        approvalPolicy: 'untrusted'
-      };
-  }
-}
-
-/**
  * Execute a Codex query with streaming
  * @param {string} command - The prompt to send
  * @param {object} options - Options including cwd, sessionId, model, permissionMode
@@ -251,23 +237,21 @@ export async function queryCodex(command, options = {}, ws, context) {
     effort,
     images,
     files,
-    permissionMode = 'default'
+    permissionMode = 'default',
+    deploymentReadOnly = false,
   } = options;
 
   // Callers pass the stable app session id; the SDK resumes threads with the
   // provider-native id recorded on the session row.
   const providerSessionId = context.resolveProviderSessionId(sessionId);
 
-  const resolvedModel = await context.resolveResumeModel(sessionId, model);
-
   const workingDirectory = cwd || projectPath || process.cwd();
-  const { sandboxMode, approvalPolicy } = mapPermissionModeToCodexOptions(permissionMode);
-  const catalog = await context.getProviderModels();
-  const selectedModel = catalog.OPTIONS.find((option) => option.value === resolvedModel) || null;
-  const allowedEfforts = selectedModel?.effort?.values?.map((value) => value.value) || [];
-  const resolvedEffort = typeof effort === 'string' && effort !== 'default' && allowedEfforts.includes(effort)
-    ? effort
-    : undefined;
+  const {
+    sandboxMode,
+    approvalPolicy,
+    networkAccessEnabled,
+    webSearchMode
+  } = mapPermissionModeToCodexOptions(deploymentReadOnly ? 'readonly' : permissionMode);
 
   let codex;
   let thread;
@@ -282,21 +266,103 @@ export async function queryCodex(command, options = {}, ws, context) {
   // stderr dump of unrelated CLI log lines, so the thrown wrapper is dropped
   // when the stream already reported the failure.
   let errorSurfaced = false;
+  // A provider can finish its stream and then throw while surrounding
+  // bookkeeping settles. Keep the terminal event exactly-once at this
+  // boundary so a late catch cannot race the richer success completion.
+  let terminalCompleteSent = false;
   const abortController = new AbortController();
   // Session-map key: the app session id when the caller supplied one, else
   // the provider-native thread id once captured (legacy/direct API callers).
   const sessionKey = () => sessionId || capturedSessionId || null;
+  const sendTerminalComplete = (message) => {
+    if (terminalCompleteSent) {
+      return false;
+    }
+    terminalCompleteSent = true;
+    sendMessage(ws, createCompleteMessage(message));
+    return true;
+  };
 
   try {
-    codex = new Codex();
+    // The pilot bridge resolves credentials for every turn. When it is not
+    // configured, the service returns null and the stock SDK behavior remains
+    // unchanged, including its normal model and process environment lookup.
+    const runtimeBridge = await dataverseRuntimeBridgeService.resolveCodexRuntime({
+      // The bridge may use a deployment-owned credential helper.  Product/QA
+      // turns keep that helper disabled unless the startup environment makes
+      // the exception explicit; writable developer turns retain legacy
+      // helper behavior.
+      deploymentReadOnly,
+    });
+    const resolvedModel = await context.resolveResumeModel(sessionId, model);
+    const runtimeModel = resolvedModel || runtimeBridge?.model;
+    const catalog = await context.getProviderModels();
+    const selectedModel = catalog.OPTIONS.find((option) => option.value === runtimeModel) || null;
+    const allowedEfforts = selectedModel?.effort?.values?.map((value) => value.value) || [];
+    const selectedEffort = typeof effort === 'string'
+      && effort !== 'default'
+      && allowedEfforts.includes(effort)
+      ? effort
+      : undefined;
+    const resolvedEffort = selectedEffort || runtimeBridge?.reasoningEffort;
+
+    const executionEnvironment = deploymentReadOnly
+      ? filterExecutionEnvironmentForReadOnly(options.executionEnvironment)
+      : options.executionEnvironment
+        && typeof options.executionEnvironment === 'object'
+        ? options.executionEnvironment
+        : {};
+    const runtimeClientOptions = runtimeBridge?.clientOptions || {};
+    // Host Codex configuration may contain arbitrary MCP commands. A
+    // product/QA turn must not inherit those commands because the SDK can
+    // execute them outside the filesystem sandbox. Keep the bridge's normal
+    // configuration for developer deployments, but remove MCP declarations in
+    // the read-only path until per-server read-only metadata exists.
+    const safeRuntimeClientOptions = deploymentReadOnly
+      ? sanitizeCodexReadonlyClientOptions(runtimeClientOptions)
+      : runtimeClientOptions;
+    const childEnvironment = {
+      ...process.env,
+      ...(safeRuntimeClientOptions.env || {}),
+      ...executionEnvironment,
+    };
+    // A CC-Switch model provider may intentionally use a non-standard
+    // credential variable (for example `DATAVERSE_API_TOKEN`).  Keep only
+    // those names explicitly declared by the trusted provider configuration;
+    // arbitrary `*_TOKEN`/`*_API_KEY` values from the service account remain
+    // hidden from a read-only model.
+    const readonlyCredentialKeys = deploymentReadOnly
+      ? Object.values(safeRuntimeClientOptions.config?.model_providers || {})
+        .map((provider) => provider?.env_key)
+        .filter((key) => typeof key === 'string' && key.trim())
+      : [];
+    codex = new Codex({
+      ...safeRuntimeClientOptions,
+      env: deploymentReadOnly
+        ? filterProviderEnvironmentForReadOnly(childEnvironment, {
+          allowedCredentialKeys: readonlyCredentialKeys,
+          // Native Codex can resolve the operating-system account home even
+          // when HOME is absent.  Refuse a shared readonly turn unless the
+          // deployment provides its dedicated transcript/config state root.
+          requireIsolatedHome: true,
+        })
+        : childEnvironment,
+    });
 
     const threadOptions = {
       workingDirectory,
       skipGitRepoCheck: true,
       sandboxMode,
       approvalPolicy,
-      model: resolvedModel,
+      networkAccessEnabled,
+      webSearchMode,
+      model: runtimeModel,
       modelReasoningEffort: resolvedEffort,
+      // Uploaded images and ordinary attachments live in the server-owned
+      // asset store, outside the project snapshot. Codex's read-only sandbox
+      // must receive that directory explicitly; without --add-dir the prompt
+      // can mention a valid upload that the provider process cannot read.
+      ...(deploymentReadOnly ? { additionalDirectories: [getGlobalImageAssetsDir()] } : {}),
     };
 
     if (providerSessionId) {
@@ -324,7 +390,7 @@ export async function queryCodex(command, options = {}, ws, context) {
 
     // Execute with streaming. Turns with image attachments send structured
     // input items so Codex reads the images from their local asset paths.
-    const promptWithFiles = appendFilesInputTag(command, files);
+    const promptWithFiles = appendFilesInputTag(command, files, workingDirectory);
     const turnInput = normalizeImageDescriptors(images).length > 0
       ? buildCodexInputItems(promptWithFiles, images, workingDirectory)
       : promptWithFiles;
@@ -413,12 +479,12 @@ export async function queryCodex(command, options = {}, ws, context) {
     const runSession = sessionKey() ? activeCodexSessions.get(sessionKey()) : null;
     const runAborted = runSession?.status === 'aborted' || abortController.signal.aborted;
     if (!runAborted) {
-      sendMessage(ws, createCompleteMessage({
+      sendTerminalComplete({
         provider: 'codex',
         sessionId: capturedSessionId || sessionId || null,
         actualSessionId: capturedSessionId || thread.id || sessionId || null,
         exitCode: terminalFailure ? 1 : 0,
-      }));
+      });
       if (!terminalFailure) {
         notifyRunStopped({
           userId: ws?.userId || null,
@@ -449,11 +515,11 @@ export async function queryCodex(command, options = {}, ws, context) {
 
         sendMessage(ws, createNormalizedMessage({ kind: 'error', content: errorContent, sessionId: capturedSessionId || sessionId || null, provider: 'codex' }));
       }
-      sendMessage(ws, createCompleteMessage({
+      sendTerminalComplete({
         provider: 'codex',
         sessionId: capturedSessionId || sessionId || null,
         exitCode: 1,
-      }));
+      });
       if (!terminalFailure) {
         notifyRunFailed({
           userId: ws?.userId || null,

@@ -3,16 +3,38 @@ import path from 'path';
 
 import express from 'express';
 
+import {
+  captureDeploymentPolicy,
+  DEPLOYMENT_CAPABILITIES,
+  hasDeploymentCapability,
+  type DeploymentPolicy,
+} from '@/modules/deployment-policy/index.js';
+// Keep the auth declaration separate from the deployment profile.  A writable
+// `developer` profile may intentionally run behind DingTalk SSO; in that
+// hybrid mode the profile alone must not make this legacy API-key execution
+// endpoint trust an arbitrary local account.
+import { AUTH_DEPLOYMENT_MODE } from '@/modules/auth/auth-policy.js';
 import type { ProviderRunFunction } from '@/shared/types.js';
-
-import { normalizeProjectPath } from '../../shared/utils.js';
+import { AppError, normalizeProjectPath } from '@/shared/utils.js';
 
 type AgentRouterDependencies = {
   fileSystem: typeof import('node:fs/promises');
   crypto: typeof import('node:crypto');
   homeDirectory(): string;
   spawnProcess: typeof import('cross-spawn').default;
-  platformMode: boolean;
+  /**
+   * @deprecated Only retained for standalone callers created before the
+   * deployment/auth policy split. Production composition must provide
+   * `allowUnauthenticatedPlatform` and a startup deployment policy instead.
+   */
+  platformMode?: boolean;
+  /**
+   * Explicit server-owned switch for the legacy managed-platform principal.
+   * This is intentionally separate from the broad `VITE_IS_PLATFORM` flag:
+   * DingTalk/SSO deployments can keep that presentation flag while still
+   * requiring a user credential on this legacy API-key surface.
+   */
+  allowUnauthenticatedPlatform?: boolean;
   users: { getFirstUser(): unknown };
   apiKeys: { validateApiKey(apiKey: string): unknown };
   githubTokens: { getActiveGithubToken(userId: number): string | null };
@@ -23,7 +45,40 @@ type AgentRouterDependencies = {
   queryCodex: ProviderRunFunction;
   queryOpenCode: ProviderRunFunction;
   GithubClient: typeof import('@octokit/rest').Octokit;
+  /** Optional identity gate for the legacy API-key execution surface. */
+  assertActorCanWrite?: (userId: number) => void;
+  /**
+   * Startup-owned SSO switch. When true, even an explicitly writable
+   * `developer` profile must carry a verified DingTalk actor; this covers a
+   * developer deployment that intentionally enables DingTalk authentication.
+   * An explicit false keeps legacy platform/self-hosted accounts from being
+   * incorrectly blocked by a stale identity registry only when the immutable
+   * startup auth snapshot itself does not require DingTalk; it cannot weaken
+   * an already-managed SSO process.
+   */
+  requireVerifiedActor?: boolean;
+  /** Optional execution attribution used by the production API-key surface. */
+  executionAttribution?: {
+    beginExecution(input: {
+      userId: string | number | null | undefined;
+      sessionId: string | null;
+      provider: string;
+      projectPath: string;
+    }): {
+      runId: string;
+      environment: Record<string, string>;
+    };
+    completeExecution(runId: string, status: 'succeeded' | 'failed'): void;
+  };
+  /** Startup-resolved deployment policy; omitted only for legacy/test callers. */
+  deploymentPolicy?: DeploymentPolicy | (() => DeploymentPolicy);
 };
+
+const MANAGED_AGENT_PROFILES = new Set<DeploymentPolicy['profile']>([
+  'platform',
+  'production',
+  'product-qa-readonly',
+]);
 
 /**
  * Creates Agent routes around explicit authentication, repository, provider,
@@ -34,7 +89,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
   const crypto = dependencies.crypto;
   const os = { homedir: dependencies.homeDirectory };
   const spawn = dependencies.spawnProcess;
-  const IS_PLATFORM = dependencies.platformMode;
+  const legacyPlatformMode = dependencies.platformMode === true;
   const userDb = dependencies.users;
   const apiKeysDb = dependencies.apiKeys;
   const githubTokensDb = dependencies.githubTokens;
@@ -46,6 +101,120 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
   const spawnOpenCode = dependencies.queryOpenCode;
   const Octokit = dependencies.GithubClient;
   const router = express.Router();
+  // A policy source is a startup hook, not a per-request resolver. Capture it
+  // once so an alternate Agent mount cannot drift after process startup.
+  const startupDeploymentPolicy = captureDeploymentPolicy(dependencies.deploymentPolicy);
+
+  /**
+   * Identity enrollment is a managed-SSO boundary, not a blanket requirement
+   * for every local installation that happens to have a registry file. Keep
+   * the legacy API-key Agent usable on explicit developer/self-hosted profiles;
+   * managed profiles still require the verified actor before any clone or
+  * provider process is started.
+  */
+  const assertAuthenticatedActorCanWrite = (user: unknown, req): void => {
+    const hasExplicitPolicy = dependencies.deploymentPolicy !== undefined
+      || req?.deploymentPolicy !== undefined;
+    const profileRequiresActor = hasExplicitPolicy
+      && MANAGED_AGENT_PROFILES.has(resolveDeploymentPolicy(req).profile);
+    // `requireVerifiedActor` is the composition-root override.  When an
+    // embedder omits it, retain the legacy profile behavior but also honor the
+    // immutable auth startup snapshot: explicit `developer` + DingTalk SSO is
+    // still a managed identity boundary, even though its capability profile
+    // remains writable.  This prevents an API-key caller from bypassing SSO in
+    // a standalone composition while leaving ordinary local developer mode
+    // untouched.
+    // The composition root owns the SSO decision.  An older embedder may
+    // explicitly pass `false`, but that value cannot weaken a startup
+    // DingTalk requirement; otherwise this legacy API-key endpoint would be a
+    // straightforward SSO bypass.  When the startup snapshot is ordinary
+    // local mode, retain the explicit/legacy behavior for compatibility.
+    const requiresVerifiedActor = AUTH_DEPLOYMENT_MODE.requiresDingTalk
+      || dependencies.requireVerifiedActor === true
+      || (dependencies.requireVerifiedActor === undefined
+        ? (hasExplicitPolicy
+          ? profileRequiresActor
+          : true)
+        : false);
+    if (!requiresVerifiedActor) {
+      return;
+    }
+    if (!dependencies.assertActorCanWrite) {
+      // A managed/explicit SSO composition must not silently become an
+      // unauthenticated Agent execution surface merely because an embedder
+      // forgot to inject the collaboration adapter. Keep the historical
+      // legacy standalone behavior only when no deployment policy or explicit
+      // actor requirement was supplied at all.
+      if (hasExplicitPolicy
+        || dependencies.requireVerifiedActor === true
+        || AUTH_DEPLOYMENT_MODE.requiresDingTalk) {
+        throw new AppError('A registered project identity is required for Agent execution.', {
+          code: 'IDENTITY_ENROLLMENT_REQUIRED',
+          statusCode: 403,
+        });
+      }
+      return;
+    }
+    const candidate = user && typeof user === 'object'
+      ? (user as Record<string, unknown>).id ?? (user as Record<string, unknown>).userId
+      : undefined;
+    const userId = typeof candidate === 'number' ? candidate : Number(candidate);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      throw new AppError('A registered project identity is required for Agent execution.', {
+        code: 'IDENTITY_ENROLLMENT_REQUIRED',
+        statusCode: 403,
+      });
+    }
+    dependencies.assertActorCanWrite(userId);
+  };
+
+  const resolveDeploymentPolicy = (req) => {
+    return req.deploymentPolicy ?? startupDeploymentPolicy;
+  };
+
+  /**
+   * Resolves the only condition under which the legacy Agent endpoint may use
+   * the first local user instead of a request credential. Once a deployment
+   * policy is supplied, a missing explicit switch fails closed; the old
+   * `platformMode` fallback is kept solely for isolated callers/tests that do
+   * not participate in the server composition root.
+   */
+  const allowUnauthenticatedPlatform = (req): boolean => {
+    if (dependencies.allowUnauthenticatedPlatform !== undefined) {
+      return dependencies.allowUnauthenticatedPlatform === true;
+    }
+    // A request-scoped policy is the production composition root's signal
+    // even when this router was constructed without an injected policy (for
+    // example, a mounted test adapter). Never let the legacy boolean win over
+    // that server-owned context.
+    if (dependencies.deploymentPolicy || req?.deploymentPolicy) {
+      return false;
+    }
+    return legacyPlatformMode;
+  };
+
+  /**
+   * The legacy Agent endpoint can clone repositories, run a provider with
+   * permissions bypassed, create branches, push, and open pull requests. It
+   * therefore has its own capability boundary in addition to API-key auth.
+   * Keep this middleware before API-key validation and all route handlers so a
+   * product/QA deployment cannot even probe or clone through this endpoint.
+   */
+  const requireAgentCapability = (req, res, next) => {
+    const policy = resolveDeploymentPolicy(req);
+    if (!hasDeploymentCapability(policy, DEPLOYMENT_CAPABILITIES.AGENT_USE)) {
+      return next(new AppError('Agent execution is disabled for this deployment.', {
+        code: 'DEPLOYMENT_CAPABILITY_DENIED',
+        statusCode: 403,
+        details: {
+          profile: policy.profile,
+          capability: DEPLOYMENT_CAPABILITIES.AGENT_USE,
+        },
+      }));
+    }
+    req.deploymentPolicy = policy;
+    return next();
+  };
 
   /**
    * Middleware to authenticate agent API requests.
@@ -61,18 +230,27 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
   const validateExternalApiKey = (req, res, next) => {
     // Platform mode: Authentication is handled externally (e.g., by a proxy layer).
     // Trust the request and use the default user context.
-    if (IS_PLATFORM) {
+    if (allowUnauthenticatedPlatform(req)) {
+      let user;
       try {
-        const user = userDb.getFirstUser();
+        user = userDb.getFirstUser();
         if (!user) {
           return res.status(500).json({ error: 'Platform mode: No user found in database' });
         }
-        req.user = user;
-        return next();
       } catch (error) {
-        console.error('Platform mode error:', error);
+        console.error(
+          'Platform mode error:',
+          sanitizeAgentDiagnostic(error?.message ?? error),
+        );
         return res.status(500).json({ error: 'Platform mode: Failed to fetch user' });
       }
+      req.user = user;
+      try {
+        assertAuthenticatedActorCanWrite(user, req);
+      } catch (error) {
+        return next(error);
+      }
+      return next();
     }
 
     // Self-hosted mode: Validate API key from header or query parameter
@@ -89,6 +267,11 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
     }
 
     req.user = user;
+    try {
+      assertAuthenticatedActorCanWrite(user, req);
+    } catch (error) {
+      return next(error);
+    }
     next();
   };
 
@@ -119,12 +302,16 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         if (code === 0) {
           resolve(stdout.trim());
         } else {
-          reject(new Error(`Failed to get git remote: ${stderr}`));
+          reject(new Error(
+            `Failed to get git remote: ${sanitizeAgentDiagnostic(stderr)}`,
+          ));
         }
       });
 
       gitProcess.on('error', (error) => {
-        reject(new Error(`Failed to execute git: ${error.message}`));
+        reject(new Error(
+          `Failed to execute git: ${sanitizeAgentDiagnostic(error.message)}`,
+        ));
       });
     });
   }
@@ -132,35 +319,118 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
   /**
    * Normalize GitHub URLs for comparison
    * @param {string} url - GitHub URL
-   * @returns {string} - Normalized URL
-   */
+  * @returns {string} - Normalized URL
+  */
   function normalizeGitHubUrl(url) {
-    // Remove .git suffix
-    let normalized = url.replace(/\.git$/, '');
+    // Normalize separators before removing `.git`, so a harmless trailing
+    // slash on an existing remote does not turn a matching checkout into a
+    // false conflict.
+    let normalized = String(url ?? '').trim().replace(/\/+$/, '').replace(/\.git$/i, '');
     // Convert SSH to HTTPS format for comparison
-    normalized = normalized.replace(/^git@github\.com:/, 'https://github.com/');
-    // Remove trailing slash
-    normalized = normalized.replace(/\/$/, '');
+    normalized = normalized.replace(/^git@github\.com:/i, 'https://github.com/');
     return normalized.toLowerCase();
   }
 
   /**
-   * Parse GitHub URL to extract owner and repo
+   * Parse a canonical GitHub URL to extract owner and repo. This legacy
+   * endpoint subsequently calls the GitHub API, so substring matching is not
+   * sufficient: `github.com.evil.example` and credential/query-bearing URLs
+   * must never be accepted as a GitHub remote.
    * @param {string} url - GitHub URL (HTTPS or SSH)
    * @returns {{owner: string, repo: string}} - Parsed owner and repo
    */
   function parseGitHubUrl(url) {
-    // Handle HTTPS URLs: https://github.com/owner/repo or https://github.com/owner/repo.git
-    // Handle SSH URLs: git@github.com:owner/repo or git@github.com:owner/repo.git
-    const match = url.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/);
-    if (!match) {
+    const value = typeof url === 'string' ? url.trim() : '';
+    let repositoryPath = '';
+
+    // The documented SCP-style SSH form is deliberately handled separately;
+    // accepting arbitrary URL schemes here would broaden the old API's remote
+    // trust boundary.
+    if (value.startsWith('git@github.com:')) {
+      repositoryPath = value.slice('git@github.com:'.length);
+    } else {
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(value);
+      } catch {
+        throw new Error('Invalid GitHub URL format');
+      }
+      if (
+          parsedUrl.protocol !== 'https:'
+          || parsedUrl.hostname.toLowerCase() !== 'github.com'
+          || parsedUrl.port
+          || parsedUrl.username
+        || parsedUrl.password
+        || parsedUrl.search
+        || parsedUrl.hash
+      ) {
+        throw new Error('Invalid GitHub URL format');
+      }
+      repositoryPath = parsedUrl.pathname;
+    }
+
+    const segments = repositoryPath.replace(/\/+$/, '').split('/');
+    if (
+      segments.length !== 2
+      || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(segments[0])
+      || !/^[A-Za-z0-9][A-Za-z0-9._-]*(?:\.git)?$/i.test(segments[1])
+    ) {
       throw new Error('Invalid GitHub URL format');
     }
+
     return {
-      owner: match[1],
-      repo: match[2].replace(/\.git$/, '')
+      owner: segments[0],
+      repo: segments[1].replace(/\.git$/i, ''),
     };
   }
+
+  /**
+   * Redacts credentials from diagnostics before they reach logs or transports.
+   * Clone credentials are intentionally supplied through the child environment,
+   * but Git can still echo a URL or an Authorization value on failure.
+   */
+  const sanitizeAgentDiagnostic = (value, secret = null) => {
+    let sanitized = typeof value === 'string' ? value : String(value ?? '');
+    const secretCandidates = new Set<string>();
+
+    if (typeof secret === 'string' && secret.length > 0) {
+      secretCandidates.add(secret);
+      for (const encoder of [encodeURIComponent, encodeURI]) {
+        try {
+          secretCandidates.add(encoder(secret));
+        } catch {
+          // Ignore malformed input; the literal value is still redacted.
+        }
+      }
+      try {
+        secretCandidates.add(decodeURIComponent(secret));
+      } catch {
+        // A token may not be URI encoded; there is no decoded variant then.
+      }
+
+      // Git may print HTTP Basic credentials as base64 instead of the token.
+      for (const username of ['', 'x-access-token']) {
+        try {
+          secretCandidates.add(Buffer.from(`${username}:${secret}`).toString('base64'));
+        } catch {
+          // Ignore an unavailable encoder and continue with literal redaction.
+        }
+      }
+    }
+
+    for (const candidate of [...secretCandidates]
+      .filter((candidate) => candidate.length > 0)
+      .sort((left, right) => right.length - left.length)) {
+      sanitized = sanitized.split(candidate).join('[REDACTED]');
+    }
+
+    // Defense in depth for credentials supplied in a diagnostic URL even when
+    // the caller's token is unavailable to this request.
+    return sanitized
+      .replace(/([a-z][a-z\d+.-]*:\/\/)(?:[^/\s@]*@)/gi, '$1[REDACTED]@')
+      .replace(/([?&](?:access[_-]?token|api[_-]?key|auth(?:orization)?|credential|key|password|passwd|secret|signature|sig|token)=)[^&#\s]*/gi, '$1[REDACTED]')
+      .replace(/(authorization\s*:\s*(?:basic|bearer)\s+)[^\s,;]+/gi, '$1[REDACTED]');
+  };
 
   /**
    * Auto-generate a branch name from a message
@@ -278,12 +548,16 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
           const messages = stdout.trim().split('\n').filter(msg => msg.length > 0);
           resolve(messages);
         } else {
-          reject(new Error(`Failed to get commit messages: ${stderr}`));
+          reject(new Error(
+            `Failed to get commit messages: ${sanitizeAgentDiagnostic(stderr)}`,
+          ));
         }
       });
 
       gitProcess.on('error', (error) => {
-        reject(new Error(`Failed to execute git: ${error.message}`));
+        reject(new Error(
+          `Failed to execute git: ${sanitizeAgentDiagnostic(error.message)}`,
+        ));
       });
     });
   }
@@ -340,48 +614,100 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         // Validate the host before using credentials or invoking Git.
         let parsedGithubUrl;
         try {
-          parsedGithubUrl = new URL(githubUrl);
+          parsedGithubUrl = new URL(String(githubUrl).trim());
         } catch {
           throw new Error('Invalid GitHub URL');
         }
         if (
           parsedGithubUrl.protocol !== 'https:'
           || parsedGithubUrl.hostname !== 'github.com'
+          || parsedGithubUrl.port
           || parsedGithubUrl.username
           || parsedGithubUrl.password
+          // Query strings/fragments are not part of a repository clone URL.
+          // Reject them instead of allowing a caller to smuggle a token into
+          // git's argv, logs, or a downstream error message.
+          || parsedGithubUrl.search
+          || parsedGithubUrl.hash
         ) {
           throw new Error('Invalid GitHub URL');
         }
-        const cloneUrl = parsedGithubUrl.toString();
+
+        // Keep the argv URL canonical and limited to a GitHub repository path.
+        // This also prevents encoded query/credential material from surviving
+        // URL parsing as part of the path.
+        const repositoryPath = parsedGithubUrl.pathname.replace(/\/+$/, '');
+        const pathSegments = repositoryPath.split('/');
+        if (
+          pathSegments.length !== 3
+          || pathSegments[0] !== ''
+          || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(pathSegments[1])
+          || !/^[A-Za-z0-9][A-Za-z0-9._-]*(?:\.git)?$/.test(pathSegments[2])
+        ) {
+          throw new Error('Invalid GitHub URL');
+        }
+        const cloneUrl = `https://github.com/${pathSegments[1]}/${pathSegments[2]}`;
 
         const cloneDir = path.resolve(projectPath);
 
-        // Check if directory already exists
+        // Check if the destination already exists. Keep this existence probe
+        // separate from the repository validation below: an outer catch around
+        // both operations would swallow a URL mismatch/non-git error and then
+        // continue into `git clone`, potentially writing into another user's
+        // checkout or masking the real conflict.
+        let cloneDirectoryExists = true;
         try {
           await fs.access(cloneDir);
-          // Directory exists - check if it's a git repo with the same URL
-          try {
-            const existingUrl = await getGitRemoteUrl(cloneDir);
-            const normalizedExisting = normalizeGitHubUrl(existingUrl);
-            const normalizedRequested = normalizeGitHubUrl(cloneUrl);
-
-            if (normalizedExisting === normalizedRequested) {
-              console.log('✅ Repository already exists at path with correct URL');
-              return resolve({ path: cloneDir, created: false });
-            } else {
-              throw new Error(`Directory ${cloneDir} already exists with a different repository (${existingUrl}). Expected: ${githubUrl}`);
-            }
-          } catch (gitError) {
-            throw new Error(`Directory ${cloneDir} already exists but is not a valid git repository or git command failed`);
-          }
         } catch (accessError) {
-          // Directory doesn't exist - proceed with clone
+          // Node's fs errors carry ENOENT for a missing path. Any other
+          // explicitly coded failure (for example EACCES) must not be treated
+          // as absence, otherwise a clone could be attempted through a path we
+          // were not allowed to inspect.
+          const accessCode = accessError && typeof accessError === 'object'
+            ? (accessError as { code?: string }).code
+            : undefined;
+          if (accessCode && accessCode !== 'ENOENT') {
+            const safeAccessError = sanitizeAgentDiagnostic(
+              accessError?.message ?? accessError,
+              githubToken,
+            );
+            throw new Error(`Unable to inspect clone destination: ${safeAccessError}`);
+          }
+          cloneDirectoryExists = false;
+        }
+
+        if (cloneDirectoryExists) {
+          // Directory exists - check if it is a git repo with the same URL.
+          let existingUrl;
+          try {
+            existingUrl = await getGitRemoteUrl(cloneDir);
+          } catch (gitError) {
+            const safeGitError = sanitizeAgentDiagnostic(
+              gitError?.message ?? gitError,
+              githubToken,
+            );
+            throw new Error(
+              `Directory ${cloneDir} already exists but is not a valid git repository or git command failed${safeGitError ? `: ${safeGitError}` : ''}`,
+            );
+          }
+
+          const normalizedExisting = normalizeGitHubUrl(existingUrl);
+          const normalizedRequested = normalizeGitHubUrl(cloneUrl);
+
+          if (normalizedExisting === normalizedRequested) {
+            console.log('✅ Repository already exists at path with correct URL');
+            return resolve({ path: cloneDir, created: false });
+          }
+
+          // Do not fall through to clone: the destination belongs to a
+          // different repository and must be left untouched.
+          throw new Error(`Directory ${cloneDir} already exists with a different repository. Expected: ${cloneUrl}`);
         }
 
         // Ensure parent directory exists
         await fs.mkdir(path.dirname(cloneDir), { recursive: true });
 
-        console.log('🔄 Cloning repository:', githubUrl);
+        console.log('🔄 Cloning repository:', cloneUrl);
         console.log('📁 Destination:', cloneDir);
 
         // Execute git clone
@@ -409,7 +735,6 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
 
         gitProcess.stderr.on('data', (data) => {
           stderr += data.toString();
-          console.log('Git stderr:', data.toString());
         });
 
         gitProcess.on('close', (code) => {
@@ -417,16 +742,19 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
             console.log('✅ Repository cloned successfully');
             resolve({ path: cloneDir, created: true });
           } else {
-            console.error('❌ Git clone failed:', stderr);
-            reject(new Error(`Git clone failed: ${stderr}`));
+            const safeStderr = sanitizeAgentDiagnostic(stderr, githubToken);
+            console.error('❌ Git clone failed:', safeStderr);
+            reject(new Error(`Git clone failed: ${safeStderr}`));
           }
         });
 
         gitProcess.on('error', (error) => {
-          reject(new Error(`Failed to execute git: ${error.message}`));
+          const safeMessage = sanitizeAgentDiagnostic(error.message, githubToken);
+          reject(new Error(`Failed to execute git: ${safeMessage}`));
         });
       } catch (error) {
-        reject(error);
+        const safeMessage = sanitizeAgentDiagnostic(error?.message ?? error, githubToken);
+        reject(new Error(safeMessage));
       }
     });
   }
@@ -465,11 +793,17 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
           await fs.rm(sessionPath, { recursive: true, force: true });
           console.log('✅ Session directory cleaned up');
         } catch (error) {
-          console.error('⚠️ Failed to clean up session directory:', error.message);
+          console.error(
+            '⚠️ Failed to clean up session directory:',
+            sanitizeAgentDiagnostic(error?.message ?? error),
+          );
         }
       }
     } catch (error) {
-      console.error('❌ Failed to clean up project:', error);
+      console.error(
+        '❌ Failed to clean up project:',
+        sanitizeAgentDiagnostic(error?.message ?? error),
+      );
     }
   }
 
@@ -873,7 +1207,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
    *     "cleanup": false
    *   }
    */
-  router.post('/', validateExternalApiKey, async (req, res) => {
+  router.post('/', requireAgentCapability, validateExternalApiKey, async (req, res) => {
     const { githubUrl, projectPath, message, provider = 'claude', model, githubToken, branchName, sessionId } = req.body;
     const effort = typeof req.body.effort === 'string' && req.body.effort.trim()
       ? req.body.effort.trim()
@@ -909,12 +1243,17 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
     let finalProjectPath = null;
     let clonedProjectCreated = false;
     let writer = null;
+    let execution = null;
+    // Keep the active credential available only for diagnostic redaction. It
+    // is never interpolated into a URL, subprocess argument, or response.
+    let githubTokenForDiagnostics = typeof githubToken === 'string' ? githubToken : null;
 
     try {
       // Determine the final project path
       if (githubUrl) {
         // Clone repository (to projectPath if provided, otherwise generate path)
         const tokenToUse = githubToken || githubTokensDb.getActiveGithubToken(req.user.id);
+        githubTokenForDiagnostics = tokenToUse;
 
         let targetPath;
         if (projectPath) {
@@ -941,6 +1280,16 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
       }
 
       finalProjectPath = normalizeProjectPath(finalProjectPath);
+
+      // The legacy API-key endpoint can run a provider and then create/push a
+      // branch. Admit it through the same execution snapshot as WebSocket
+      // turns so shared Git commits receive Human-Actor and receipt trailers.
+      execution = dependencies.executionAttribution?.beginExecution({
+        userId: req.user.id,
+        sessionId: sessionId || null,
+        provider,
+        projectPath: finalProjectPath,
+      }) ?? null;
 
       // Register project path in DB (or reuse existing active registration)
       const registrationResult = projectsDb.createProjectPath(finalProjectPath, null);
@@ -991,6 +1340,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
           sessionId: sessionId || null,
           model: model,
           effort,
+          executionEnvironment: execution?.environment,
           permissionMode: 'bypassPermissions' // Bypass all permissions for API calls
         }, writer);
 
@@ -1002,6 +1352,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
           cwd: finalProjectPath,
           sessionId: sessionId || null,
           model: model || undefined,
+          executionEnvironment: execution?.environment,
           skipPermissions: true // Bypass permissions for Cursor
         }, writer);
       } else if (provider === 'codex') {
@@ -1013,6 +1364,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
           sessionId: sessionId || null,
           model: model || codexModels.DEFAULT,
           effort,
+          executionEnvironment: execution?.environment,
           permissionMode: 'bypassPermissions'
         }, writer);
       } else if (provider === 'opencode') {
@@ -1024,6 +1376,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
           sessionId: sessionId || null,
           model: model || opencodeModels.DEFAULT,
           effort,
+          executionEnvironment: execution?.environment,
           permissionMode: 'bypassPermissions' // Agent runs are non-interactive, like the other providers above
         }, writer);
       }
@@ -1038,6 +1391,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
 
           // Get GitHub token
           const tokenToUse = githubToken || githubTokensDb.getActiveGithubToken(req.user.id);
+          githubTokenForDiagnostics = tokenToUse;
 
           if (!tokenToUse) {
             throw new Error('GitHub token required for branch/PR creation. Please configure a GitHub token in settings.');
@@ -1052,12 +1406,11 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
             console.log('🔍 Getting GitHub URL from git remote...');
             try {
               repoUrl = await getGitRemoteUrl(finalProjectPath);
-              if (!repoUrl.includes('github.com')) {
-                throw new Error('Project does not have a GitHub remote configured');
-              }
-              console.log(`✅ Found GitHub remote: ${repoUrl}`);
+              console.log(`✅ Found GitHub remote: ${sanitizeAgentDiagnostic(repoUrl, githubTokenForDiagnostics)}`);
             } catch (error) {
-              throw new Error(`Failed to get GitHub remote URL: ${error.message}`);
+              throw new Error(
+                `Failed to get GitHub remote URL: ${sanitizeAgentDiagnostic(error?.message ?? error)}`,
+              );
             }
           }
 
@@ -1107,11 +1460,15 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
                         console.log(`✅ Checked out existing branch '${finalBranchName}'`);
                         resolve();
                       } else {
-                        reject(new Error(`Failed to checkout existing branch: ${stderr}`));
+                        reject(new Error(
+                          `Failed to checkout existing branch: ${sanitizeAgentDiagnostic(stderr)}`,
+                        ));
                       }
                     });
                   } else {
-                    reject(new Error(`Failed to create branch: ${stderr}`));
+                    reject(new Error(
+                      `Failed to create branch: ${sanitizeAgentDiagnostic(stderr)}`,
+                    ));
                   }
                 }
               });
@@ -1139,7 +1496,9 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
                     console.log(`ℹ️ Branch '${finalBranchName}' already exists on remote, using existing branch`);
                     resolve();
                   } else {
-                    reject(new Error(`Failed to push branch: ${stderr}`));
+                    reject(new Error(
+                      `Failed to push branch: ${sanitizeAgentDiagnostic(stderr)}`,
+                    ));
                   }
                 }
               });
@@ -1192,19 +1551,23 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
           }
 
         } catch (error) {
-          console.error('❌ GitHub branch/PR creation error:', error);
+          const safeErrorMessage = sanitizeAgentDiagnostic(
+            error?.message ?? error,
+            githubTokenForDiagnostics,
+          );
+          console.error('❌ GitHub branch/PR creation error:', safeErrorMessage);
 
           // Send error but don't fail the entire request
           if (stream) {
             writer.send({
               type: 'github-error',
-              error: error.message
+              error: safeErrorMessage
             });
           }
           // Store error info for non-streaming response
           if (!stream) {
-            branchInfo = { error: error.message };
-            prInfo = { error: error.message };
+            branchInfo = { error: safeErrorMessage };
+            prInfo = { error: safeErrorMessage };
           }
         }
       }
@@ -1246,8 +1609,20 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         }, 5000);
       }
 
+      if (execution) {
+        dependencies.executionAttribution?.completeExecution(execution.runId, 'succeeded');
+      }
+
     } catch (error) {
-      console.error('❌ External session error:', error);
+      const safeErrorMessage = sanitizeAgentDiagnostic(
+        error?.message ?? error,
+        githubTokenForDiagnostics,
+      );
+      console.error('❌ External session error:', safeErrorMessage);
+
+      if (execution) {
+        dependencies.executionAttribution?.completeExecution(execution.runId, 'failed');
+      }
 
       // Clean up on error
       if (finalProjectPath && cleanup && githubUrl && clonedProjectCreated) {
@@ -1269,15 +1644,15 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         if (!res.writableEnded) {
           writer.send({
             type: 'error',
-            error: error.message,
-            message: `Failed: ${error.message}`
+            error: safeErrorMessage,
+            message: `Failed: ${safeErrorMessage}`
           });
           writer.end();
         }
       } else if (!res.headersSent) {
         res.status(500).json({
           success: false,
-          error: error.message
+          error: safeErrorMessage
         });
       }
     }

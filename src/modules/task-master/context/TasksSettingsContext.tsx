@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import type { Dispatch, ReactNode, SetStateAction } from 'react';
 
 import { api } from '@/shared/api';
+import { taskMasterUiEnabled } from '@/shared/utils';
 import {
   readUserPreference,
   subscribeToUserPreferences,
@@ -55,7 +56,7 @@ export const useTasksSettings = () => {
 /** Mounted by App.tsx; supplies the tasks-enabled preference and TaskMaster installation status that the chat, sidebar, settings and project-workspace modules read through useTasksSettings. */
 export const TasksSettingsProvider = ({ children }: { children: ReactNode }) => {
   const [tasksEnabled, setTasksEnabled] = useState<boolean>(
-    () => readUserPreference('tasksEnabled', TASKS_ENABLED_DEFAULT),
+    () => taskMasterUiEnabled && readUserPreference('tasksEnabled', TASKS_ENABLED_DEFAULT),
   );
 
   const [isTaskMasterInstalled, setIsTaskMasterInstalled] = useState<boolean | null>(null);
@@ -69,6 +70,10 @@ export const TasksSettingsProvider = ({ children }: { children: ReactNode }) => 
   // "has the user chosen?" check below unreachable.
   const chooseTasksEnabled = useCallback<Dispatch<SetStateAction<boolean>>>((update) => {
     setTasksEnabled((previous) => {
+      if (!taskMasterUiEnabled) {
+        return false;
+      }
+
       const next = typeof update === 'function' ? update(previous) : update;
       writeUserPreference('tasksEnabled', next);
       return next;
@@ -77,11 +82,21 @@ export const TasksSettingsProvider = ({ children }: { children: ReactNode }) => 
 
   // A choice made on another device arrives with the hydrated preferences.
   useEffect(() => subscribeToUserPreferences(() => {
-    setTasksEnabled(readUserPreference('tasksEnabled', TASKS_ENABLED_DEFAULT));
+    setTasksEnabled(
+      taskMasterUiEnabled && readUserPreference('tasksEnabled', TASKS_ENABLED_DEFAULT),
+    );
   }), []);
 
   // Check TaskMaster installation status asynchronously on component mount
   useEffect(() => {
+    if (!taskMasterUiEnabled) {
+      setIsTaskMasterInstalled(false);
+      setIsTaskMasterReady(false);
+      setInstallationStatus(null);
+      setIsCheckingInstallation(false);
+      return;
+    }
+
     const checkInstallation = async () => {
       try {
         const response = await api.taskmaster.installationStatus();

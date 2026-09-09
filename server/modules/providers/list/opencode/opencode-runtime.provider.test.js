@@ -172,6 +172,29 @@ test('resolveOpenCodePermissionOptions maps UI permission modes onto OpenCode co
   assert.deepEqual(resolveOpenCodePermissionOptions(undefined), { args: [], env: {} });
 });
 
+test('spawnOpenCode rejects readonly execution before resolving or spawning', async () => {
+  let contextCalled = false;
+  const context = {
+    ...runtimeContext,
+    resolveProviderSessionId: () => {
+      contextCalled = true;
+      return null;
+    },
+  };
+
+  await assert.rejects(
+    () => opencodeRuntime.run(
+      'must not execute',
+      { deploymentReadOnly: true },
+      { send() {}, setSessionId() {} },
+      context,
+    ),
+    (error) => error?.code === 'PROVIDER_READ_ONLY_UNSUPPORTED'
+      && error?.message === 'Provider "opencode" does not expose a safe read-only runtime in this deployment.',
+  );
+  assert.equal(contextCalled, false);
+});
+
 test('spawnOpenCode passes permission mode flags and env to the CLI', async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'opencode-cli-perms-'));
   const pathKey = findEnvKey('PATH');

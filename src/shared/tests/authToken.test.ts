@@ -5,6 +5,9 @@ import { test } from 'vitest';
 import {
   AUTH_SESSION_EXPIRED_EVENT,
   AUTH_TOKEN_REFRESHED_EVENT,
+  establishAuthSession,
+  expireAuthSession,
+  getAuthSessionSnapshot,
   getAuthTokenRefreshDelay,
   getStoredAuthToken,
   isAuthTokenExpired,
@@ -82,6 +85,23 @@ test('storeAuthToken: a non-token value is rejected and does not overwrite the s
   assert.equal(storeAuthToken(''), false);
   assert.equal(storeAuthToken({ token: 'x' }), false);
   assert.equal(localStorage.getItem('auth-token'), 'existing');
+});
+
+test('a stale request snapshot cannot rotate or expire a newly established login', () => {
+  localStorage.clear();
+  const now = Math.floor(Date.now() / 1000);
+  const sameToken = makeToken({ sub: 'alice', iat: now, exp: now + 600 });
+  const staleRotation = makeToken({ sub: 'alice', iat: now + 1, exp: now + 601 });
+
+  assert.equal(establishAuthSession(sameToken), true);
+  const firstLogin = getAuthSessionSnapshot();
+  // A same-second re-login may receive the exact same JWT string. Its fresh
+  // epoch must still distinguish it from requests made by the first login.
+  assert.equal(establishAuthSession(sameToken), true);
+
+  assert.equal(storeAuthToken(staleRotation, firstLogin), false);
+  assert.equal(expireAuthSession(firstLogin), false);
+  assert.equal(localStorage.getItem('auth-token'), sameToken);
 });
 
 test('getStoredAuthToken: an expired token is dropped and the expiry is announced once', () => {

@@ -32,7 +32,8 @@ type SettingsDependencies = {
   };
   pushSubscriptions: {
     save(userId: number, endpoint: string, p256dh: string, auth: string): void;
-    remove(endpoint: string): void;
+    /** Remove only the authenticated user's subscription. */
+    remove(userId: number, endpoint: string): void;
   };
   getVapidPublicKey(): string | null;
 };
@@ -172,7 +173,10 @@ export function createSettingsService(dependencies: SettingsDependencies) {
     },
     unsubscribeFromPush(userId: number, endpointInput: unknown) {
       const endpoint = requiredString(endpointInput, 'Endpoint', 'PUSH_ENDPOINT_REQUIRED');
-      dependencies.pushSubscriptions.remove(endpoint);
+      // Endpoints are bearer-like identifiers. Scope the delete by the
+      // authenticated owner so a caller who learns another user's endpoint
+      // cannot unregister that user's browser notifications.
+      dependencies.pushSubscriptions.remove(userId, endpoint);
       const currentPreferences = dependencies.notifications.getPreferences(userId);
       if (currentPreferences?.channels?.webPush) {
         dependencies.notifications.updatePreferences(userId, {

@@ -8,7 +8,7 @@ import { createGitRouter } from './git.routes.js';
 
 type GitExternalDependencies = Pick<
   Parameters<typeof createGitRouter>[0],
-  'queryClaude' | 'queryCursor'
+  'queryClaude' | 'queryCursor' | 'isProtectedBaselinePath' | 'capabilityGuard'
 >;
 
 /** Assembles the Git router with runners from the centralized provider runtime service. */

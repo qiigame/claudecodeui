@@ -8,7 +8,7 @@ workspace is. A slot holds two arrays — `serverMessages` (what REST returned) 
 `realtimeMessages` (what the socket delivered since) — plus a cached `merged` array that is
 what actually renders. History is paginated from the *newest* row backwards: opening a session
 fetches the last 20 rows, scrolling up prepends 20 more. On the server those pages are sliced
-out of a full-transcript cache keyed by the transcript file's `stat`, so a multi-megabyte
+out of a full-transcript cache keyed by the authenticated transcript file identity, so a multi-megabyte
 JSONL is parsed once, not once per page. On the client every rendered row is wrapped in a
 `LazyMessageRow` that keeps a fixed-height placeholder in the DOM and mounts its expensive
 markdown/tool subtree only inside a band around the viewport. That last part is why "Load all"
@@ -68,7 +68,7 @@ on a 29k-row session costs ~112 MB instead of ~1 GB.
 | `src/modules/chat/transcript/ChatExportMenu.tsx` | Calls `onLoadFullTranscript` before building a file. |
 | `server/modules/providers/provider.routes.ts` | `GET /api/providers/sessions/:sessionId/messages` — parses `limit`/`offset`. |
 | `server/modules/providers/services/sessions.service.ts` | `fetchHistory` — cache lookup, tail slice, stamps the app session id on every row. |
-| `server/modules/providers/services/session-history-cache.service.ts` | Full-transcript LRU validated by `stat`. |
+| `server/modules/providers/services/session-history-cache.service.ts` | Full-transcript LRU validated by canonical path + device/inode/mtime/size. |
 | `server/shared/message-unification.ts` | `prepareTranscriptMessages` — reduces a Claude or Codex transcript to renderable rows before it is paged. |
 | `server/shared/utils.ts` | `sliceTailPage` — the one definition of what a page is. |
 
@@ -347,24 +347,26 @@ corrected offset. Two attempts, then it gives up and prepends nothing.
 
 ## Server-side history
 
-**RULE: one page request costs one `stat`, not one transcript parse.**
+**RULE: one page request costs one validated metadata probe, not one transcript parse.**
 
 `sessionsService.fetchHistory` resolves the session row, returns an empty result when
 `provider_session_id` is not set yet (first message still streaming), then asks
 `sessionHistoryCache.getFullHistory` for the complete normalized transcript and slices the
-requested page out of it with the same `sliceTailPage` the providers use. When the cache
-returns `null` — an ineligible provider, or a transcript file that cannot be `stat`ed — the
-provider's own `fetchHistory` is called with the requested `limit`/`offset` instead, and it
-slices with that same helper. Either way the caller cannot tell which path served the page.
+requested page out of it with the same `sliceTailPage` the providers use. The cache receives a
+resolver that has already authenticated a canonical provider transcript path; it never stats a
+raw database path. When the cache returns `null` — an ineligible provider, or a transcript that
+cannot be resolved as a regular file — the provider's own `fetchHistory` is called with the
+requested `limit`/`offset` instead, and it slices with that same helper. Either way the caller
+cannot tell which path served the page.
 
 | Aspect | Behaviour |
 | --- | --- |
-| Key | App session id. |
-| Validity | `transcriptPath` + `mtimeMs` + `size` from one `fsp.stat` per request. A mismatch re-parses. |
-| Eligible providers | Claude and Codex only — they parse `session.jsonl_path` itself. Cursor (`store.db`) and OpenCode (shared SQLite) pass `transcriptPath: null` and bypass the cache, because the JSONL's stat says nothing about their history. |
+| Key | App session id, with the canonical transcript path and its `device`/`inode`/`mtimeMs`/`size` identity. A pathname replacement therefore cannot reuse an entry merely by preserving length and timestamps. |
+| Validity | The resolver authenticates containment, filename, symlink and opening metadata; the cache performs one `lstat` identity check per request. A mismatch starts a new parse. |
+| Eligible providers | Claude and Codex only — they parse `session.jsonl_path` itself. Cursor (`store.db`) and OpenCode (shared SQLite) provide no resolver and bypass the cache, because a JSONL stat says nothing about their history. |
 | Budget | `MAX_CACHED_TRANSCRIPT_FILE_BYTES = 256 MB` of source-file bytes and `MAX_CACHE_ENTRIES = 8`, LRU by re-insertion. The newest entry is never evicted. |
-| Concurrency | `pendingLoads` — concurrent requests for one session share a single parse. |
-| Invalidation | None, by design. Anything that changes history (a turn, an edit, a rewind, a fork) touches the file, so the next `stat` misses. |
+| Concurrency | `pendingLoads` — concurrent requests for one session and file identity share a single parse; generation barriers prevent an older path or resolver from winning after a repoint/failure. |
+| Invalidation | No explicit provider hook is required for ordinary edits: a changed identity starts a new parse. The cache also drops entries when resolution fails; child/subagent transcript files are not part of the parent identity and remain a known follow-up boundary. |
 
 `sessions.service.test.ts` → *"history pages are sliced from the cached full transcript and see
 appended rows"* is the test that pins this: page, append a row, re-read, and the newest page
@@ -567,9 +569,10 @@ of ~1 GB with seven thousand.
 - **Hidden tabs never fetch.** `canRequest` returns false, the coordinator marks the session
   dirty, and activation flushes exactly one request (`6e8d4087`). An initial page load
   supersedes a pending refresh for an unhydrated slot via `discardPending`.
-- **The history cache has no invalidation API on purpose.** Every mutation path already
-  touches the transcript file, so the `stat` comparison covers all of them; an explicit hook
-  would be one more thing to forget to call.
+- **The history cache has no provider invalidation API on purpose.** Every parent-transcript
+  mutation path already changes its authenticated file identity, so the metadata comparison
+  covers ordinary turns, edits, rewinds and forks. Independent Claude/Codex subagent files are
+  not part of the parent key yet; callers must treat that as a known follow-up boundary.
 - **The store keys sessions directly, with no alias table.** The app session id is allocated by
   `POST /api/providers/sessions` before the first send — see
   [conversation handoff](./03-conversation-handoff.md) — so nothing downstream re-keys a slot.

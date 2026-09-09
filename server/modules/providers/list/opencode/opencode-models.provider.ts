@@ -258,7 +258,17 @@ export class OpenCodeProviderModels implements IProviderModels {
     // OpenCode's `session` table is keyed by its own session id, so the stable
     // app id has to be translated first; sessions discovered on disk store the
     // provider id in both columns and resolve to themselves.
-    const providerSessionId = sessionsDb.getSessionById(sessionId)?.provider_session_id ?? sessionId;
+    const session = sessionsDb.getSessionById(sessionId);
+    // A known app row without a native id has not produced an OpenCode
+    // transcript yet. Do not query the shared database by that opaque app id,
+    // and never treat a row owned by another provider as an OpenCode session.
+    if (session && session.provider !== 'opencode') {
+      return buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
+    }
+    const providerSessionId = session ? session.provider_session_id : sessionId;
+    if (!providerSessionId) {
+      return buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
+    }
 
     try {
       const dbPath = getOpenCodeDatabasePath();

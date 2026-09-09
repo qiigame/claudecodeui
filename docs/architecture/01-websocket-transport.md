@@ -31,8 +31,10 @@ does.
    `/desktop-notifications` (the Electron main process), `/plugin-ws/:name` (a passthrough
    proxy). Routing is a pathname comparison in one `connection` handler.
 2. **Authentication happens at the upgrade, once, for every path.** If a handler is
-   running, the connection is authenticated. No handler re-checks a token, and no frame
-   carries credentials.
+   running, the connection has passed the token/explicit-platform gate and carries no
+   credentials in frames. Managed DingTalk routes still apply a stronger actor-status
+   check at the operation boundary: a pending or ambiguous actor may read `/ws`, but
+   cannot start provider work, approve a tool, open a PTY, or proxy a plugin.
 3. **`kind` goes down, `type` goes up.** Every server-to-client chat frame is discriminated
    by `kind`; every client-to-server message is discriminated by `type`. Task Master's
    broadcasts are the single exception — they travel down the same socket keyed by `type`.
@@ -63,7 +65,7 @@ every open `/ws` socket in the process. A run's writer holds only the sockets wa
 | --- | --- |
 | `server/modules/websocket/services/websocket-server.service.ts` | Creates the one `WebSocketServer`, attaches the heartbeat, routes by pathname |
 | `server/modules/websocket/services/websocket-auth.service.ts` | `verifyWebSocketClient` — the upgrade-time gate for every path |
-| `server/modules/auth/auth.middleware.ts` | `authenticateWebSocket` — first DB user in platform mode, JWT verification in OSS mode |
+| `server/modules/auth/auth.middleware.ts` | `authenticateWebSocket` — resolves the explicit platform fallback or verifies the JWT/user row |
 | `server/modules/websocket/services/websocket-state.service.ts` | `connectedClients`, the set of open `/ws` sockets, and `WS_OPEN_STATE` |
 | `server/modules/websocket/services/chat-websocket.service.ts` | The `/ws` protocol: the five inbound handlers, `protocol_error`, the attachment trust boundary, `runDetachedChatTurn` |
 | `server/modules/websocket/services/chat-run-registry.service.ts` | `chatRunRegistry` — one run per session, `seq` stamping, the replay buffer, the exactly-one-`complete` contract |
@@ -120,34 +122,52 @@ Two things that are easy to assume and wrong:
 **RULE: `verifyClient` runs before the `connection` event, so an unauthenticated socket
 never reaches a route handler. Failure is an upgrade rejection, not a close frame.**
 
-`verifyWebSocketClient` (`websocket-auth.service.ts:18`) logs the attempt with the token
-redacted (`:25-29`, added by `14ddbc7c`) and then splits:
+`verifyWebSocketClient` logs the attempt with the token redacted and resolves the
+server-supplied authentication policy. A browser-supplied `VITE_IS_PLATFORM` flag is not
+used as a websocket bypass. The two admission paths are:
 
 | Mode | What it does |
 | --- | --- |
-| Platform (`isPlatform`) | Calls `authenticateWebSocket(null)`, which returns the first user in the database, and **ignores tokens entirely** (`:32-42`) |
-| OSS | Takes the JWT from the `token` query parameter, falling back to `Authorization: Bearer` (`:45-48`), and verifies it plus the user row (`auth.middleware.ts:118-155`) |
+| Explicit legacy platform-auth policy | With no token, calls `authenticateWebSocket(null)` to resolve the first database user. If a token is present, that token still wins and is verified. |
+| Token-auth policy | Takes the JWT from the `token` query parameter, falling back to `Authorization: Bearer`, and verifies it together with the user row. |
 
 On success the user is attached as `request.user` and the upgrade proceeds; on failure the
 function returns `false` and the client sees a failed handshake.
 
-The two modes return *different user shapes* — platform returns `{ id, userId, username }`,
-OSS returns `{ userId, username }` with no `id` — which is why the chat handler reads the
-id through `readRequestUserId` (`chat-websocket.service.ts:89-106`) instead of touching
-`user.id` directly.
+In managed DingTalk mode, the upgrade additionally requires that the authenticated
+principal carries a DingTalk actor (`provider: "dingtalk"`). This transport check is
+presence-only: `verified`, `configured`, `pending`, and `ambiguous` actors can reach the
+chat handler. The stronger verified check is deliberately deferred to operations so a
+first-login user can subscribe to existing sessions and see the enrollment prompt.
 
-Only `/ws` and `/desktop-notifications` read `request.user` at all. `/shell` and
-`/plugin-ws` just needed the connection to be authenticated.
+Route handlers then apply their own immutable deployment policy and, where applicable,
+actor gate:
+
+- `/ws`: `chat.subscribe` remains a read/subscription operation for pending or ambiguous
+  actors; `chat.send`, `chat.edit-send`, `chat.abort`, and tool approvals require a verified
+  DingTalk actor in managed mode.
+- `/shell`: requires a verified actor and `terminal.interactive` before a PTY is created.
+- `/plugin-ws/:name`: requires a verified actor and plugin execution capability before any
+  frame is proxied upstream.
+- `/desktop-notifications`: uses the authenticated numeric user id and checks endpoint
+  registration against `session.write`.
+
+This distinction matters for `product-qa-readonly`: it is an application-layer policy,
+not an OS filesystem sandbox. The profile denies PTY, plugin execution, and mutating
+provider operations; an independent service account/container and read-only project
+mount are still required for an OS-level boundary.
 
 ## The client's single socket
 
 **RULE: `WebSocketProvider` is mounted once by `App` and owns the only chat socket. Features
 call `subscribe(listener)`; they never construct a `WebSocket`.**
 
-`buildWebSocketUrl` (`WebSocketContext.tsx:36-45`) is the whole URL story: same host as the
-page, `wss:` when the page is `https:`, `/ws` with no token in platform mode, `/ws?token=`
-in OSS mode. An expired token is caught here — `expireAuthSession()` runs and the function
-returns `null`, so no socket is created at all.
+`buildWebSocketUrl` (`WebSocketContext.tsx:36-45`) is the browser URL story: same host as
+the page, `wss:` when the page is `https:`, and either `/ws` for the explicit hosted
+platform-auth path or `/ws?token=` for token-auth deployments. The backend also accepts an
+`Authorization: Bearer` header from non-browser clients, and a token always wins when both
+paths are available. An expired token is caught here — `expireAuthSession()` runs and the
+function returns `null`, so no socket is created at all.
 
 **The listener registry is a ref-held `Set`, dispatched synchronously** (`:56`, `:61-69`),
 not React state. The declaration says why:
@@ -237,6 +257,10 @@ Every code that exists, with the line that emits it:
 | `ANCHOR_LOOKUP_FAILED` | `:351` | Reading the transcript threw |
 | `EDIT_REWIND_FAILED` | `:400` | The rewind itself failed; the run is ended too |
 | `NO_ACTIVE_RUN` | `:428` | `chat.abort` for a session with nothing running |
+| `DEPLOYMENT_CAPABILITY_DENIED` | gateway route/operation guards | The startup deployment profile does not grant the requested chat, terminal, plugin, or approval operation |
+| `IDENTITY_ENROLLMENT_REQUIRED` | managed actor gates | The DingTalk actor is pending, ambiguous, or otherwise not verified for an execution operation |
+| `DINGTALK_LOGIN_REQUIRED` | managed chat admission | The authenticated principal has no DingTalk actor |
+| `PROVIDER_READ_ONLY_UNSUPPORTED` | read-only chat gate | Cursor/OpenCode has no server-enforced read-only runtime contract |
 | `UNKNOWN_MESSAGE_TYPE` | `:620` | Unrecognised `type` |
 | `INTERNAL_ERROR` | `:626` | Anything thrown out of a handler |
 
@@ -568,7 +592,9 @@ The parts worth knowing:
 
 The client is `useShellConnection.ts:127` via `getShellWebSocketUrl`
 (`src/modules/shell/utils/socket.ts:39-53`), which builds the URL the same way the chat one
-does — no token in platform mode, `?token=` in OSS.
+does — no token for the explicit hosted platform-auth path, `?token=` in token-auth
+deployments. Managed SSO still requires the authenticated principal to carry a verified
+DingTalk actor, and `product-qa-readonly` rejects the PTY before `init` is handled.
 
 ## The plugin proxy and desktop notifications
 
@@ -603,7 +629,7 @@ with 1008 (`:47-50`); the client then sends one `register` frame carrying `devic
 | No send queue, no backoff | A frame sent while closed is dropped with a warning, and a dead server is retried flat every 3 seconds forever |
 | An expired token produces no socket *and no retry* | `buildWebSocketUrl` returns `null` before a `WebSocket` exists, so there is no `onclose` to schedule anything. Recovery waits on the auth state changing |
 | Heartbeat detection takes two intervals | The tick that finds `isAlive === false` is the one *after* the unanswered ping — so up to ~60 s, not 30 |
-| Platform mode ignores tokens entirely | `verifyWebSocketClient:32`. The local `.env` here sets `VITE_IS_PLATFORM=true`, so auth in this working copy does not behave the way CI does |
+| A stale platform flag changes websocket auth | It must not: only the startup-resolved explicit `platform` profile can enable the no-token first-user fallback. A token, when present, always wins; `VITE_IS_PLATFORM` alone is not a bypass |
 | `ws` in the context value is a snapshot | `value` memoises `ws: wsRef.current` at render time (`:177-183`), so it can be stale between renders. Use `sendMessage` and `subscribe`; treat `ws` as a connectedness signal only |
 | `/plugin-ws` has no in-repo caller | It is a third-party extension point, which is exactly why broadcasting over `wss.clients` was a real leak and not a tidiness complaint |
 

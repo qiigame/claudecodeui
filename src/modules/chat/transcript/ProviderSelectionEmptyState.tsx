@@ -9,6 +9,8 @@ import type {
   ProviderModelOption,
   ProviderModelsDefinition,
 } from "@/shared/types";
+import { COMIC_RUNTIME_PROVIDERS } from '@/shared/constants';
+import { comicRuntimeOnly } from '@/shared/utils';
 import { NextTaskBanner } from "@/modules/task-master";
 import {
   Dialog,
@@ -36,6 +38,10 @@ const PROVIDER_META: { id: LLMProvider; name: string }[] = [
   { id: "opencode", name: "OpenCode" },
 ];
 
+const RUNTIME_PROVIDER_META = PROVIDER_META.filter((provider) => (
+  COMIC_RUNTIME_PROVIDERS.includes(provider.id)
+));
+
 const MOD_KEY =
   typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘" : "Ctrl";
 
@@ -61,6 +67,14 @@ type ProviderSelectionEmptyStateProps = {
   setProviderModel: (provider: LLMProvider, model: string) => void;
   providerModelCatalog: Partial<Record<LLMProvider, ProviderModelsDefinition>>;
   providerModelActions: ProviderModelActions;
+  /** Server-authorized provider catalog mutation capability. */
+  canManageProviderModels?: boolean;
+  /** Whether the active session can accept a new chat turn. */
+  canSendMessages?: boolean;
+  /** Human-readable reason shown when a new turn is unavailable. */
+  sendDisabledReason?: string | null;
+  /** Restricts the selector to runtimes with a proven read-only contract. */
+  readOnly?: boolean;
   providerModelsLoading: boolean;
   tasksEnabled: boolean;
   isTaskMasterInstalled: boolean | null;
@@ -83,7 +97,7 @@ function getModelConfig(
 }
 
 function getProviderDisplayName(p: LLMProvider) {
-  if (p === "claude") return "Claude";
+  if (p === "claude") return comicRuntimeOnly ? "Claude Code" : "Claude";
   if (p === "cursor") return "Cursor";
   if (p === "codex") return "Codex";
   if (p === "opencode") return "OpenCode";
@@ -92,7 +106,8 @@ function getProviderDisplayName(p: LLMProvider) {
 
 /**
  * Rendered by chat's ChatMessagesPane when a session has no messages yet, so
- * the user can pick a provider, model and permission mode before their first turn.
+ * the user can pick a runtime (and, in the standard build, its model) before
+ * their first turn.
  */
 export default function ProviderSelectionEmptyState({
   selectedSession,
@@ -104,6 +119,12 @@ export default function ProviderSelectionEmptyState({
   setProviderModel,
   providerModelCatalog,
   providerModelActions,
+  // Capability props fail closed for direct mounts and stale callers. The
+  // application composition root passes the server-authorized values.
+  canManageProviderModels = false,
+  canSendMessages = false,
+  sendDisabledReason = null,
+  readOnly = false,
   providerModelsLoading,
   tasksEnabled,
   isTaskMasterInstalled,
@@ -111,16 +132,40 @@ export default function ProviderSelectionEmptyState({
   setInput,
 }: ProviderSelectionEmptyStateProps) {
   const { t } = useTranslation("chat");
+  const runtimeSelectorOnly = comicRuntimeOnly || readOnly;
+  // A session row pins its provider even when the transcript is still empty.
+  // In a read-only deployment an old Cursor/OpenCode row is readable, but it
+  // cannot be continued; do not render the task shortcut that would otherwise
+  // populate a disabled composer and imply that a turn can be started.
+  const sessionProvider = selectedSession?.__provider ?? selectedSession?.provider;
+  const canContinueSession = !readOnly
+    || !selectedSession
+    || (sessionProvider !== undefined && COMIC_RUNTIME_PROVIDERS.includes(sessionProvider));
+  const canStartConversation = canSendMessages && canContinueSession;
+  const unavailableReason = sendDisabledReason
+    ?? (!canContinueSession
+      ? t("input.providerReadOnlyUnsupported", {
+          provider: getProviderDisplayName(sessionProvider ?? provider),
+          defaultValue: "This provider session cannot be continued in the current read-only deployment.",
+        })
+      : !canSendMessages
+        ? t("input.sendUnavailable", {
+            defaultValue: "Sending is unavailable in this deployment.",
+          })
+        : null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [modelLibraryOpen, setModelLibraryOpen] = useState(false);
 
   const visibleProviderGroups = useMemo<ProviderGroup[]>(() => {
-    return PROVIDER_META.map((p) => ({
+    const providerMeta = runtimeSelectorOnly
+      ? RUNTIME_PROVIDER_META
+      : PROVIDER_META;
+    return providerMeta.map((p) => ({
       id: p.id,
       name: p.name,
       models: providerModelCatalog[p.id]?.OPTIONS ?? [],
     }));
-  }, [providerModelCatalog]);
+  }, [providerModelCatalog, runtimeSelectorOnly]);
 
   const nextTaskPrompt = t("tasks.nextTaskPrompt", {
     defaultValue: "Start the next task",
@@ -138,13 +183,26 @@ export default function ProviderSelectionEmptyState({
 
   const handleModelSelect = useCallback(
     (providerId: LLMProvider, modelValue: string) => {
+      if (runtimeSelectorOnly || !canManageProviderModels) {
+        return;
+      }
       setProvider(providerId);
       writeSelectedProvider(providerId);
       setProviderModel(providerId, modelValue);
       setDialogOpen(false);
       setTimeout(() => textareaRef.current?.focus(), 100);
     },
-    [setProvider, setProviderModel, textareaRef],
+    [canManageProviderModels, runtimeSelectorOnly, setProvider, setProviderModel, textareaRef],
+  );
+
+  const handleRuntimeSelect = useCallback(
+    (providerId: LLMProvider) => {
+      setProvider(providerId);
+      writeSelectedProvider(providerId);
+      setDialogOpen(false);
+      setTimeout(() => textareaRef.current?.focus(), 100);
+    },
+    [setProvider, textareaRef],
   );
 
   const openModelLibrary = () => {
@@ -157,7 +215,30 @@ export default function ProviderSelectionEmptyState({
     setDialogOpen(true);
   };
 
+  const renderUnavailableState = (title: string) => (
+    <div className="flex h-full items-center justify-center px-4">
+      <div
+        className="w-full max-w-[34.25rem] rounded-2xl border border-amber-500/30 bg-amber-500/10 px-5 py-6 text-center"
+        role="status"
+        aria-live="polite"
+      >
+        <h2 className="text-base font-semibold text-foreground">{title}</h2>
+        <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+          {unavailableReason}
+        </p>
+      </div>
+    </div>
+  );
+
   if (!selectedSession && !currentSessionId) {
+    if (!canStartConversation) {
+      return renderUnavailableState(
+        t("providerSelection.unavailableTitle", {
+          defaultValue: "Chat is currently unavailable",
+        }),
+      );
+    }
+
     return (
       <div className="flex h-full items-center justify-center px-4">
         <div className="w-full max-w-[34.25rem]">
@@ -187,15 +268,23 @@ export default function ProviderSelectionEmptyState({
                       <span className="text-xs font-semibold text-foreground">
                         {getProviderDisplayName(provider)}
                       </span>
-                      <span className="text-xs text-muted-foreground">·</span>
-                      <span className="truncate text-xs text-foreground">
-                        {currentModelLabel}
-                      </span>
+                      {!runtimeSelectorOnly && (
+                        <>
+                          <span className="text-xs text-muted-foreground">·</span>
+                          <span className="truncate text-xs text-foreground">
+                            {currentModelLabel}
+                          </span>
+                        </>
+                      )}
                     </div>
                     <p className="mt-0.5 text-[11px] text-muted-foreground">
-                      {t("providerSelection.clickToChange", {
-                        defaultValue: "Click to change model",
-                      })}
+                      {runtimeSelectorOnly
+                        ? t("providerSelection.runtimeOnly.clickToChange", {
+                            defaultValue: "Click to change Runtime",
+                          })
+                        : t("providerSelection.clickToChange", {
+                            defaultValue: "Click to change model",
+                          })}
                     </p>
                   </div>
                   <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-hover:translate-y-0.5" />
@@ -204,125 +293,171 @@ export default function ProviderSelectionEmptyState({
             </DialogTrigger>
 
             <DialogContent className="max-w-md overflow-hidden p-0">
-              <DialogTitle>Model Selector</DialogTitle>
-              <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/20 px-4 py-3">
-                <div>
-                  <p className="text-sm font-semibold text-foreground">
-                    {t("providerSelection.chooseModel", {
-                      defaultValue: "Choose a model",
-                    })}
-                  </p>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">
-                    {t("providerSelection.chooseModelDescription", {
-                      defaultValue: "Built-in and custom models in one list",
-                    })}
-                  </p>
-                </div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={openModelLibrary}
-                  className="h-8 shrink-0 rounded-lg px-2.5 text-xs"
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                  {t("providerSelection.addModel", { defaultValue: "Add model" })}
-                </Button>
-              </div>
-              <Command filter={modelSearchFilter}>
-                <CommandInput
-                  placeholder={t("providerSelection.searchModels", {
-                    defaultValue: "Search models...",
-                  })}
-                />
-                <CommandList className="max-h-[350px]">
-                  <CommandEmpty>
-                    {t("providerSelection.noModelsFound", {
-                      defaultValue: "No models found.",
-                    })}
-                  </CommandEmpty>
-                  {visibleProviderGroups.map((group, idx) => (
-                    <CommandGroup
-                      key={group.id}
-                      className={
-                        idx > 0
-                          ? "border-t border-border/40 [&_[cmdk-group-heading]]:mt-1 [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider"
-                          : "[&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider"
-                      }
-                      heading={
-                        <span className="flex items-center gap-1.5">
-                          <LLMProviderLogo provider={group.id} className="h-3.5 w-3.5 shrink-0" />
-                          {group.name}
-                        </span>
-                      }
-                    >
-                      {group.models.length === 0 && providerModelsLoading ? (
-                        <CommandItem disabled className="ml-4 border-l border-border/40 pl-4 text-muted-foreground">
-                          {t("providerSelection.loadingModels", { defaultValue: "Loading models…" })}
-                        </CommandItem>
-                      ) : null}
-                      {group.models.map((model) => {
-                        const isSelected = provider === group.id && currentModel === model.value;
-                        return (
-                          <CommandItem
-                            key={`${group.id}-${model.value}`}
-                            value={`${group.name} ${model.label} ${model.description || ''}`}
-                            onSelect={() => handleModelSelect(group.id, model.value)}
-                            className="ml-4 border-l border-border/40 pl-4"
-                          >
-                            <div className="min-w-0 flex-1">
-                              <div className="flex min-w-0 items-center gap-2">
-                                <span className="truncate">{model.label}</span>
-                                {model.isCustom && (
-                                  <Badge className="h-4 shrink-0 rounded-full px-1.5 text-[8px]">Custom</Badge>
-                                )}
-                              </div>
-                              {model.label !== model.value && (
-                                <div className="truncate font-mono text-[10px] text-muted-foreground">
-                                  {model.value}
-                                </div>
-                              )}
-                            </div>
-                            {isSelected && (
-                              <Check className="ml-auto h-4 w-4 shrink-0 text-primary" />
-                            )}
-                          </CommandItem>
-                        );
+              <DialogTitle>
+                {runtimeSelectorOnly
+                  ? t("providerSelection.runtimeOnly.dialogTitle", { defaultValue: "Runtime Selector" })
+                  : "Model Selector"}
+              </DialogTitle>
+              {runtimeSelectorOnly ? (
+                <>
+                  <div className="border-b border-border/60 bg-muted/20 px-4 py-3">
+                    <p className="text-sm font-semibold text-foreground">
+                      {t("providerSelection.runtimeOnly.choose", { defaultValue: "Choose a Runtime" })}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">
+                      {t("providerSelection.runtimeOnly.description", {
+                        defaultValue: "The server manages each Runtime's model configuration.",
                       })}
-                    </CommandGroup>
-                  ))}
-                </CommandList>
-              </Command>
+                    </p>
+                  </div>
+                  <Command>
+                    <CommandList className="max-h-[350px] p-2">
+                      {RUNTIME_PROVIDER_META.map((runtime) => (
+                        <CommandItem
+                          key={runtime.id}
+                          value={getProviderDisplayName(runtime.id)}
+                          onSelect={() => handleRuntimeSelect(runtime.id)}
+                          className="rounded-lg px-3 py-3"
+                        >
+                          <LLMProviderLogo provider={runtime.id} className="h-5 w-5 shrink-0" />
+                          <span className="font-medium">{getProviderDisplayName(runtime.id)}</span>
+                          {provider === runtime.id && (
+                            <Check className="ml-auto h-4 w-4 shrink-0 text-primary" />
+                          )}
+                        </CommandItem>
+                      ))}
+                    </CommandList>
+                  </Command>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/20 px-4 py-3">
+                    <div>
+                      <p className="text-sm font-semibold text-foreground">
+                        {t("providerSelection.chooseModel", {
+                          defaultValue: "Choose a model",
+                        })}
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-muted-foreground">
+                        {t("providerSelection.chooseModelDescription", {
+                          defaultValue: "Built-in and custom models in one list",
+                        })}
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={openModelLibrary}
+                      className="h-8 shrink-0 rounded-lg px-2.5 text-xs"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      {t("providerSelection.addModel", { defaultValue: "Add model" })}
+                    </Button>
+                  </div>
+                  <Command filter={modelSearchFilter}>
+                    <CommandInput
+                      placeholder={t("providerSelection.searchModels", {
+                        defaultValue: "Search models...",
+                      })}
+                    />
+                    <CommandList className="max-h-[350px]">
+                      <CommandEmpty>
+                        {t("providerSelection.noModelsFound", {
+                          defaultValue: "No models found.",
+                        })}
+                      </CommandEmpty>
+                      {visibleProviderGroups.map((group, idx) => (
+                        <CommandGroup
+                          key={group.id}
+                          className={
+                            idx > 0
+                              ? "border-t border-border/40 [&_[cmdk-group-heading]]:mt-1 [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider"
+                              : "[&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider"
+                          }
+                          heading={
+                            <span className="flex items-center gap-1.5">
+                              <LLMProviderLogo provider={group.id} className="h-3.5 w-3.5 shrink-0" />
+                              {group.name}
+                            </span>
+                          }
+                        >
+                          {group.models.length === 0 && providerModelsLoading ? (
+                            <CommandItem disabled className="ml-4 border-l border-border/40 pl-4 text-muted-foreground">
+                              {t("providerSelection.loadingModels", { defaultValue: "Loading models…" })}
+                            </CommandItem>
+                          ) : null}
+                          {group.models.map((model) => {
+                            const isSelected = provider === group.id && currentModel === model.value;
+                            return (
+                              <CommandItem
+                                key={`${group.id}-${model.value}`}
+                                value={`${group.name} ${model.label} ${model.description || ''}`}
+                                onSelect={() => handleModelSelect(group.id, model.value)}
+                                className="ml-4 border-l border-border/40 pl-4"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex min-w-0 items-center gap-2">
+                                    <span className="truncate">{model.label}</span>
+                                    {model.isCustom && (
+                                      <Badge className="h-4 shrink-0 rounded-full px-1.5 text-[8px]">Custom</Badge>
+                                    )}
+                                  </div>
+                                  {model.label !== model.value && (
+                                    <div className="truncate font-mono text-[10px] text-muted-foreground">
+                                      {model.value}
+                                    </div>
+                                  )}
+                                </div>
+                                {isSelected && (
+                                  <Check className="ml-auto h-4 w-4 shrink-0 text-primary" />
+                                )}
+                              </CommandItem>
+                            );
+                          })}
+                        </CommandGroup>
+                      ))}
+                    </CommandList>
+                  </Command>
+                </>
+              )}
             </DialogContent>
           </Dialog>
 
-          <Dialog
-            open={modelLibraryOpen}
-            onOpenChange={(open) => {
-              if (open) {
-                setModelLibraryOpen(true);
-              } else {
-                closeModelLibrary();
-              }
-            }}
-          >
-            <DialogContent className="flex h-[min(90dvh,46rem)] w-[calc(100vw-1rem)] max-w-4xl flex-col overflow-hidden rounded-3xl p-4 sm:p-5">
-              <DialogTitle>
-                {t("providerSelection.manageModels", {
-                  defaultValue: "Manage models",
-                })}
-              </DialogTitle>
-              <ModelLibraryPanel
-                initialProvider={provider}
-                providerModelCatalog={providerModelCatalog}
-                actions={providerModelActions}
-                onDone={closeModelLibrary}
-              />
-            </DialogContent>
-          </Dialog>
+          {!runtimeSelectorOnly && canManageProviderModels && (
+            <Dialog
+              open={modelLibraryOpen}
+              onOpenChange={(open) => {
+                if (open) {
+                  setModelLibraryOpen(true);
+                } else {
+                  closeModelLibrary();
+                }
+              }}
+            >
+              <DialogContent className="flex h-[min(90dvh,46rem)] w-[calc(100vw-1rem)] max-w-4xl flex-col overflow-hidden rounded-3xl p-4 sm:p-5">
+                <DialogTitle>
+                  {t("providerSelection.manageModels", {
+                    defaultValue: "Manage models",
+                  })}
+                </DialogTitle>
+                <ModelLibraryPanel
+                  initialProvider={provider}
+                  providerModelCatalog={providerModelCatalog}
+                  actions={providerModelActions}
+                  onDone={closeModelLibrary}
+                />
+              </DialogContent>
+            </Dialog>
+          )}
 
           <p className="mt-4 text-center text-sm text-muted-foreground/70">
-            {
+            {runtimeSelectorOnly
+              ? t("providerSelection.runtimeOnly.ready", {
+                  runtime: getProviderDisplayName(provider),
+                  defaultValue: "{{runtime}} Runtime is ready. Start typing below.",
+                })
+              :
               {
                 claude: t("providerSelection.readyPrompt.claude", {
                   model: providerModels.claude,
@@ -337,8 +472,7 @@ export default function ProviderSelectionEmptyState({
                   model: providerModels.opencode,
                   defaultValue: "Ready with OpenCode {{model}}",
                 }),
-              }[provider]
-            }
+              }[provider]}
           </p>
 
           <p className="mt-3 flex items-center justify-center gap-1.5 text-center text-xs text-muted-foreground/60">
@@ -354,7 +488,7 @@ export default function ProviderSelectionEmptyState({
             />
           </p>
 
-          {provider && tasksEnabled && isTaskMasterInstalled && (
+          {provider && canContinueSession && tasksEnabled && isTaskMasterInstalled && (
             <div className="mt-5">
               <NextTaskBanner
                 onStartTask={() => setInput(nextTaskPrompt)}
@@ -368,6 +502,14 @@ export default function ProviderSelectionEmptyState({
   }
 
   if (selectedSession) {
+    if (!canStartConversation) {
+      return renderUnavailableState(
+        t("providerSelection.readOnlyTitle", {
+          defaultValue: "This conversation is read-only",
+        }),
+      );
+    }
+
     return (
       <div className="flex h-full items-center justify-center">
         <div className="max-w-[34.25rem] px-6 text-center">
@@ -378,7 +520,7 @@ export default function ProviderSelectionEmptyState({
             {t("session.continue.description")}
           </p>
 
-          {tasksEnabled && isTaskMasterInstalled && (
+          {canContinueSession && tasksEnabled && isTaskMasterInstalled && (
             <div className="mt-5">
               <NextTaskBanner
                 onStartTask={() => setInput(nextTaskPrompt)}

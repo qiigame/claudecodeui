@@ -1,13 +1,22 @@
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 
 import { sessionsDb } from '@/modules/database/index.js';
+import { ccSwitchConfigService } from '@/modules/runtime-bridge/index.js';
 import type { IProviderModels } from '@/shared/interfaces.js';
 import type {
   ProviderCurrentActiveModel,
   ProviderModelOption,
   ProviderModelsDefinition,
 } from '@/shared/types.js';
-import { buildDefaultProviderCurrentActiveModel } from '@/shared/utils.js';
+import {
+  buildDefaultProviderCurrentActiveModel,
+  closeProviderTranscriptReadHandle,
+  openValidatedProviderTranscript,
+  resolveClaudeConfigDirectory,
+  type ProviderTranscriptPathValidationInput,
+  validateProviderTranscriptPath,
+} from '@/shared/utils.js';
 
 /**
  * Ultracode is not one of the SDK's reasoning-effort levels. Selecting it runs the turn at
@@ -251,11 +260,10 @@ const extractClaudeModelFromMessageContent = (content: unknown): string | null =
   return null;
 };
 
-const readClaudeSessionModelFromJsonl = async (
+const readClaudeSessionModelFromContent = (
   sessionId: string,
-  jsonlPath: string,
+  content: string,
 ): Promise<ProviderCurrentActiveModel | null> => {
-  const content = await readFile(jsonlPath, 'utf8');
   const lines = content
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -276,7 +284,26 @@ const readClaudeSessionModelFromJsonl = async (
   return null;
 };
 
+/** Filesystem seams used to validate Claude model lookups and isolated tests. */
+export type ClaudeProviderModelsDependencies = {
+  getClaudeConfigDirectory?: () => string;
+  validateTranscriptPath?: (
+    input: ProviderTranscriptPathValidationInput,
+  ) => Promise<string | null>;
+};
+
 export class ClaudeProviderModels implements IProviderModels {
+  private readonly dependencies: Required<ClaudeProviderModelsDependencies>;
+
+  constructor(dependencyOverrides: ClaudeProviderModelsDependencies = {}) {
+    this.dependencies = {
+      getClaudeConfigDirectory: dependencyOverrides.getClaudeConfigDirectory
+        ?? resolveClaudeConfigDirectory,
+      validateTranscriptPath: dependencyOverrides.validateTranscriptPath
+        ?? validateProviderTranscriptPath,
+    };
+  }
+
   async getSupportedModels(): Promise<ProviderModelsDefinition> {
     // claude creates a new jsonl file as a separate session for this request.
     // As a result, it lists the workspace where this is invoked when it shouldn't.
@@ -289,7 +316,43 @@ export class ClaudeProviderModels implements IProviderModels {
     // const supportedModels = await queryInstance.supportedModels();
     // queryInstance.close();
     // return buildClaudeModelsDefinition(supportedModels);
-    return CLAUDE_PREDEFINED_MODELS;
+    if (!['1', 'true', 'yes'].includes(process.env.COMIC_CC_SWITCH_SYNC?.trim().toLowerCase() ?? '')) {
+      return CLAUDE_PREDEFINED_MODELS;
+    }
+
+    const configuration = await ccSwitchConfigService.readClaudeConfiguration();
+    const configuredModel = configuration?.model;
+    if (!configuredModel) {
+      return CLAUDE_PREDEFINED_MODELS;
+    }
+
+    const hasConfiguredModel = CLAUDE_PREDEFINED_MODELS.OPTIONS.some(
+      (option) => option.value === configuredModel,
+    );
+    return {
+      OPTIONS: hasConfiguredModel
+        ? CLAUDE_PREDEFINED_MODELS.OPTIONS
+        : [
+          {
+            value: configuredModel,
+            label: configuredModel,
+            description: 'Current CC-Switch Claude provider model.',
+            effort: {
+              default: 'high',
+              values: [
+                { value: 'low' },
+                { value: 'medium' },
+                { value: 'high' },
+                { value: 'xhigh' },
+                { value: 'max' },
+                ULTRACODE_EFFORT_OPTION,
+              ],
+            },
+          },
+          ...CLAUDE_PREDEFINED_MODELS.OPTIONS,
+        ],
+      DEFAULT: configuredModel,
+    };
   }
 
   async getCurrentActiveModel(sessionId?: string): Promise<ProviderCurrentActiveModel> {
@@ -298,10 +361,62 @@ export class ClaudeProviderModels implements IProviderModels {
     }
 
     try {
-      const jsonlPath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
-      const activeModel = jsonlPath
-        ? await readClaudeSessionModelFromJsonl(sessionId, jsonlPath)
+      const session = sessionsDb.getSessionById(sessionId);
+      // A known app row without a native id is still pending its first run;
+      // its opaque app id must never be used as a Claude transcript key. A row
+      // owned by another provider is likewise not a valid Claude session.
+      if (session && session.provider !== 'claude') {
+        return buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
+      }
+      const providerSessionId = session ? session.provider_session_id : sessionId;
+      if (!providerSessionId) {
+        return buildDefaultProviderCurrentActiveModel(await this.getSupportedModels());
+      }
+      // `project_path` remains the source/sidebar owner, while isolated
+      // sessions run in `runtime_path`. Bind the transcript lookup to that
+      // effective cwd so a stale source path cannot report another model as
+      // this session's active model.
+      const expectedProjectPath = typeof session?.runtime_path === 'string' && session.runtime_path.trim()
+        ? session.runtime_path.trim()
+        : typeof session?.project_path === 'string' && session.project_path.trim()
+          ? session.project_path.trim()
+          : null;
+      const jsonlPath = session?.jsonl_path
+        ? session.jsonl_path
         : null;
+      let activeModel: ProviderCurrentActiveModel | null = null;
+      if (jsonlPath) {
+        const rootPath = path.join(this.dependencies.getClaudeConfigDirectory(), 'projects');
+        if (this.dependencies.validateTranscriptPath === validateProviderTranscriptPath) {
+          const authenticated = await openValidatedProviderTranscript({
+            provider: 'claude',
+            candidatePath: jsonlPath,
+            rootPath,
+            providerSessionId,
+            expectedProjectPath,
+          });
+          if (authenticated) {
+            try {
+              const content = await authenticated.handle.readFile({ encoding: 'utf8' });
+              activeModel = readClaudeSessionModelFromContent(providerSessionId, content);
+            } finally {
+              await closeProviderTranscriptReadHandle(authenticated.handle);
+            }
+          }
+        } else {
+          // Test/adapter seams may intentionally bypass the deployment root.
+          const validated = await this.dependencies.validateTranscriptPath({
+            provider: 'claude',
+            candidatePath: jsonlPath,
+            rootPath,
+            providerSessionId,
+            expectedProjectPath,
+          });
+          activeModel = validated
+            ? readClaudeSessionModelFromContent(providerSessionId, await readFile(validated, 'utf8'))
+            : null;
+        }
+      }
       if (activeModel?.model) {
         return activeModel;
       }

@@ -4,6 +4,8 @@ import type { NavigateFunction } from 'react-router-dom';
 
 import { useProjectsState } from '@/modules/project-workspace/hooks/useProjectsState';
 import type { IsSessionProcessing,ServerEvent } from '@/shared/types';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type ProjectsState = ReturnType<typeof useProjectsState>;
 
@@ -66,12 +68,22 @@ export function ProjectsStateProvider({
   isMobile,
   isSessionProcessing,
 }: ProjectsStateProviderProps) {
+  const { authMode, user, canManageSettings: authCanManageSettings } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  // Keep the state-layer opener aligned with the server-owned deployment
+  // policy.  Auth alone must not expose settings/configuration controls in a
+  // product/QA read-only deployment.
+  const canManageSettings = authCanManageSettings
+    && can('settings.write')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
   const state = useProjectsState({
     sessionId,
     navigate,
     subscribe,
     isMobile,
     isSessionProcessing,
+    canManageSettings,
   });
 
   const sidebarState = useMemo<ProjectSidebarState>(

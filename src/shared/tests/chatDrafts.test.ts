@@ -17,11 +17,15 @@ const savedDrafts: SavedDraft[] = [];
 const deletedScopes: string[] = [];
 let serverDrafts: unknown[] = [];
 let draftsRequestFailed = false;
+let pendingDraftsResponse: Promise<Response> | null = null;
 
 vi.mock('@/shared/api', () => ({
   api: {
     user: {
       drafts: async () => {
+        if (pendingDraftsResponse) {
+          return pendingDraftsResponse;
+        }
         if (draftsRequestFailed) {
           throw new Error('offline');
         }
@@ -53,6 +57,7 @@ beforeEach(() => {
   deletedScopes.length = 0;
   serverDrafts = [];
   draftsRequestFailed = false;
+  pendingDraftsResponse = null;
   vi.useFakeTimers();
 });
 
@@ -144,6 +149,27 @@ test('hydrate does not overwrite a scope the user is typing into right now', asy
   await store.hydrateChatDrafts();
 
   assert.equal(store.readDraftText('session-a'), 'what I am writing');
+});
+
+test('a response from a reset account cannot repopulate the draft store', async () => {
+  let resolveResponse!: (response: Response) => void;
+  pendingDraftsResponse = new Promise<Response>((resolve) => {
+    resolveResponse = resolve;
+  });
+
+  const store = await loadStore();
+  const hydration = store.hydrateChatDrafts();
+
+  store.resetChatDrafts();
+  resolveResponse(new Response(JSON.stringify({
+    drafts: [{ scope: 'session-a', text: 'private A data', queuedMessage: null }],
+  }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  }));
+  await hydration;
+
+  assert.equal(store.readDraftText('session-a'), '');
 });
 
 test('a failed hydrate keeps the mirrored draft rather than blanking the composer', async () => {

@@ -113,8 +113,9 @@ export class OpenCodeSessionSynchronizer implements IProviderSessionSynchronizer
     }
 
     const fallbackTitle = 'Untitled OpenCode Session';
-    const pendingAppSession = sessionsDb.getSessionByProviderSessionId(sessionId)
-      ?? sessionsDb.getSessionById(sessionId)
+    const appIdSession = sessionsDb.getSessionById(sessionId);
+    const pendingAppSession = sessionsDb.getSessionByProviderSessionId(sessionId, this.provider)
+      ?? (appIdSession?.provider === this.provider ? appIdSession : null)
       ?? sessionsDb.findLatestPendingAppSession(this.provider, projectPath);
     if (pendingAppSession && !pendingAppSession.provider_session_id) {
       // Slow networks can let the sqlite watcher index opencode.db before the
@@ -126,8 +127,11 @@ export class OpenCodeSessionSynchronizer implements IProviderSessionSynchronizer
 
     // App-created sessions are keyed by an app id, so disk-discovered provider
     // ids must be resolved through the provider-id mapping first.
-    const existingSession = sessionsDb.getSessionByProviderSessionId(sessionId)
-      ?? sessionsDb.getSessionById(sessionId);
+    const existingSession = sessionsDb.getSessionByProviderSessionId(sessionId, this.provider)
+      ?? (appIdSession?.provider === this.provider ? appIdSession : null);
+    if (appIdSession && appIdSession.provider !== this.provider && !existingSession) {
+      return null;
+    }
     const existingName = existingSession?.custom_name;
 
     let nextName: string | undefined;

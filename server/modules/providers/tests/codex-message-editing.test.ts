@@ -220,7 +220,12 @@ test('rewinding a Codex session moves it onto the branch and retires the old thr
       codexAppServer.forkThread = realForkThread;
     }
 
-    assert.deepEqual(forkCalls, [{ threadId: 'thread-1', lastTurnId: 'turn-b', cwd: workspacePath }]);
+    assert.deepEqual(forkCalls, [{
+      threadId: 'thread-1',
+      jsonlPath: path.join(homeDir, '.codex', 'sessions', '2026', '07', '07', 'rollout-thread-1.jsonl'),
+      lastTurnId: 'turn-b',
+      cwd: workspacePath,
+    }]);
 
     const session = sessionsDb.getSessionById(sessionId);
     assert.equal(session?.provider_session_id, 'thread-2');
@@ -385,6 +390,7 @@ test('codex app-server forks a real thread at a turn', { concurrency: false }, a
 
     const fork = await codexAppServer.forkThread({
       threadId: '01a02a80-dfb9-7882-8013-00e41955e656',
+      jsonlPath: path.join(sessionsDir, path.basename(fixture)),
       // The fixture's second turn; the third must not survive the cut.
       lastTurnId: '01a02a81-2427-7853-b5e2-6eee36690146',
       cwd: workspacePath,

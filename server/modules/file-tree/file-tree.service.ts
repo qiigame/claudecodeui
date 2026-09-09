@@ -4,6 +4,7 @@ import ignore from 'ignore';
 
 import type {
   FileTreeDirectoryEntry,
+  FileTreeFileSystem,
   FileTreeNode,
   FileTreeServiceDependencies,
   FileTreeServices,
@@ -101,6 +102,66 @@ function resolvePathInsideProject(projectRoot: string, targetPath: string): stri
   return resolvedPath;
 }
 
+/**
+ * Resolves a client-selected file to its canonical filesystem location.
+ *
+ * Lexical `..` checks alone do not protect a read endpoint: a symlink inside
+ * the project can point at an arbitrary file outside the project root.  Both
+ * the configured project root and the selected file are therefore resolved
+ * before any bytes are read or streamed.  Callers use the returned canonical
+ * path for the actual operation, which also avoids following the checked
+ * symlink a second time after validation.
+ */
+async function resolveCanonicalProjectFile(
+  fileSystem: FileTreeFileSystem,
+  projectRoot: string,
+  targetPath: string,
+): Promise<{ projectRoot: string; filePath: string }> {
+  const lexicalPath = path.isAbsolute(targetPath)
+    ? path.resolve(targetPath)
+    : resolvePathInsideProject(projectRoot, targetPath);
+
+  // A tree response may expose canonical absolute paths when the database
+  // row itself points through a symlink.  Permit those absolute candidates
+  // here and let the canonical containment check below decide ownership;
+  // relative traversal is still rejected by resolvePathInsideProject above.
+  if (!path.isAbsolute(targetPath) && !isPathInsideOrEqual(projectRoot, lexicalPath)) {
+    throw createFileTreeError('Path must be under project root', 403, 'PATH_OUTSIDE_PROJECT');
+  }
+
+  let canonicalProjectRoot: string;
+  let canonicalFilePath: string;
+  try {
+    [canonicalProjectRoot, canonicalFilePath] = await Promise.all([
+      fileSystem.realpath(projectRoot),
+      fileSystem.realpath(lexicalPath),
+    ]);
+  } catch (error) {
+    mapFileSystemError(error, {
+      ENOENT: { message: 'File not found', statusCode: 404 },
+      EACCES: { message: 'Permission denied', statusCode: 403 },
+      EPERM: { message: 'Permission denied', statusCode: 403 },
+      ELOOP: { message: 'File path cannot be resolved safely', statusCode: 403 },
+    });
+  }
+
+  if (!isPathInsideOrEqual(canonicalProjectRoot, canonicalFilePath)) {
+    throw createFileTreeError('Path must be under project root', 403, 'PATH_OUTSIDE_PROJECT');
+  }
+
+  return {
+    projectRoot: canonicalProjectRoot,
+    filePath: canonicalFilePath,
+  };
+}
+
+function isPathInsideOrEqual(parentPath: string, candidatePath: string): boolean {
+  const normalizedParentPath = path.resolve(parentPath);
+  const normalizedCandidatePath = path.resolve(candidatePath);
+  return normalizedCandidatePath === normalizedParentPath
+    || normalizedCandidatePath.startsWith(`${normalizedParentPath}${path.sep}`);
+}
+
 function expandWorkspacePath(workspaceRoot: string, inputPath: string): string {
   if (inputPath === '~') {
     return workspaceRoot;
@@ -186,6 +247,101 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
       throw createFileTreeError('Project not found', 404, 'PROJECT_NOT_FOUND');
     }
     return projectRoot;
+  }
+
+  /**
+   * Resolves the database-selected project root before a read walk.  Project
+   * rows created by older versions may contain a symlink path, and a root link
+   * can otherwise make the recursive listing walk outside the approved tree.
+   */
+  async function resolveCanonicalProjectRoot(projectRoot: string): Promise<string> {
+    let canonicalProjectRoot: string;
+    try {
+      canonicalProjectRoot = await fileSystem.realpath(projectRoot);
+    } catch (error) {
+      mapFileSystemError(error, {
+        ENOENT: { message: 'Project path not found', statusCode: 404 },
+        EACCES: { message: 'Permission denied', statusCode: 403 },
+        EPERM: { message: 'Permission denied', statusCode: 403 },
+        ELOOP: { message: 'Project path cannot be resolved safely', statusCode: 403 },
+      });
+    }
+
+    // Keep the project-id lookup subject to the same workspace boundary as
+    // project creation. This protects legacy/tampered database rows whose
+    // root path itself is a symlink into a machine-wide directory.
+    const validation = await dependencies.workspace.validatePath(canonicalProjectRoot);
+    if (!validation.valid) {
+      throw createFileTreeError(
+        'Path is outside the workspace root',
+        403,
+        'INVALID_WORKSPACE_PATH',
+      );
+    }
+
+    return canonicalProjectRoot;
+  }
+
+  /**
+   * Resolves one client-selected directory without allowing a symlink inside
+   * the project to escape to another filesystem location.
+   */
+  async function resolveProjectDirectory(
+    projectRoot: string,
+    requestedDirectoryPath: string,
+  ): Promise<string> {
+    const resolvedDirectoryPath = requestedDirectoryPath === '.' || requestedDirectoryPath === './'
+      ? path.resolve(projectRoot)
+      : path.isAbsolute(requestedDirectoryPath)
+        ? path.resolve(requestedDirectoryPath)
+        : path.resolve(projectRoot, requestedDirectoryPath);
+
+    // Reject relative lexical traversal before touching the filesystem. An
+    // absolute path may be a canonical path returned by a previous tree
+    // response while the database still stores a symlinked project root; the
+    // canonical containment check below is authoritative for that case.
+    if (!isPathInsideOrEqual(projectRoot, resolvedDirectoryPath)
+      && !path.isAbsolute(requestedDirectoryPath)) {
+      throw createFileTreeError('Path must be under project root', 403, 'PATH_OUTSIDE_PROJECT');
+    }
+
+    let canonicalProjectRoot: string;
+    let canonicalDirectoryPath: string;
+    try {
+      [canonicalProjectRoot, canonicalDirectoryPath] = await Promise.all([
+        fileSystem.realpath(projectRoot),
+        fileSystem.realpath(resolvedDirectoryPath),
+      ]);
+    } catch (error) {
+      mapFileSystemError(error, {
+        ENOENT: { message: 'Directory not found', statusCode: 404 },
+        EACCES: { message: 'Permission denied', statusCode: 403 },
+        EPERM: { message: 'Permission denied', statusCode: 403 },
+      });
+    }
+
+    if (!isPathInsideOrEqual(canonicalProjectRoot, canonicalDirectoryPath)) {
+      throw createFileTreeError('Path must be under project root', 403, 'PATH_OUTSIDE_PROJECT');
+    }
+
+    try {
+      const directoryStats = await fileSystem.stat(resolvedDirectoryPath);
+      if (!directoryStats.isDirectory()) {
+        throw createFileTreeError('Path is not a directory', 400, 'NOT_A_DIRECTORY');
+      }
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      mapFileSystemError(error, {
+        ENOENT: { message: 'Directory not found', statusCode: 404 },
+        EACCES: { message: 'Permission denied', statusCode: 403 },
+        EPERM: { message: 'Permission denied', statusCode: 403 },
+      });
+    }
+
+    // Use the canonical directory for the subsequent walk.  Returning the
+    // lexical symlink path would re-follow a link after the containment check
+    // and could expose a different target if the link changed in between.
+    return canonicalDirectoryPath;
   }
 
   /**
@@ -330,7 +486,7 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
       const targetPath = path.resolve(requestedPath);
       const validation = await dependencies.workspace.validatePath(targetPath);
       if (!validation.valid) {
-        throw createFileTreeError(validation.error ?? 'Path is outside the workspace root', 403, 'INVALID_WORKSPACE_PATH');
+        throw createFileTreeError('Path is outside the workspace root', 403, 'INVALID_WORKSPACE_PATH');
       }
 
       const resolvedPath = validation.resolvedPath || targetPath;
@@ -379,7 +535,7 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
       const resolvedInput = path.resolve(expandedPath);
       const validation = await dependencies.workspace.validatePath(resolvedInput);
       if (!validation.valid) {
-        throw createFileTreeError(validation.error ?? 'Path is outside the workspace root', 403, 'INVALID_WORKSPACE_PATH');
+        throw createFileTreeError('Path is outside the workspace root', 403, 'INVALID_WORKSPACE_PATH');
       }
 
       const targetPath = validation.resolvedPath || resolvedInput;
@@ -408,8 +564,12 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
     },
 
     async readTextFile(projectId, filePath) {
-      const projectRoot = await resolveProjectRoot(projectId);
-      const resolvedPath = resolvePathInsideProject(projectRoot, filePath);
+      const projectRoot = await resolveCanonicalProjectRoot(await resolveProjectRoot(projectId));
+      const { filePath: resolvedPath } = await resolveCanonicalProjectFile(
+        fileSystem,
+        projectRoot,
+        filePath,
+      );
       try {
         const content = await fileSystem.readTextFile(resolvedPath);
         return { content, path: resolvedPath };
@@ -417,18 +577,18 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
         mapFileSystemError(error, {
           ENOENT: { message: 'File not found', statusCode: 404 },
           EACCES: { message: 'Permission denied', statusCode: 403 },
+          EPERM: { message: 'Permission denied', statusCode: 403 },
         });
       }
     },
 
     async openFile(projectId, filePath) {
-      const projectRoot = await resolveProjectRoot(projectId);
-      const resolvedPath = resolvePathInsideProject(projectRoot, filePath);
-      try {
-        await fileSystem.access(resolvedPath);
-      } catch {
-        throw createFileTreeError('File not found', 404, 'FILE_NOT_FOUND');
-      }
+      const projectRoot = await resolveCanonicalProjectRoot(await resolveProjectRoot(projectId));
+      const { filePath: resolvedPath } = await resolveCanonicalProjectFile(
+        fileSystem,
+        projectRoot,
+        filePath,
+      );
 
       return {
         contentType: dependencies.resolveMimeType(resolvedPath),
@@ -452,11 +612,12 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
     },
 
     async listProjectFiles(projectId, options) {
-      const projectRoot = await resolveProjectRoot(projectId);
+      const configuredProjectRoot = await resolveProjectRoot(projectId);
+      const projectRoot = await resolveCanonicalProjectRoot(configuredProjectRoot);
       try {
         await fileSystem.access(projectRoot);
       } catch {
-        throw createFileTreeError(`Project path not found: ${projectRoot}`, 404, 'PROJECT_PATH_NOT_FOUND');
+        throw createFileTreeError('Project path not found', 404, 'PROJECT_PATH_NOT_FOUND');
       }
 
       let includeEntry: FileTreeEntryFilter | undefined;
@@ -471,7 +632,16 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
         }
       }
 
-      return buildFileTree(projectRoot, 10, 0, includeEntry);
+      // `directoryPath` opts into the bounded lazy-listing contract used by
+      // the browser tree. Omitting it preserves recursive responses for older
+      // consumers such as mentions and the command palette.
+      const requestedDirectoryPath = options?.directoryPath;
+      const directoryPath = requestedDirectoryPath === undefined
+        ? projectRoot
+        : await resolveProjectDirectory(configuredProjectRoot, requestedDirectoryPath);
+      const maximumDepth = requestedDirectoryPath === undefined ? 10 : 0;
+
+      return buildFileTree(directoryPath, maximumDepth, 0, includeEntry);
     },
 
     async createEntry(input) {

@@ -1,9 +1,15 @@
 // @ts-nocheck -- temporary while command handlers are extracted into the injected service.
-import path from "path";
+import path from 'node:path';
 
 import express from "express";
 
-import { parseFrontMatter } from "../../shared/frontmatter.js";
+import {
+  captureDeploymentPolicy,
+  hasDeploymentCapability,
+  isDeploymentReadOnly,
+} from '@/modules/deployment-policy/index.js';
+import { AppError } from '@/shared/utils.js';
+import { parseFrontMatter } from '@/shared/frontmatter.js';
 
 type CommandsRouterDependencies = {
   fileSystem: typeof import('node:fs/promises');
@@ -17,6 +23,13 @@ type CommandsRouterDependencies = {
     platform: NodeJS.Platform;
     pid: number;
   };
+  /** Optional deployment policy override for composition roots and tests. */
+  deploymentPolicy?: import('@/modules/deployment-policy/index.js').DeploymentPolicy
+    | (() => import('@/modules/deployment-policy/index.js').DeploymentPolicy);
+  /** Resolve a client-supplied project id through the server-owned project registry. */
+  resolveProjectPathById?: (projectId: string) => string | null | Promise<string | null>;
+  /** Resolve a legacy path only when it is already registered by the server. */
+  resolveRegisteredProjectPath?: (projectPath: string) => string | null | Promise<string | null>;
 };
 
 /** Creates Commands routes around explicit filesystem, model-catalog, and runtime adapters. */
@@ -27,6 +40,200 @@ const APP_ROOT = dependencies.appRoot;
 const providerModelsService = dependencies.models;
 const process = dependencies.runtime;
 const router = express.Router();
+// Capture the explicit source (or the ambient environment) once while this
+// router is assembled.  A trusted composition middleware may attach a more
+// specific request snapshot later; absent that context, requests always use
+// this immutable startup fallback rather than reparsing process.env.
+const startupDeploymentPolicy = captureDeploymentPolicy(dependencies.deploymentPolicy);
+
+const resolveDeploymentPolicy = (request) => {
+  return request?.deploymentPolicy || startupDeploymentPolicy;
+};
+
+/**
+ * Reads a project identifier from a command context/request without trusting
+ * the path field as an authority.  New clients send `projectId`; the path is
+ * retained only as a backwards-compatible lookup hint for older clients.
+ */
+const readProjectId = (source) => {
+  const value = source?.projectId;
+  return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+};
+
+const readProjectPath = (source) => {
+  const value = source?.projectPath;
+  return typeof value === 'string' ? value.trim() : '';
+};
+
+/**
+ * Resolves the project directory through the server-owned registry.  A
+ * deployment that supplies either resolver rejects unregistered legacy paths;
+ * standalone callers without a registry retain the historical path behavior
+ * for compatibility with local tests and developer-only integrations.
+ */
+const resolveAuthorizedProjectPath = async (source) => {
+  const projectId = readProjectId(source);
+  const requestedPath = readProjectPath(source);
+
+  if (projectId) {
+    if (!dependencies.resolveProjectPathById) {
+      throw new AppError('Project id resolution is unavailable.', {
+        code: 'PROJECT_RESOLUTION_UNAVAILABLE',
+        statusCode: 503,
+      });
+    }
+    const resolved = await dependencies.resolveProjectPathById(projectId);
+    if (!resolved || typeof resolved !== 'string' || !resolved.trim()) {
+      throw new AppError(`Project "${projectId}" was not found.`, {
+        code: 'PROJECT_NOT_FOUND',
+        statusCode: 404,
+      });
+    }
+    // The id is authoritative. Never let a conflicting client path redirect
+    // the subsequent command lookup to a different project.
+    return canonicalizeExistingPath(path.resolve(resolved));
+  }
+
+  if (!requestedPath) {
+    return null;
+  }
+
+  if (dependencies.resolveRegisteredProjectPath) {
+    const registered = await dependencies.resolveRegisteredProjectPath(requestedPath);
+    if (!registered || typeof registered !== 'string' || !registered.trim()) {
+      throw new AppError('Project path is not registered for this deployment.', {
+        code: 'PROJECT_PATH_NOT_REGISTERED',
+        statusCode: 403,
+      });
+    }
+    return canonicalizeExistingPath(path.resolve(registered));
+  }
+
+  return canonicalizeExistingPath(path.resolve(requestedPath));
+};
+
+/** Returns an absolute path after resolving symlinks when the injected fs supports realpath. */
+const canonicalizeExistingPath = async (candidatePath) => {
+  const absolutePath = path.resolve(candidatePath);
+  if (typeof fs.realpath !== 'function') {
+    return absolutePath;
+  }
+
+  try {
+    return await fs.realpath(absolutePath);
+  } catch (error) {
+    // Let the normal read/access operation produce its 404/empty result for a
+    // path that does not exist yet. Existing paths are always canonicalized so
+    // symlinks cannot escape the authorized command roots.
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+      return absolutePath;
+    }
+    throw new AppError('Unable to resolve command path.', {
+      code: 'COMMAND_PATH_RESOLUTION_FAILED',
+      statusCode: 403,
+    });
+  }
+};
+
+const isPathInside = (basePath, candidatePath) => {
+  const base = path.resolve(basePath);
+  const candidate = path.resolve(candidatePath);
+  const relative = path.relative(base, candidate);
+  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+};
+
+/**
+ * Resolve a `.claude/commands` directory only when it remains below the
+ * authorized project/home root.  Resolving the commands directory itself is
+ * not enough: a repository can contain a symlink such as
+ * `.claude/commands -> /some/other/checkout`, and treating that resolved path
+ * as a fresh trust root would turn command discovery/execution into an
+ * arbitrary filesystem read.  Missing directories are returned in lexical
+ * form so the normal `access` check can keep treating them as empty.
+ */
+const resolveAuthorizedCommandsDirectory = async (authorizedRoot) => {
+  const canonicalRoot = await canonicalizeExistingPath(authorizedRoot);
+  const commandsPath = path.join(authorizedRoot, '.claude', 'commands');
+  const canonicalCommandsPath = await canonicalizeExistingPath(commandsPath);
+  return isPathInside(canonicalRoot, canonicalCommandsPath)
+    ? canonicalCommandsPath
+    : null;
+};
+
+/**
+ * Verifies a custom command file is a direct descendant of an authorized
+ * user/project `.claude/commands` directory, including symlink-aware checks.
+ */
+const resolveAuthorizedCommandPath = async (commandPath, projectPath) => {
+  if (typeof commandPath !== 'string' || !commandPath.trim()) {
+    return null;
+  }
+
+  const resolvedPath = await canonicalizeExistingPath(commandPath);
+  const userBase = await resolveAuthorizedCommandsDirectory(os.homedir());
+  if (userBase && isPathInside(userBase, resolvedPath)) {
+    return resolvedPath;
+  }
+
+  if (!projectPath) {
+    return null;
+  }
+  const projectBase = await resolveAuthorizedCommandsDirectory(projectPath);
+  return projectBase && isPathInside(projectBase, resolvedPath) ? resolvedPath : null;
+};
+
+const sendCommandError = (response, error, fallbackMessage) => {
+  if (error instanceof AppError) {
+    response.status(error.statusCode).json({
+      error: error.message,
+      message: error.message,
+      code: error.code,
+    });
+    return;
+  }
+  const message = error instanceof Error ? error.message : fallbackMessage;
+  response.status(500).json({ error: fallbackMessage, message });
+};
+
+/**
+ * Removes server-local paths and arbitrary front-matter from command records
+ * returned to a product/QA caller.  Read-only users may discover the command
+ * names available in a registered project, but an absolute path (or custom
+ * metadata copied from a command file) is not part of that read contract and
+ * can disclose the service account's filesystem layout.
+ */
+const sanitizeReadOnlyCommand = (command) => ({
+  name: command.name,
+  relativePath: command.relativePath,
+  description: command.description,
+  namespace: command.namespace,
+});
+
+/**
+ * Slash-command execution can invoke command content containing shell/MCP
+ * instructions. It is therefore an interactive-terminal capability, even
+ * though the current handler primarily prepares command text. Keep command
+ * listing available to product/QA users, but fail closed for execution in the
+ * product-qa-readonly profile.
+ */
+const requireInteractiveTerminal = (req, _res, next) => {
+  const policy = resolveDeploymentPolicy(req);
+  const allowed = policy.profile !== "product-qa-readonly"
+    && ["terminal.interactive", "terminal-interactive", "shell-exec", "local-shell"]
+      .some((capability) => hasDeploymentCapability(policy, capability));
+  if (!allowed) {
+    next(new AppError("Command execution is disabled for this deployment.", {
+      code: "DEPLOYMENT_CAPABILITY_DENIED",
+      statusCode: 403,
+      details: {
+        profile: policy.profile,
+        capabilities: ["terminal.interactive"],
+      },
+    }));
+    return;
+  }
+  next();
+};
 
 const MODEL_PROVIDERS = ["claude", "cursor", "codex", "opencode"];
 
@@ -101,17 +308,35 @@ const executeModelsCommand = async (args, context, modelsService) => {
  * @param {string} namespace - Namespace for commands (e.g., 'project', 'user')
  * @returns {Promise<Array>} Array of command objects
  */
-async function scanCommandsDirectory(dir, baseDir, namespace) {
+async function scanCommandsDirectory(dir, baseDir, namespace, authorizedRoot = baseDir) {
   const commands = [];
 
   try {
     // Check if directory exists
     await fs.access(dir);
 
-    const entries = await fs.readdir(dir, { withFileTypes: true });
+    // Re-resolve each directory immediately before reading it.  A command
+    // tree is project-controlled data, so a symlink swap between the caller's
+    // root check and this scan must fail closed rather than expose a file from
+    // outside the authorized project/home root.
+    const canonicalRoot = await canonicalizeExistingPath(authorizedRoot);
+    const canonicalBaseDir = await canonicalizeExistingPath(baseDir);
+    const canonicalDir = await canonicalizeExistingPath(dir);
+    const sameDirectory = path.resolve(canonicalRoot) === path.resolve(canonicalDir);
+    const sameCommandTree = path.resolve(canonicalBaseDir) === path.resolve(canonicalDir);
+    if ((!sameDirectory && !isPathInside(canonicalRoot, canonicalDir))
+      || (!sameCommandTree && !isPathInside(canonicalBaseDir, canonicalDir))) {
+      console.warn(`Skipping command directory outside authorized root: ${dir}`);
+      return commands;
+    }
+
+    // Read the canonical directory rather than the original (possibly
+    // symlinked) spelling. This narrows the check/use window and makes nested
+    // entries relative to the same trusted tree.
+    const entries = await fs.readdir(canonicalDir, { withFileTypes: true });
 
     for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
+      const fullPath = path.join(canonicalDir, entry.name);
 
       if (entry.isDirectory()) {
         // Recursively scan subdirectories
@@ -119,17 +344,25 @@ async function scanCommandsDirectory(dir, baseDir, namespace) {
           fullPath,
           baseDir,
           namespace,
+          canonicalRoot,
         );
         commands.push(...subCommands);
       } else if (entry.isFile() && entry.name.endsWith(".md")) {
         // Parse markdown file for metadata
         try {
-          const content = await fs.readFile(fullPath, "utf8");
+          // Dirent.isFile() is only a point-in-time observation. Canonicalize
+          // again before opening so a swapped symlink cannot escape the root.
+          const canonicalFilePath = await canonicalizeExistingPath(fullPath);
+          if (!isPathInside(canonicalBaseDir, canonicalFilePath)) {
+            console.warn(`Skipping command file outside authorized root: ${fullPath}`);
+            continue;
+          }
+          const content = await fs.readFile(canonicalFilePath, "utf8");
           const { data: frontmatter, content: commandContent } =
             parseFrontMatter(content);
 
           // Calculate relative path from baseDir for command name
-          const relativePath = path.relative(baseDir, fullPath);
+          const relativePath = path.relative(baseDir, canonicalFilePath);
           // Remove .md extension and convert to command name
           const commandName =
             "/" + relativePath.replace(/\.md$/, "").replace(/\\/g, "/");
@@ -445,29 +678,66 @@ Custom commands can be created in:
  */
 router.post("/list", async (req, res) => {
   try {
-    const { projectPath } = req.body;
+    const policy = resolveDeploymentPolicy(req);
+    const readOnly = isDeploymentReadOnly(policy);
+    const requestBody = req.body && typeof req.body === 'object'
+      ? req.body as Record<string, unknown>
+      : {};
+    // In a shared read-only deployment an absolute path is safe only when the
+    // server can resolve it through its project registry.  A missing resolver
+    // is a composition error, not permission to fall back to arbitrary host
+    // paths (which would defeat the HOME/filesystem isolation boundary).
+    if (readOnly
+      && readProjectPath(requestBody)
+      && !dependencies.resolveRegisteredProjectPath
+      && !dependencies.resolveProjectPathById) {
+      throw new AppError('Project path is not registered for this deployment.', {
+        code: 'PROJECT_PATH_NOT_REGISTERED',
+        statusCode: 403,
+      });
+    }
+    const projectPath = await resolveAuthorizedProjectPath(req.body);
     const allCommands = [...builtInCommands];
 
     // Scan project-level commands (.claude/commands/)
     if (projectPath) {
-      const projectCommandsDir = path.join(projectPath, ".claude", "commands");
-      const projectCommands = await scanCommandsDirectory(
-        projectCommandsDir,
-        projectCommandsDir,
-        "project",
-      );
-      allCommands.push(...projectCommands);
+      const projectCommandsDir = await resolveAuthorizedCommandsDirectory(projectPath);
+      if (projectCommandsDir) {
+        const projectCommands = await scanCommandsDirectory(
+          projectCommandsDir,
+          projectCommandsDir,
+          "project",
+          projectPath,
+        );
+        allCommands.push(...projectCommands);
+      } else {
+        // A symlinked `.claude/commands` root that resolves outside the
+        // registered project is untrusted. Do not enumerate it, even if the
+        // service account can read the target.
+        console.warn(`Skipping project command directory outside authorized root: ${projectPath}`);
+      }
     }
 
-    // Scan user-level commands (~/.claude/commands/)
-    const homeDir = os.homedir();
-    const userCommandsDir = path.join(homeDir, ".claude", "commands");
-    const userCommands = await scanCommandsDirectory(
-      userCommandsDir,
-      userCommandsDir,
-      "user",
-    );
-    allCommands.push(...userCommands);
+    // A read-only deployment is a shared service-account process.  Scanning
+    // ~/.claude/commands would enumerate an unrelated operator's home (and
+    // expose absolute paths/front-matter), so only commands below the
+    // server-registered project are discoverable there. Local developer
+    // profiles retain the historical user-command behavior.
+    if (!readOnly) {
+      const homeDir = os.homedir();
+      const userCommandsDir = await resolveAuthorizedCommandsDirectory(homeDir);
+      if (userCommandsDir) {
+        const userCommands = await scanCommandsDirectory(
+          userCommandsDir,
+          userCommandsDir,
+          "user",
+          homeDir,
+        );
+        allCommands.push(...userCommands);
+      } else {
+        console.warn(`Skipping user command directory outside authorized home: ${homeDir}`);
+      }
+    }
 
     // Separate built-in and custom commands
     const customCommands = allCommands.filter(
@@ -479,15 +749,17 @@ router.post("/list", async (req, res) => {
 
     res.json({
       builtIn: builtInCommands,
-      custom: customCommands,
+      // Never return absolute command paths or untrusted front-matter to a
+      // read-only shared deployment.  Writable local callers need `path` to
+      // execute custom commands and therefore receive the legacy records.
+      custom: readOnly
+        ? customCommands.map(sanitizeReadOnlyCommand)
+        : customCommands,
       count: allCommands.length,
     });
   } catch (error) {
     console.error("Error listing commands:", error);
-    res.status(500).json({
-      error: "Failed to list commands",
-      message: error.message,
-    });
+    sendCommandError(res, error, "Failed to list commands");
   }
 });
 
@@ -497,9 +769,16 @@ router.post("/list", async (req, res) => {
  * This endpoint prepares the command content but doesn't execute bash commands yet
  * (that will be handled in the command parser utility)
  */
-router.post("/execute", async (req, res) => {
+router.post("/execute", requireInteractiveTerminal, async (req, res) => {
   try {
     const { commandName, commandPath, args = [], context = {} } = req.body;
+    const authorizedProjectPath = await resolveAuthorizedProjectPath(context);
+    // Project paths in the browser context are hints only.  Built-in handlers
+    // (notably `/memory`) must receive the registry-resolved path as well, or
+    // an attacker could bypass the custom-command check with a built-in.
+    const authorizedContext = authorizedProjectPath
+      ? { ...context, projectPath: authorizedProjectPath }
+      : context;
 
     if (!commandName) {
       return res.status(400).json({
@@ -511,7 +790,7 @@ router.post("/execute", async (req, res) => {
     const handler = builtInHandlers[commandName];
     if (handler) {
       try {
-        const result = await handler(args, context);
+        const result = await handler(args, authorizedContext);
         return res.json({
           ...result,
           command: commandName,
@@ -538,26 +817,20 @@ router.post("/execute", async (req, res) => {
 
     // Load command content
     // Security: validate commandPath is within allowed directories
+    let authorizedCommandPath = commandPath;
     {
-      const resolvedPath = path.resolve(commandPath);
-      const userBase = path.resolve(
-        path.join(os.homedir(), ".claude", "commands"),
-      );
-      const projectBase = context?.projectPath
-        ? path.resolve(path.join(context.projectPath, ".claude", "commands"))
-        : null;
-      const isUnder = (base) => {
-        const rel = path.relative(base, resolvedPath);
-        return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
-      };
-      if (!(isUnder(userBase) || (projectBase && isUnder(projectBase)))) {
+      const canonicalCommandPath = await resolveAuthorizedCommandPath(commandPath, authorizedProjectPath);
+      if (!canonicalCommandPath) {
         return res.status(403).json({
           error: "Access denied",
           message: "Command must be in .claude/commands directory",
         });
       }
+      // Use the canonical path returned by the containment check to avoid a
+      // check/use gap through a swapped symlink.
+      authorizedCommandPath = canonicalCommandPath;
     }
-    const content = await fs.readFile(commandPath, "utf8");
+    const content = await fs.readFile(authorizedCommandPath, "utf8");
     const { data: metadata, content: commandContent } =
       parseFrontMatter(content);
     // Basic argument replacement (will be enhanced in command parser utility)
@@ -593,10 +866,7 @@ router.post("/execute", async (req, res) => {
     }
 
     console.error("Error executing command:", error);
-    res.status(500).json({
-      error: "Failed to execute command",
-      message: error.message,
-    });
+    sendCommandError(res, error, "Failed to execute command");
   }
 });
 

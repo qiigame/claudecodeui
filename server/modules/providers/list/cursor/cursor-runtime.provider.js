@@ -6,7 +6,12 @@ import {
   normalizeAttachmentDescriptors
 } from '@/shared/image-attachments.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
-import { createCompleteMessage, createNormalizedMessage, flattenPromptForWindowsShell } from '@/shared/utils.js';
+import {
+  createCompleteMessage,
+  createNormalizedMessage,
+  filterProviderEnvironmentForReadOnly,
+  flattenPromptForWindowsShell,
+} from '@/shared/utils.js';
 
 // cross-spawn resolves .cmd shims/PATHEXT on Windows and delegates to
 // child_process.spawn everywhere else.
@@ -30,6 +35,18 @@ function isWorkspaceTrustPrompt(text = '') {
 }
 
 async function spawnCursor(command, options = {}, ws, context) {
+  // Cursor CLI has no server-enforced read-only tool/sandbox contract.  The
+  // Chat gateway rejects it for product/QA deployments, but this runtime is
+  // also reachable from legacy/internal callers; fail closed here before any
+  // session lookup or child process can be created.
+  if (options?.deploymentReadOnly === true) {
+    const error = new Error(
+      'Provider "cursor" does not expose a safe read-only runtime in this deployment.',
+    );
+    error.code = 'PROVIDER_READ_ONLY_UNSUPPORTED';
+    throw error;
+  }
+
   // Callers pass the stable app session id; the CLI resumes with the
   // provider-native id recorded on the session row. Both lookups run before the
   // promise is created: inside an async executor a rejected `resolveResumeModel`
@@ -72,6 +89,11 @@ async function spawnCursor(command, options = {}, ws, context) {
       baseArgs.push('--resume=' + providerSessionId);
     }
 
+    // Resolve the effective project directory before serializing attachment
+    // paths.  The prompt formatter performs a second trust-boundary check for
+    // legacy/internal callers that bypass the websocket gateway.
+    const workingDir = cwd || projectPath || process.cwd();
+
     const hasAttachments =
       normalizeAttachmentDescriptors(images).length > 0
       || normalizeAttachmentDescriptors(files).length > 0;
@@ -82,8 +104,9 @@ async function spawnCursor(command, options = {}, ws, context) {
       // cursor-agent is a .cmd shim on Windows, so the whole argument must be
       // newline-free or cmd.exe silently truncates it at the first newline.
       const promptWithAttachments = appendFilesInputTag(
-        appendImagesInputTag(command || '', images),
-        files
+        appendImagesInputTag(command || '', images, workingDir),
+        files,
+        workingDir,
       );
       baseArgs.push('-p', flattenPromptForWindowsShell(promptWithAttachments));
 
@@ -101,9 +124,6 @@ async function spawnCursor(command, options = {}, ws, context) {
     if (skipPermissions || settings.skipPermissions) {
       baseArgs.push('-f');
     }
-
-    // Use cwd (actual project directory) instead of projectPath
-    const workingDir = cwd || projectPath || process.cwd();
 
     // Store process reference for potential abort — keyed by the app session
     // id when the caller supplied one, so abort-by-app-id always works.
@@ -156,10 +176,18 @@ async function spawnCursor(command, options = {}, ws, context) {
         console.log('Retrying Cursor CLI with --trust after workspace trust prompt');
       }
 
+      const cursorEnvironment = {
+        ...process.env,
+        ...(options.executionEnvironment && typeof options.executionEnvironment === 'object'
+          ? options.executionEnvironment
+          : {}),
+      };
       const cursorProcess = spawnFunction('cursor-agent', args, {
         cwd: workingDir,
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env } // Inherit all environment variables
+        env: options.deploymentReadOnly === true
+          ? filterProviderEnvironmentForReadOnly(cursorEnvironment)
+          : cursorEnvironment,
       });
 
       activeCursorProcesses.set(processKey, cursorProcess);

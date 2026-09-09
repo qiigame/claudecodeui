@@ -9,6 +9,7 @@ import { api } from '@/shared/api';
 import { useSessionForkingProviders } from '@/shared/hooks/useProviderCapabilities';
 import { createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
+import SessionActorBadge from '@/modules/sidebar/SessionActorBadge';
 
 type SidebarSessionItemProps = {
   project: Project;
@@ -29,6 +30,10 @@ type SidebarSessionItemProps = {
   onDeleteSession: (sessionId: string, sessionTitle: string) => void;
   /** Branches this session into an independent one; absent when its provider cannot. */
   onForkSession?: (session: SessionWithProvider) => void;
+  /** Server-authorized session metadata capability for rename/archive/fork actions. */
+  canWriteSessions?: boolean;
+  /** Server-authorized filesystem capability required for transcript forks. */
+  canWriteSessionFiles?: boolean;
   t: TFunction;
 };
 
@@ -58,6 +63,8 @@ function SidebarSessionItem({
   onSessionSelect,
   onDeleteSession,
   onForkSession,
+  canWriteSessions = false,
+  canWriteSessionFiles = false,
   t,
 }: SidebarSessionItemProps) {
   const isCompact = useCompactSidebar();
@@ -72,12 +79,13 @@ function SidebarSessionItem({
   const showAttentionIndicator = needsAttention && !isSelected;
   const showRecentIndicator = !showAttentionIndicator && !isProcessing && sessionView.isActive;
   const providerLabel = PROVIDER_LABELS[session.__provider];
+  const sessionIsEditing = isEditing && canWriteSessions;
 
   // While editing, dismiss only when the user clicks outside the inline rename panel
   // (matches Escape / cancel-button behaviour). The mobile rename lives inside the
   // bottom sheet, which owns its own dismissal, so the listener stays off there.
   useEffect(() => {
-    if (!isEditing || isMobileOptionsOpen) {
+    if (!sessionIsEditing || isMobileOptionsOpen) {
       return;
     }
 
@@ -90,7 +98,7 @@ function SidebarSessionItem({
 
     document.addEventListener('mousedown', handlePointerDown);
     return () => document.removeEventListener('mousedown', handlePointerDown);
-  }, [isEditing, isMobileOptionsOpen, onCancelEditingSession]);
+  }, [isMobileOptionsOpen, onCancelEditingSession, sessionIsEditing]);
 
   // Sessions are owned by a project identified by `projectId` (DB primary key)
   // after the projectName → projectId migration.
@@ -100,6 +108,9 @@ function SidebarSessionItem({
   };
 
   const saveEditedSession = () => {
+    if (!canWriteSessions) {
+      return;
+    }
     onSaveEditingSession(project.projectId, session.id, renameDraft, session.__provider);
   };
 
@@ -110,7 +121,17 @@ function SidebarSessionItem({
   const canForkThisSession = forkableProviders.has(session.__provider);
 
   const requestDeleteSession = () => {
+    if (!canWriteSessions) {
+      return;
+    }
     onDeleteSession(session.id, sessionView.sessionName);
+  };
+
+  const requestForkSession = () => {
+    if (!canWriteSessionFiles || !onForkSession) {
+      return;
+    }
+    onForkSession(session);
   };
 
   const loadProviderSessionId = async () => {
@@ -152,7 +173,7 @@ function SidebarSessionItem({
   const setMobileOptionsOpen = (open: boolean) => {
     setIsMobileOptionsOpen(open);
     setOptionsOpen(open);
-    if (!open && isEditing) {
+    if (!open && sessionIsEditing) {
       onCancelEditingSession();
     }
   };
@@ -266,6 +287,7 @@ function SidebarSessionItem({
                 )}
               </div>
               <div className="mt-0.5 flex items-center">
+                <SessionActorBadge attribution={session.attribution} />
                 {sessionView.messageCount > 0 && (
                   <Badge variant="secondary" className="px-1 py-0 text-xs">
                     {sessionView.messageCount}
@@ -313,7 +335,7 @@ function SidebarSessionItem({
               </div>
             </div>
 
-            {isEditing ? (
+            {sessionIsEditing ? (
               <div className="mb-3 space-y-2">
                 <label htmlFor={`mobile-session-rename-${session.id}`} className="block px-1 text-xs font-medium text-muted-foreground">
                   Session name
@@ -356,14 +378,14 @@ function SidebarSessionItem({
               </div>
             ) : (
               <div className="space-y-2">
-                <button
+                {canWriteSessions && <button
                   type="button"
                   onClick={startMobileRename}
                   className="flex min-h-12 w-full items-center gap-3 rounded-xl border border-border bg-muted/35 px-4 py-3 text-left text-foreground transition-colors active:bg-muted"
                 >
                   <Edit2 className="h-5 w-5 flex-shrink-0" />
                   <span className="text-sm font-medium">Rename session</span>
-                </button>
+                </button>}
 
                 <button
                   type="button"
@@ -391,7 +413,7 @@ function SidebarSessionItem({
                   </span>
                 </button>
 
-                {!isProcessing && (
+                {canWriteSessions && !isProcessing && (
                   <button
                     type="button"
                     onClick={() => {
@@ -407,7 +429,7 @@ function SidebarSessionItem({
               </div>
             )}
 
-            {!isEditing && (
+            {!sessionIsEditing && (
               <button
                 type="button"
                 onClick={() => setMobileOptionsOpen(false)}
@@ -485,6 +507,7 @@ function SidebarSessionItem({
                 )}
               </div>
               <div className="mt-0.5 flex items-center">
+                <SessionActorBadge attribution={session.attribution} />
                 {sessionView.messageCount > 0 && <Badge variant="secondary" className="px-1 py-0 text-xs">{sessionView.messageCount}</Badge>}
               </div>
             </div>
@@ -495,7 +518,7 @@ function SidebarSessionItem({
           ref={editingContainerRef}
           className="absolute right-2 top-1/2 flex -translate-y-1/2 transform items-center gap-1 opacity-100 transition-all duration-200"
         >
-            {isEditing ? (
+            {sessionIsEditing ? (
               <>
                 <input
                   type="text"
@@ -555,12 +578,12 @@ function SidebarSessionItem({
                   </div>
                 )}
                 items={[
-                  {
+                  ...(canWriteSessions ? [{
                     key: 'rename',
                     label: 'Rename session',
                     icon: Edit2,
                     onSelect: () => onStartEditingSession(project.projectId, session.id, sessionView.sessionName),
-                  },
+                  }] : []),
                   {
                     key: 'copy',
                     label: copyLabel,
@@ -570,14 +593,14 @@ function SidebarSessionItem({
                     closeOnSelect: false,
                     onSelect: handleCopyAction,
                   },
-                  ...(onForkSession && canForkThisSession && !isProcessing ? [{
+                  ...(canWriteSessionFiles && onForkSession && canForkThisSession && !isProcessing ? [{
                     key: 'fork',
                     label: 'Fork session',
                     description: 'Continue from a copy, leaving this one untouched.',
                     icon: GitBranch,
-                    onSelect: () => onForkSession(session),
+                    onSelect: requestForkSession,
                   }] : []),
-                  ...(!isProcessing ? [{
+                  ...(canWriteSessions && !isProcessing ? [{
                     key: 'delete',
                     label: 'Archive or delete session',
                     icon: Trash2,

@@ -55,7 +55,10 @@ function createFakeFileSystem(
     openDirectory: () => ({
       [Symbol.asyncIterator]: () => ({ next: unexpectedOperation }),
     }),
-    realpath: unexpectedOperation,
+    // Read operations canonicalize the project root and target.  The default
+    // fake models an ordinary non-symlinked filesystem; individual tests
+    // override it when they need to exercise a link escape.
+    realpath: async (candidatePath) => candidatePath,
     readTextFile: unexpectedOperation,
     writeTextFile: unexpectedOperation,
     makeDirectory: unexpectedOperation,
@@ -323,6 +326,118 @@ test('listProjectFiles shares the entry limit across nested directories', async 
   );
 });
 
+test('listProjectFiles lazy root listing does not traverse large child repositories', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const firstRepository = path.join(projectRoot, 'first-repository');
+  const secondRepository = path.join(projectRoot, 'second-repository');
+  const readDirectories: string[] = [];
+  const fileSystem = createFakeFileSystem({
+    access: async () => undefined,
+    realpath: async (candidatePath) => candidatePath,
+    stat: async (candidatePath) => createStats(candidatePath === projectRoot, 0o755),
+    openDirectory: createDirectoryReader((directoryPath) => {
+      readDirectories.push(directoryPath);
+      if (directoryPath === projectRoot) {
+        return [
+          createDirectoryEntry('first-repository', true),
+          createDirectoryEntry('second-repository', true),
+          createDirectoryEntry('README.md', false),
+        ];
+      }
+      if (directoryPath === firstRepository || directoryPath === secondRepository) {
+        return Array.from(
+          { length: 6_000 },
+          (_, index) => createDirectoryEntry(`file-${index}.txt`, false),
+        );
+      }
+      return [];
+    }),
+    lstat: async (candidatePath) => createStats(
+      candidatePath === firstRepository || candidatePath === secondRepository,
+      0o755,
+    ),
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  const tree = await service.listProjectFiles('project-1', {
+    respectGitignore: false,
+    directoryPath: '.',
+  });
+
+  assert.deepEqual(tree.map((entry) => entry.name), [
+    'first-repository',
+    'second-repository',
+    'README.md',
+  ]);
+  assert.deepEqual(readDirectories, [projectRoot]);
+  assert.equal(tree[0]?.children, undefined);
+});
+
+test('listProjectFiles lazy directory listing returns only immediate children', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const sourceDirectory = path.join(projectRoot, 'src');
+  const nestedDirectory = path.join(sourceDirectory, 'nested');
+  const readDirectories: string[] = [];
+  const fileSystem = createFakeFileSystem({
+    access: async () => undefined,
+    realpath: async (candidatePath) => candidatePath,
+    stat: async (candidatePath) => createStats(candidatePath === sourceDirectory, 0o755),
+    openDirectory: createDirectoryReader((directoryPath) => {
+      readDirectories.push(directoryPath);
+      if (directoryPath === sourceDirectory) {
+        return [
+          createDirectoryEntry('nested', true),
+          createDirectoryEntry('index.ts', false),
+        ];
+      }
+      if (directoryPath === nestedDirectory) {
+        return [createDirectoryEntry('deep.ts', false)];
+      }
+      return [];
+    }),
+    lstat: async (candidatePath) => createStats(candidatePath === nestedDirectory, 0o755),
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  const tree = await service.listProjectFiles('project-1', {
+    respectGitignore: false,
+    directoryPath: sourceDirectory,
+  });
+
+  assert.deepEqual(tree.map((entry) => entry.name), ['nested', 'index.ts']);
+  assert.deepEqual(readDirectories, [sourceDirectory]);
+  assert.equal(tree[0]?.children, undefined);
+});
+
+test('listProjectFiles rejects a lazy directory symlink that escapes the canonical project root', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const linkedDirectory = path.join(projectRoot, 'external-link');
+  const outsideDirectory = path.resolve('outside-project');
+  let openedDirectory = false;
+  const fileSystem = createFakeFileSystem({
+    access: async () => undefined,
+    realpath: async (candidatePath) => candidatePath === linkedDirectory
+      ? outsideDirectory
+      : candidatePath,
+    openDirectory: async function* () {
+      openedDirectory = true;
+      yield createDirectoryEntry('must-not-open', false);
+    },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  await assert.rejects(
+    service.listProjectFiles('project-1', {
+      respectGitignore: false,
+      directoryPath: linkedDirectory,
+    }),
+    (error: unknown) => error instanceof AppError
+      && error.code === 'PATH_OUTSIDE_PROJECT'
+      && error.statusCode === 403,
+  );
+  assert.equal(openedDirectory, false);
+});
+
 test('readTextFile rejects traversal before invoking the filesystem adapter', async () => {
   const projectRoot = path.resolve('file-tree-test-project');
   const readPaths: string[] = [];
@@ -341,6 +456,79 @@ test('readTextFile rejects traversal before invoking the filesystem adapter', as
       && error.statusCode === 403,
   );
   assert.deepEqual(readPaths, []);
+});
+
+test('readTextFile rejects a symlink target outside the canonical project root', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const linkedFile = path.join(projectRoot, 'secrets.txt');
+  const outsideFile = path.resolve('outside-project', 'secrets.txt');
+  const readPaths: string[] = [];
+  const fileSystem = createFakeFileSystem({
+    realpath: async (candidatePath) => candidatePath === linkedFile
+      ? outsideFile
+      : candidatePath,
+    readTextFile: async (filePath) => {
+      readPaths.push(filePath);
+      return 'must not be read';
+    },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  await assert.rejects(
+    service.readTextFile('project-1', 'secrets.txt'),
+    (error: unknown) => error instanceof AppError
+      && error.code === 'PATH_OUTSIDE_PROJECT'
+      && error.statusCode === 403,
+  );
+  assert.deepEqual(readPaths, []);
+});
+
+test('openFile canonicalizes the stream path and rejects an escaping symlink before opening it', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const linkedFile = path.join(projectRoot, 'image.png');
+  const outsideFile = path.resolve('outside-project', 'image.png');
+  const openedPaths: string[] = [];
+  const fileSystem = createFakeFileSystem({
+    realpath: async (candidatePath) => candidatePath === linkedFile
+      ? outsideFile
+      : candidatePath,
+    createReadStream: (filePath) => {
+      openedPaths.push(filePath);
+      return Readable.from(['must not be opened']);
+    },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  await assert.rejects(
+    service.openFile('project-1', 'image.png'),
+    (error: unknown) => error instanceof AppError
+      && error.code === 'PATH_OUTSIDE_PROJECT'
+      && error.statusCode === 403,
+  );
+  assert.deepEqual(openedPaths, []);
+});
+
+test('readTextFile reads the canonical target path after validation', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const requestedFile = path.join(projectRoot, 'notes.txt');
+  const canonicalFile = path.join(projectRoot, 'real-notes.txt');
+  const readPaths: string[] = [];
+  const fileSystem = createFakeFileSystem({
+    realpath: async (candidatePath) => candidatePath === requestedFile
+      ? canonicalFile
+      : candidatePath,
+    readTextFile: async (filePath) => {
+      readPaths.push(filePath);
+      return 'canonical content';
+    },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  const result = await service.readTextFile('project-1', 'notes.txt');
+
+  assert.equal(result.content, 'canonical content');
+  assert.equal(result.path, canonicalFile);
+  assert.deepEqual(readPaths, [canonicalFile]);
 });
 
 test('createEntry performs filesystem mutation only through the injected adapter', async () => {

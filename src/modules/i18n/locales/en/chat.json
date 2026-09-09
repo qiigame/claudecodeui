@@ -108,6 +108,10 @@
     "placeholder": "Type / for commands, @ for files, or ask {{provider}} anything...",
     "placeholderDefault": "Type your message...",
     "disabled": "Input disabled",
+    "abortUnavailable": "Stopping this run is unavailable for your account.",
+    "sendUnavailable": "Sending is unavailable in this deployment.",
+    "providerReadOnlyUnsupported": "{{provider}} sessions cannot be continued in this read-only deployment. Choose a Claude or Codex session.",
+    "identityEnrollmentRequired": "Chat is read-only until your DingTalk project identity is verified. Contact the administrator to request access.",
     "attachFiles": "Attach files",
     "attachImages": "Attach images",
     "send": "Send",
@@ -147,7 +151,16 @@
   "providerSelection": {
     "title": "Choose Your AI Assistant",
     "description": "Select a provider to start a new conversation",
+    "unavailableTitle": "Chat is currently unavailable",
+    "readOnlyTitle": "This conversation is read-only",
     "selectModel": "Select Model",
+    "runtimeOnly": {
+      "dialogTitle": "Runtime Selector",
+      "choose": "Choose a Runtime",
+      "description": "The server manages each Runtime's model configuration.",
+      "clickToChange": "Click to change Runtime",
+      "ready": "{{runtime}} Runtime is ready. Start typing below."
+    },
     "providerInfo": {
       "anthropic": "by Anthropic",
       "openai": "by OpenAI",
@@ -265,7 +278,35 @@
     "json": {
       "label": "JSON (.json)",
       "description": "Every message, unformatted, for tooling."
+    },
+    "share": {
+      "label": "Create read-only share link",
+      "description": "Creates a public 7-day snapshot that anyone with the link can view.",
+      "confirm": "This creates a public read-only snapshot. Anyone with the link can read its conversation text. Thinking, raw tools, and attachments are excluded. Continue?",
+      "copied": "Share link copied",
+      "copiedDescription": "Anyone with the link can view this fixed, read-only snapshot.",
+      "copyFailed": "Link created, copy failed",
+      "copyFailedDescription": "Check clipboard permission and select this action again to retry.",
+      "failed": "Could not create share link",
+      "failedDescription": "Select this action to retry.",
+      "checking": "Checking share link",
+      "checkingDescription": "Looking for an active link created by you for this conversation.",
+      "statusFailed": "Could not check share link",
+      "statusFailedDescription": "Select this action to retry the status check.",
+      "revoke": "Revoke active share link",
+      "revokeDescription": "Immediately disables your current public link for this conversation.",
+      "revokeFailed": "Could not revoke share link",
+      "revokeFailedDescription": "The link may still be public. Select this action to retry.",
+      "revoked": "Share link revoked",
+      "revokedDescription": "The old link no longer works. Select this action to create a new one."
     }
+  },
+  "sessionWorkspace": {
+    "title": "Choose repositories for this session",
+    "description": "CloudCLI creates isolated worktrees from the latest remote bases. Uncommitted changes stay out of other sessions.",
+    "readOnly": "Read only",
+    "cancel": "Cancel",
+    "create": "Create isolated session"
   },
   "schedule": {
     "trigger": "Schedule this message",

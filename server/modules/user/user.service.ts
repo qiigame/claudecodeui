@@ -1,4 +1,4 @@
-import { AppError } from '@/shared/utils.js';
+import { AppError, isValidEmailAddress } from '@/shared/utils.js';
 
 type GitConfig = {
   git_name: string | null;
@@ -29,10 +29,6 @@ type UserDependencies = {
     saveDraft(userId: number, scope: string, draft: { text: string; queuedMessage: unknown | null }): void;
     deleteDraft(userId: number, scope: string): void;
   };
-  readSystemGitConfig(): Promise<GitConfig>;
-  applyGlobalGitConfig(gitName: string, gitEmail: string): Promise<void>;
-  logInfo(message: string): void;
-  logError(message: string, error: unknown): void;
 };
 
 /**
@@ -83,19 +79,7 @@ const readPreferenceUpdates = (body: unknown): Record<string, unknown> => {
 export function createUserService(dependencies: UserDependencies) {
   return {
     async getGitConfig(userId: number) {
-      let gitConfig = dependencies.users.getGitConfig(userId);
-      if (!gitConfig || (!gitConfig.git_name && !gitConfig.git_email)) {
-        const systemConfig = await dependencies.readSystemGitConfig();
-        if (systemConfig.git_name || systemConfig.git_email) {
-          dependencies.users.updateGitConfig(
-            userId,
-            systemConfig.git_name,
-            systemConfig.git_email,
-          );
-          gitConfig = systemConfig;
-          dependencies.logInfo(`Auto-populated Git config for user ${userId}`);
-        }
-      }
+      const gitConfig = dependencies.users.getGitConfig(userId);
 
       return {
         success: true,
@@ -113,7 +97,7 @@ export function createUserService(dependencies: UserDependencies) {
           statusCode: 400,
         });
       }
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(gitEmail)) {
+      if (!isValidEmailAddress(gitEmail)) {
         throw new AppError('Invalid email format', {
           code: 'INVALID_GIT_EMAIL',
           statusCode: 400,
@@ -121,13 +105,6 @@ export function createUserService(dependencies: UserDependencies) {
       }
 
       dependencies.users.updateGitConfig(userId, gitName, gitEmail);
-      try {
-        await dependencies.applyGlobalGitConfig(gitName, gitEmail);
-      } catch (error) {
-        // Persisted user settings remain authoritative even if the host Git
-        // installation cannot be updated (matching the previous behavior).
-        dependencies.logError('Failed to apply global Git config', error);
-      }
       return { success: true, gitName, gitEmail };
     },
 

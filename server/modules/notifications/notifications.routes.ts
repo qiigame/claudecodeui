@@ -1,8 +1,32 @@
-import express from 'express';
+import express, { type RequestHandler } from 'express';
 
 import { notificationChannelEndpointsDb, notificationPreferencesDb } from '@/modules/database/index.js';
+import {
+  createDeploymentPolicyGuard,
+  parseDeploymentPolicy,
+  type DeploymentPolicy,
+} from '@/modules/deployment-policy/index.js';
 
-const router = express.Router();
+/**
+ * Options for the notification endpoint router.
+ *
+ * Notification endpoint registration changes per-user application state, so
+ * every write route requires `session.write`.  A production composition root
+ * can inject its already-captured guard; standalone/alternate mounts capture
+ * a trusted deployment policy when the router is created.
+ */
+export type NotificationRouterOptions = {
+  /** Startup policy, or a resolver evaluated once while constructing the router. */
+  deploymentPolicy?: DeploymentPolicy | (() => DeploymentPolicy);
+  /** Production composition-root guard; takes precedence over the fallback. */
+  capabilityGuard?: (operation: string) => RequestHandler;
+};
+
+function captureDeploymentPolicy(
+  policy: NotificationRouterOptions['deploymentPolicy'],
+): DeploymentPolicy {
+  return typeof policy === 'function' ? policy() : policy ?? parseDeploymentPolicy();
+}
 
 function readText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -39,7 +63,22 @@ function updateChannelPreference(userId: number, channel: string): unknown {
   });
 }
 
-router.get('/endpoints', (req, res) => {
+/** Builds the authenticated notification endpoint router. */
+export function createNotificationsRouter(
+  options: NotificationRouterOptions = {},
+): express.Router {
+  const router = express.Router();
+  // Capture this once so a standalone mount cannot change its authorization
+  // posture by mutating process.env after startup.  The injected production
+  // guard already closes over the same startup snapshot as the other routes.
+  const sessionWriteGuard = options.capabilityGuard
+    ? options.capabilityGuard('session.write')
+    : createDeploymentPolicyGuard({
+      policy: captureDeploymentPolicy(options.deploymentPolicy),
+      capability: 'session.write',
+    });
+
+  router.get('/endpoints', (req, res) => {
   try {
     const channel = readText(req.query.channel);
     if (!channel) {
@@ -55,9 +94,9 @@ router.get('/endpoints', (req, res) => {
     console.error('Error fetching notification endpoints:', error);
     return res.status(500).json({ error: 'Failed to fetch notification endpoints' });
   }
-});
+  });
 
-router.post('/endpoints/current', (req, res) => {
+  router.post('/endpoints/current', sessionWriteGuard, (req, res) => {
   try {
     const { channel, endpointId, label, metadata = {}, enabled = true } = req.body || {};
     const normalizedChannel = readText(channel);
@@ -82,9 +121,9 @@ router.post('/endpoints/current', (req, res) => {
     console.error('Error registering notification endpoint:', error);
     return res.status(500).json({ error: 'Failed to register notification endpoint' });
   }
-});
+  });
 
-router.patch('/endpoints/:channel/:endpointId', (req, res) => {
+  router.patch('/endpoints/:channel/:endpointId', sessionWriteGuard, (req, res) => {
   try {
     const { channel, endpointId } = req.params;
     const { enabled } = req.body || {};
@@ -105,9 +144,9 @@ router.patch('/endpoints/:channel/:endpointId', (req, res) => {
     console.error('Error updating notification endpoint:', error);
     return res.status(500).json({ error: 'Failed to update notification endpoint' });
   }
-});
+  });
 
-router.delete('/endpoints/:channel/:endpointId', (req, res) => {
+  router.delete('/endpoints/:channel/:endpointId', sessionWriteGuard, (req, res) => {
   try {
     const { channel, endpointId } = req.params;
     const userId = readUserId(req);
@@ -122,6 +161,15 @@ router.delete('/endpoints/:channel/:endpointId', (req, res) => {
     console.error('Error removing notification endpoint:', error);
     return res.status(500).json({ error: 'Failed to remove notification endpoint' });
   }
-});
+  });
+
+  return router;
+}
+
+// Singular alias mirrors the surrounding feature-module naming convention;
+// keep both names source-compatible for standalone embedders.
+export const createNotificationRouter = createNotificationsRouter;
+
+const router = createNotificationsRouter();
 
 export default router;

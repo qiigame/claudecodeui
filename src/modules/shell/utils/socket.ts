@@ -1,5 +1,4 @@
-import { IS_PLATFORM } from '@/shared/utils';
-import { getStoredAuthToken } from '@/shared/authToken';
+import { getStoredAuthToken, isLegacyPlatformAuth } from '@/shared/authToken';
 
 type ShellInitMessage = {
   type: 'init';
@@ -39,7 +38,9 @@ type ShellIncomingMessage =
 export function getShellWebSocketUrl(): string | null {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 
-  if (IS_PLATFORM) {
+  // A shell may omit the token only for the server-advertised legacy managed
+  // platform mode. Hosted/product builds otherwise remain token-bound.
+  if (isLegacyPlatformAuth()) {
     return `${protocol}//${window.location.host}/shell`;
   }
 

@@ -53,6 +53,7 @@ test('register hashes credentials and commits through injected dependencies', as
   const result = await service.register('alice', 'secret12');
 
   assert.equal(result.token, 'signed-token');
+  assert.deepEqual(result.user.permissions, { manageSettings: false });
   assert.deepEqual(operations, ['begin', 'hash:secret12', 'create:alice:hash', 'commit', 'login:1']);
 });
 
@@ -79,6 +80,43 @@ test('login rejects an invalid password without issuing a token', async () => {
   assert.equal(tokenIssued, false);
 });
 
+test('password login explicitly returns a non-admin settings capability', async () => {
+  const service = createAuthService(createDependencies({
+    users: {
+      hasUsers: () => true,
+      createUser: () => { throw new Error('unused'); },
+      getUserByUsername: () => ({ id: 1, username: 'alice', password_hash: 'hash' }),
+      updateLastLogin: () => undefined,
+    },
+    comparePassword: async () => true,
+  }));
+
+  const result = await service.login('alice', 'secret12');
+
+  assert.deepEqual(result.user, {
+    id: 1,
+    username: 'alice',
+    permissions: { manageSettings: false },
+  });
+});
+
+test('password login returns the injected local settings capability', async () => {
+  const service = createAuthService(createDependencies({
+    users: {
+      hasUsers: () => true,
+      createUser: () => { throw new Error('unused'); },
+      getUserByUsername: () => ({ id: 1, username: 'alice', password_hash: 'hash' }),
+      updateLastLogin: () => undefined,
+    },
+    comparePassword: async () => true,
+    getSettingsPermission: () => true,
+  }));
+
+  const result = await service.login('alice', 'secret12');
+
+  assert.equal(result.user.permissions?.manageSettings, true);
+});
+
 test('refreshSession issues a replacement token for the authenticated user', () => {
   let tokenUser: { id: number | bigint; username: string } | undefined;
   const service = createAuthService(createDependencies({
@@ -92,4 +130,66 @@ test('refreshSession issues a replacement token for the authenticated user', () 
 
   assert.deepEqual(result, { token: 'replacement-token' });
   assert.deepEqual(tokenUser, { id: 7, username: 'alice' });
+});
+
+test('DingTalk configuration suppresses first-run password setup', () => {
+  const service = createAuthService(createDependencies({
+    getDingTalkStatus: () => ({
+      enabled: true,
+      providers: [{ key: 'comic', name: '漫剧团队' }],
+    }),
+  }));
+
+  assert.deepEqual(service.getStatus(), {
+    needsSetup: false,
+    isAuthenticated: false,
+    dingTalk: {
+      enabled: true,
+      providers: [{ key: 'comic', name: '漫剧团队' }],
+    },
+  });
+});
+
+test('DingTalk configuration blocks anonymous password registration', async () => {
+  const service = createAuthService(createDependencies({
+    getDingTalkStatus: () => ({
+      enabled: true,
+      providers: [{ key: 'comic', name: 'Comic' }],
+    }),
+  }));
+
+  await assert.rejects(
+    service.register('attacker', 'secret12'),
+    (error: unknown) => (
+      error instanceof AppError
+      && error.code === 'AUTH_REGISTRATION_DISABLED'
+      && error.statusCode === 403
+    ),
+  );
+});
+
+test('password login never compares an OAuth-only password marker', async () => {
+  let compared = false;
+  const service = createAuthService(createDependencies({
+    users: {
+      hasUsers: () => true,
+      createUser: () => { throw new Error('unused'); },
+      getUserByUsername: () => ({
+        id: 1,
+        username: '张三',
+        password_hash: '!dingtalk-oauth:disabled',
+      }),
+      updateLastLogin: () => undefined,
+    },
+    comparePassword: async () => {
+      compared = true;
+      return true;
+    },
+  }));
+
+  await assert.rejects(
+    service.login('张三', 'anything'),
+    (error: unknown) => error instanceof AppError && error.code === 'AUTH_INVALID_CREDENTIALS',
+  );
+  assert.equal(compared, false);
 });

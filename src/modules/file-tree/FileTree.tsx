@@ -11,7 +11,7 @@ import { useFileTreeOperations } from '@/modules/file-tree/hooks/useFileTreeOper
 import { useFileTreeSearch } from '@/modules/file-tree/hooks/useFileTreeSearch';
 import { useFileTreeViewMode } from '@/modules/file-tree/hooks/useFileTreeViewMode';
 import { useFileTreeUpload } from '@/modules/file-tree/hooks/useFileTreeUpload';
-import type { FileTreeImageSelection, FileTreeNode,Project } from '@/shared/types';
+import type { FileTreeImageSelection, FileTreeNode, Project } from '@/shared/types';
 import { formatFileSize, formatRelativeTime, isImageFile } from '@/modules/file-tree/utils/fileTreeUtils';
 import { ScrollArea, Input } from '@/shared/ui';
 import FileTreeBody from '@/modules/file-tree/FileTreeBody';
@@ -20,6 +20,8 @@ import FileTreeHeader from '@/modules/file-tree/FileTreeHeader';
 import FileTreeLoadingState from '@/modules/file-tree/FileTreeLoadingState';
 import FileTreeUploadProgress from '@/modules/file-tree/FileTreeUploadProgress';
 import ImageViewer from '@/modules/file-tree/ImageViewer';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 
 type FileTreeProps = {
@@ -30,6 +32,11 @@ type FileTreeProps = {
 /** Exported through the file-tree barrel; the project-workspace module renders it as the Files sidebar tab. */
 export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps) {
   const { t } = useTranslation();
+  const { authMode, user } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const canWriteFiles = can('file.write')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
   const [selectedImage, setSelectedImage] = useState<FileTreeImageSelection | null>(null);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const newItemInputRef = useRef<HTMLInputElement>(null);
@@ -48,9 +55,13 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
     }
   }, [toast]);
 
-  const { files, loading, error, refreshFiles } = useFileTreeData(selectedProject);
-  const { viewMode, changeViewMode } = useFileTreeViewMode();
   const { expandedDirs, toggleDirectory, expandDirectories, collapseAll } = useExpandedDirectories();
+  const { files, loading, error, refreshFiles, loadDirectory } = useFileTreeData(selectedProject);
+  const { viewMode, changeViewMode } = useFileTreeViewMode();
+  const refreshAndCollapse = useCallback(() => {
+    collapseAll();
+    refreshFiles();
+  }, [collapseAll, refreshFiles]);
   const { searchQuery, setSearchQuery, filteredFiles } = useFileTreeSearch({
     files,
     expandDirectories,
@@ -59,16 +70,18 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
   // File operations
   const operations = useFileTreeOperations({
     selectedProject,
-    onRefresh: refreshFiles,
+    onRefresh: refreshAndCollapse,
     showToast,
+    canWriteFiles,
   });
 
   // File upload (drag and drop). `treeRef` is pulled out of the returned object
   // so the remaining plain values are not treated as render-time ref reads.
   const { treeRef, ...upload } = useFileTreeUpload({
     selectedProject,
-    onRefresh: refreshFiles,
+    onRefresh: refreshAndCollapse,
     showToast,
+    canWriteFiles,
   });
   const operationLoading = operations.operationLoading || upload.operationLoading;
 
@@ -79,19 +92,33 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
   const { uploadFiles } = upload;
 
   const handleUploadToFolder = useCallback((targetPath: string) => {
+    // The callback can outlive the render that exposed it (for example while
+    // a context menu or native file picker is open). Re-check the current
+    // deployment decision before opening a write-capable picker.
+    if (!canWriteFiles) {
+      folderUploadTargetRef.current = '';
+      return;
+    }
     folderUploadTargetRef.current = targetPath;
     folderUploadInputRef.current?.click();
-  }, []);
+  }, [canWriteFiles]);
 
   const handleFolderUploadInputChange = useCallback(
     (event: ChangeEvent<HTMLInputElement>) => {
+      const targetPath = folderUploadTargetRef.current;
+      // Consume the target exactly once. This avoids a later stale input event
+      // reusing a folder selected before permissions changed.
+      folderUploadTargetRef.current = '';
       const { files: pickedFiles } = event.target;
-      if (pickedFiles && pickedFiles.length > 0) {
-        uploadFiles(Array.from(pickedFiles), folderUploadTargetRef.current);
-      }
       event.target.value = '';
+
+      if (!canWriteFiles || !pickedFiles || pickedFiles.length === 0) {
+        return;
+      }
+
+      uploadFiles(Array.from(pickedFiles), targetPath);
     },
-    [uploadFiles],
+    [canWriteFiles, uploadFiles],
   );
 
   // Focus input when creating new item
@@ -119,7 +146,21 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
   const handleItemClick = useCallback(
     (item: FileTreeNode) => {
       if (item.type === 'directory') {
+        const isExpanding = !expandedDirs.has(item.path);
         toggleDirectory(item.path);
+        if (isExpanding && item.children === undefined && !item.isLoadingChildren) {
+          void loadDirectory(item.path).catch((loadError: unknown) => {
+            if ((loadError as { name?: string }).name === 'AbortError') {
+              return;
+            }
+            showToast(
+              loadError instanceof Error
+                ? loadError.message
+                : t('fileTree.loadFailed', 'Unable to load files'),
+              'error',
+            );
+          });
+        }
         return;
       }
 
@@ -137,7 +178,7 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
 
       onFileOpen?.(item.path);
     },
-    [onFileOpen, selectedProject, toggleDirectory],
+    [expandedDirs, loadDirectory, onFileOpen, selectedProject, showToast, t, toggleDirectory],
   );
 
   const formatRelativeTimeLabel = useCallback(
@@ -165,6 +206,7 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
         multiple
         className="hidden"
         onChange={handleFolderUploadInputChange}
+        disabled={!canWriteFiles}
         tabIndex={-1}
         aria-hidden="true"
       />
@@ -190,10 +232,10 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
         onViewModeChange={changeViewMode}
         searchQuery={searchQuery}
         onSearchQueryChange={setSearchQuery}
-        onUploadFiles={upload.handleFileSelect}
-        onNewFile={() => operations.handleStartCreate('', 'file')}
-        onNewFolder={() => operations.handleStartCreate('', 'directory')}
-        onRefresh={refreshFiles}
+        onUploadFiles={canWriteFiles ? upload.handleFileSelect : undefined}
+        onNewFile={canWriteFiles ? () => operations.handleStartCreate('', 'file') : undefined}
+        onNewFolder={canWriteFiles ? () => operations.handleStartCreate('', 'directory') : undefined}
+        onRefresh={refreshAndCollapse}
         onCollapseAll={collapseAll}
         loading={loading}
         operationLoading={operationLoading}
@@ -207,7 +249,7 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
 
       <ScrollArea className="flex-1 px-2 py-1">
         {/* New item input */}
-        {operations.isCreating && (
+        {canWriteFiles && operations.isCreating && (
           <div
             className="mb-1 flex items-center gap-1.5 py-[3px] pr-2"
             style={{ paddingLeft: `${(operations.newItemParent.split('/').length - 1) * 16 + 4}px` }}
@@ -249,23 +291,23 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
           renderFileIcon={renderFileIcon}
           formatFileSize={formatFileSize}
           formatRelativeTime={formatRelativeTimeLabel}
-          onRename={operations.handleStartRename}
-          onDelete={operations.handleStartDelete}
-          onNewFile={(path) => operations.handleStartCreate(path, 'file')}
-          onNewFolder={(path) => operations.handleStartCreate(path, 'directory')}
+          onRename={canWriteFiles ? operations.handleStartRename : undefined}
+          onDelete={canWriteFiles ? operations.handleStartDelete : undefined}
+          onNewFile={canWriteFiles ? (path) => operations.handleStartCreate(path, 'file') : undefined}
+          onNewFolder={canWriteFiles ? (path) => operations.handleStartCreate(path, 'directory') : undefined}
           onCopyPath={operations.handleCopyPath}
           onDownload={operations.handleDownload}
-          onUpload={handleUploadToFolder}
-          onRefresh={refreshFiles}
+          onUpload={canWriteFiles ? handleUploadToFolder : undefined}
+          onRefresh={refreshAndCollapse}
           dropTarget={upload.dropTarget}
           onItemDragOver={upload.handleItemDragOver}
           // Pass rename state and handlers for inline editing
-          renamingItem={operations.renamingItem}
-          renameValue={operations.renameValue}
-          setRenameValue={operations.setRenameValue}
-          handleConfirmRename={operations.handleConfirmRename}
-          handleCancelRename={operations.handleCancelRename}
-          renameInputRef={renameInputRef}
+          renamingItem={canWriteFiles ? operations.renamingItem : null}
+          renameValue={canWriteFiles ? operations.renameValue : ''}
+          setRenameValue={canWriteFiles ? operations.setRenameValue : undefined}
+          handleConfirmRename={canWriteFiles ? operations.handleConfirmRename : undefined}
+          handleCancelRename={canWriteFiles ? operations.handleCancelRename : undefined}
+          renameInputRef={canWriteFiles ? renameInputRef : undefined}
           operationLoading={operationLoading}
         />
       </ScrollArea>
@@ -278,7 +320,7 @@ export default function FileTree({ selectedProject, onFileOpen }: FileTreeProps)
       )}
 
       {/* Delete Confirmation Dialog */}
-      {operations.deleteConfirmation.isOpen && operations.deleteConfirmation.item && (
+      {canWriteFiles && operations.deleteConfirmation.isOpen && operations.deleteConfirmation.item && (
         <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50">
           <div className="mx-4 max-w-sm rounded-lg border border-border bg-background p-4 shadow-lg">
             <div className="mb-4 flex items-center gap-3">

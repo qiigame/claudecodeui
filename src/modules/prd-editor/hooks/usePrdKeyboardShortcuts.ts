@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 
 type UsePrdKeyboardShortcutsArgs = {
-  onSave: () => void;
+  onSave?: () => void;
   onClose: () => void;
 };
 
@@ -16,7 +16,7 @@ export function usePrdKeyboardShortcuts({
 
       if ((event.ctrlKey || event.metaKey) && loweredKey === 's') {
         event.preventDefault();
-        onSave();
+        onSave?.();
         return;
       }
 

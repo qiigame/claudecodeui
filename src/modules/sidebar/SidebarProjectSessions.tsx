@@ -30,6 +30,10 @@ type SidebarProjectSessionsProps = {
   onForkSession?: (session: SessionWithProvider) => void;
   onLoadMoreSessions: (projectId: string) => void;
   onNewSession: (project: Project) => void;
+  /** Server-authorized session metadata capability, including creation. */
+  canWriteSessions?: boolean;
+  /** Server-authorized filesystem capability for transcript forks/deletion. */
+  canWriteSessionFiles?: boolean;
   t: TFunction;
 };
 
@@ -75,6 +79,8 @@ export default function SidebarProjectSessions({
   onForkSession,
   onLoadMoreSessions,
   onNewSession,
+  canWriteSessions = false,
+  canWriteSessionFiles = false,
   t,
 }: SidebarProjectSessionsProps) {
   const isCompact = useCompactSidebar();
@@ -87,7 +93,7 @@ export default function SidebarProjectSessions({
 
   return (
     <div className="ml-3 space-y-1 border-l border-border pl-3">
-      {isCompact ? (
+      {canWriteSessions && (isCompact ? (
         <div className="px-3 pb-1 pt-1">
           <button
             className="flex h-8 w-full items-center justify-center gap-2 rounded-md bg-primary text-xs font-medium text-primary-foreground transition-all duration-150 hover:bg-primary/90 active:scale-[0.98]"
@@ -110,7 +116,7 @@ export default function SidebarProjectSessions({
           <Plus className="h-3 w-3" />
           {t('sessions.newSession')}
         </Button>
-      )}
+      ))}
 
       {!initialSessionsLoaded ? (
         <SessionListSkeleton />
@@ -139,6 +145,8 @@ export default function SidebarProjectSessions({
               onSessionSelect={onSessionSelect}
               onDeleteSession={onDeleteSession}
               onForkSession={onForkSession}
+              canWriteSessions={canWriteSessions}
+              canWriteSessionFiles={canWriteSessionFiles}
               t={t}
             />
           ))}

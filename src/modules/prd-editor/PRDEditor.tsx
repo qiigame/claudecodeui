@@ -9,6 +9,8 @@ import { ensurePrdExtension } from '@/modules/prd-editor/utils/fileName';
 import OverwriteConfirmModal from '@/modules/prd-editor/modals/OverwriteConfirmModal';
 import PrdEditorLoadingState from '@/modules/prd-editor/PrdEditorLoadingState';
 import PrdEditorWorkspace from '@/modules/prd-editor/PrdEditorWorkspace';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type PRDEditorProps = {
   file?: PrdEditorFile | null;
@@ -17,6 +19,8 @@ type PRDEditorProps = {
   project?: Project | null;
   initialContent?: string;
   isNewFile?: boolean;
+  /** Prevents PRD content, filename, save and task-generation mutations. */
+  readOnly?: boolean;
   onSave?: () => Promise<void> | void;
 };
 
@@ -28,8 +32,15 @@ export default function PRDEditor({
   project,
   initialContent = '',
   isNewFile = false,
+  readOnly = false,
   onSave,
 }: PRDEditorProps) {
+  const { authMode, user } = useAuth();
+  const { isReadOnly: deploymentIsReadOnly, can } = useDeploymentPolicy();
+  const effectiveReadOnly = readOnly
+    || deploymentIsReadOnly
+    || !can('project.mutate')
+    || isManagedIdentityRestricted(authMode, user);
   const [showOverwriteConfirm, setShowOverwriteConfirm] = useState<boolean>(false);
   const [overwriteFileName, setOverwriteFileName] = useState<string>('');
 
@@ -52,6 +63,7 @@ export default function PRDEditor({
     projectId: project?.projectId,
     existingPrds,
     isExistingFile,
+    canMutate: !effectiveReadOnly,
     onAfterSave: async () => {
       await refreshExistingPrds();
       await onSave?.();
@@ -74,6 +86,10 @@ export default function PRDEditor({
 
   const handleSave = useCallback(
     async (allowOverwrite = false) => {
+      if (effectiveReadOnly) {
+        return;
+      }
+
       const result = await savePrd({
         content,
         fileName,
@@ -90,7 +106,7 @@ export default function PRDEditor({
         alert(result.message);
       }
     },
-    [content, fileName, savePrd],
+    [content, effectiveReadOnly, fileName, savePrd],
   );
 
   const confirmOverwrite = useCallback(async () => {
@@ -99,9 +115,11 @@ export default function PRDEditor({
   }, [handleSave]);
 
   usePrdKeyboardShortcuts({
-    onSave: () => {
-      void handleSave();
-    },
+    onSave: effectiveReadOnly
+      ? undefined
+      : () => {
+          void handleSave();
+        },
     onClose,
   });
 
@@ -119,23 +137,26 @@ export default function PRDEditor({
         isNewFile={isNewFile}
         saving={saving}
         saveSuccess={saveSuccess}
-        onSave={() => {
+        onSave={effectiveReadOnly ? undefined : () => {
           void handleSave();
         }}
         onDownload={handleDownload}
         onClose={onClose}
         loadError={loadError}
+        readOnly={effectiveReadOnly}
       />
 
-      <OverwriteConfirmModal
-        isOpen={showOverwriteConfirm}
-        fileName={overwriteFileName || ensurePrdExtension(fileName || 'prd')}
-        saving={saving}
-        onCancel={() => setShowOverwriteConfirm(false)}
-        onConfirm={() => {
-          void confirmOverwrite();
-        }}
-      />
+      {!effectiveReadOnly && (
+        <OverwriteConfirmModal
+          isOpen={showOverwriteConfirm}
+          fileName={overwriteFileName || ensurePrdExtension(fileName || 'prd')}
+          saving={saving}
+          onCancel={() => setShowOverwriteConfirm(false)}
+          onConfirm={() => {
+            void confirmOverwrite();
+          }}
+        />
+      )}
     </>
   );
 }

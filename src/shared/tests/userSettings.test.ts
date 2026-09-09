@@ -17,11 +17,15 @@ type SavedPayload = Record<string, unknown>;
 const saved: SavedPayload[] = [];
 let serverPreferences: Record<string, unknown> = {};
 let preferencesRequestFailed = false;
+let pendingPreferencesResponse: Promise<Response> | null = null;
 
 vi.mock('@/shared/api', () => ({
   api: {
     user: {
       preferences: async () => {
+        if (pendingPreferencesResponse) {
+          return pendingPreferencesResponse;
+        }
         if (preferencesRequestFailed) {
           throw new Error('offline');
         }
@@ -48,6 +52,7 @@ beforeEach(() => {
   saved.length = 0;
   serverPreferences = {};
   preferencesRequestFailed = false;
+  pendingPreferencesResponse = null;
   vi.useFakeTimers();
 });
 
@@ -219,6 +224,25 @@ test('hydrate leaves a queued write for a key the server has no answer for', asy
   await vi.advanceTimersByTimeAsync(500);
 
   assert.deepEqual(saved, [{ userLanguage: 'de' }]);
+});
+
+test('a response from a reset account cannot repopulate the preference store', async () => {
+  let resolveResponse!: (response: Response) => void;
+  pendingPreferencesResponse = new Promise<Response>((resolve) => {
+    resolveResponse = resolve;
+  });
+
+  const store = await loadStore();
+  const hydration = store.hydrateUserPreferences();
+
+  store.resetUserPreferences();
+  resolveResponse(new Response(JSON.stringify({ preferences: { theme: 'dark' } }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  }));
+  await hydration;
+
+  assert.equal(store.readUserPreference('theme', 'light'), 'light');
 });
 
 test('reset clears the copy so the next user does not inherit the previous one', async () => {

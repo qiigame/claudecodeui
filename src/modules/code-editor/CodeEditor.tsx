@@ -19,6 +19,8 @@ import CodeEditorLoadingState from '@/modules/code-editor/CodeEditorLoadingState
 import CodeEditorSurface from '@/modules/code-editor/CodeEditorSurface';
 import CodeEditorBinaryFile from '@/modules/code-editor/CodeEditorBinaryFile';
 import CodeEditorMediaPreview from '@/modules/code-editor/CodeEditorMediaPreview';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
 
 type CodeEditorProps = {
   file: CodeEditorFile;
@@ -28,6 +30,8 @@ type CodeEditorProps = {
   isExpanded?: boolean;
   onToggleExpand?: (() => void) | null;
   onPopOut?: (() => void) | null;
+  /** Disables text edits and persistence while retaining file previews/downloads. */
+  readOnly?: boolean;
 };
 
 /** Rendered by the code-editor module's own EditorSidebar, and re-exported on the module barrel, as the full CodeMirror editor for one open file. */
@@ -39,7 +43,12 @@ export default function CodeEditor({
   isExpanded = false,
   onToggleExpand = null,
   onPopOut = null,
+  readOnly = false,
 }: CodeEditorProps) {
+  const { authMode, user, canManageSettings: authCanManageSettings } = useAuth();
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const effectiveReadOnly = readOnly || isReadOnly || isManagedIdentityRestricted(authMode, user);
+  const canManageSettings = authCanManageSettings && can('settings.write') && !effectiveReadOnly;
   const { t } = useTranslation('codeEditor');
   const paletteOps = usePaletteOps();
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -71,7 +80,21 @@ export default function CodeEditor({
   } = useCodeEditorDocument({
     file,
     projectPath,
+    canWriteFiles: !effectiveReadOnly,
   });
+
+  // Keep both the UI and keyboard shortcut on the same capability boundary;
+  // the document hook also receives the flag as a second defensive guard.
+  const handleContentChange = useCallback((value: string) => {
+    if (!effectiveReadOnly) {
+      setContent(value);
+    }
+  }, [effectiveReadOnly, setContent]);
+  const handleSaveIfAllowed = useCallback(() => {
+    if (!effectiveReadOnly) {
+      void handleSave();
+    }
+  }, [effectiveReadOnly, handleSave]);
 
   const isMarkdownFile = useMemo(() => {
     const extension = file.name.split('.').pop()?.toLowerCase();
@@ -178,7 +201,7 @@ export default function CodeEditor({
   ]);
 
   useEditorKeyboardShortcuts({
-    onSave: handleSave,
+    onSave: handleSaveIfAllowed,
     onClose,
     dependency: content,
   });
@@ -258,9 +281,11 @@ export default function CodeEditor({
             saveSuccess={saveSuccess}
             onToggleMarkdownPreview={() => setMarkdownPreview((previous) => !previous)}
             onOpenHtmlPreview={openHtmlPreview}
-            onOpenSettings={() => paletteOps.openSettings('appearance')}
+            onOpenSettings={canManageSettings
+              ? () => paletteOps.openSettings('appearance')
+              : undefined}
             onDownload={handleDownload}
-            onSave={handleSave}
+            onSave={effectiveReadOnly ? undefined : handleSaveIfAllowed}
             onToggleFullscreen={() => setIsFullscreen((previous) => !previous)}
             onClose={onClose}
             labels={{
@@ -290,13 +315,14 @@ export default function CodeEditor({
           <div className="flex-1 overflow-hidden">
             <CodeEditorSurface
               content={content}
-              onChange={setContent}
+              onChange={handleContentChange}
               markdownPreview={markdownPreview}
               isMarkdownFile={isMarkdownFile}
               isDarkMode={isDarkMode}
               fontSize={fontSize}
               showLineNumbers={showLineNumbers}
               extensions={extensions}
+              readOnly={effectiveReadOnly}
             />
           </div>
 

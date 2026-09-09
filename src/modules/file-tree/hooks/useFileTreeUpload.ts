@@ -1,16 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { DragEvent } from 'react';
 
-import { IS_PLATFORM } from '@/shared/utils';
 import type { FileTreeUploadProgressState, Project } from '@/shared/types';
 import { api } from '@/shared/api';
-import { expireAuthSession, getStoredAuthToken, storeAuthToken } from '@/shared/authToken';
+import {
+  expireAuthSession,
+  getAuthSessionSnapshot,
+  getStoredAuthToken,
+  storeAuthToken,
+} from '@/shared/authToken';
 import { MAX_FILE_UPLOAD_SIZE_BYTES, MAX_FILE_UPLOAD_SIZE_LABEL } from '@/shared/constants';
 
 type UseFileTreeUploadOptions = {
   selectedProject: Project | null;
   onRefresh: () => void;
   showToast: (message: string, type: 'success' | 'error') => void;
+  /** Server-authorized permission for uploading into the project tree. */
+  canWriteFiles?: boolean;
 };
 
 
@@ -106,7 +112,11 @@ const uploadFormDataWithProgress = (
     xhr.open('POST', api.uploadFilesUrl(projectId));
 
     const token = getStoredAuthToken();
-    if (!IS_PLATFORM && token) {
+    const requestSession = getAuthSessionSnapshot();
+    // Hosting/build mode does not grant a write bypass. Send the server-issued
+    // bearer token whenever one exists; product/QA deployments will then
+    // receive the capability decision from the backend.
+    if (token) {
       xhr.setRequestHeader('Authorization', `Bearer ${token}`);
     }
 
@@ -123,10 +133,10 @@ const uploadFormDataWithProgress = (
     xhr.onload = () => {
       const refreshedToken = xhr.getResponseHeader('X-Refreshed-Token');
       if (refreshedToken) {
-        storeAuthToken(refreshedToken);
+        storeAuthToken(refreshedToken, requestSession);
       }
       if (xhr.getResponseHeader('X-Auth-Error')) {
-        expireAuthSession();
+        expireAuthSession(requestSession);
       }
 
       const payload = parseUploadResponse(xhr);
@@ -239,6 +249,7 @@ export const useFileTreeUpload = ({
   selectedProject,
   onRefresh,
   showToast,
+  canWriteFiles = false,
 }: UseFileTreeUploadOptions) => {
   const [isDragOver, setIsDragOver] = useState(false);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
@@ -284,6 +295,12 @@ export const useFileTreeUpload = ({
 
   const uploadFiles = useCallback(
     async (files: File[], targetPath = '') => {
+      if (!canWriteFiles) {
+        setDropTarget(null);
+        setIsDragOver(false);
+        return;
+      }
+
       if (files.length === 0) {
         setDropTarget(null);
         return;
@@ -365,6 +382,7 @@ export const useFileTreeUpload = ({
       selectedProject,
       setUploadError,
       showToast,
+      canWriteFiles,
     ],
   );
 
@@ -376,20 +394,23 @@ export const useFileTreeUpload = ({
   );
 
   const handleDragEnter = useCallback((e: DragEvent) => {
+    if (!canWriteFiles) return;
     e.preventDefault();
     e.stopPropagation();
     setIsDragOver(true);
-  }, []);
+  }, [canWriteFiles]);
 
   // Item rows stop propagation of their own dragover, so reaching this handler
   // means the cursor is over empty space and the drop should target the root.
   const handleDragOver = useCallback((e: DragEvent) => {
+    if (!canWriteFiles) return;
     e.preventDefault();
     e.stopPropagation();
     setDropTarget(null);
-  }, []);
+  }, [canWriteFiles]);
 
   const handleDragLeave = useCallback((e: DragEvent) => {
+    if (!canWriteFiles) return;
     e.preventDefault();
     e.stopPropagation();
     // Only set isDragOver to false if we're leaving the entire tree
@@ -397,10 +418,11 @@ export const useFileTreeUpload = ({
       setIsDragOver(false);
       setDropTarget(null);
     }
-  }, []);
+  }, [canWriteFiles]);
 
   const handleDrop = useCallback(
     async (e: DragEvent) => {
+      if (!canWriteFiles) return;
       e.preventDefault();
       e.stopPropagation();
       setIsDragOver(false);
@@ -418,14 +440,15 @@ export const useFileTreeUpload = ({
         setDropTarget(null);
       }
     },
-    [dropTarget, setUploadError, showToast, uploadFiles],
+    [canWriteFiles, dropTarget, setUploadError, showToast, uploadFiles],
   );
 
   const handleItemDragOver = useCallback((e: DragEvent, itemPath: string) => {
+    if (!canWriteFiles) return;
     e.preventDefault();
     e.stopPropagation();
     setDropTarget(itemPath);
-  }, []);
+  }, [canWriteFiles]);
 
   return {
     isDragOver,

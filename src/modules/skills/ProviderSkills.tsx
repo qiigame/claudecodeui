@@ -26,6 +26,8 @@ import {
 } from '@/shared/ui';
 import { useProviderSkills } from '@/modules/skills/hooks/useProviderSkills';
 import type { ProviderSkill, ProviderSkillCreateEntryPayload, SkillsProject, SkillsProvider, SkillsScope } from '@/shared/types';
+import { useDeploymentPolicy } from '@/shared/context/DeploymentPolicyContext';
+import { isManagedIdentityRestricted, useAuth } from '@/modules/auth';
 
 type ProviderSkillsProps = {
   selectedProvider: SkillsProvider;
@@ -195,6 +197,11 @@ const buildQueuedSkillFolders = (selectedFiles: File[]): QueuedSkillFile[] => {
 /** Rendered by the settings module's agents tab to list, upload and delete one provider's skills. */
 export default function ProviderSkills({ selectedProvider, currentProjects }: ProviderSkillsProps) {
   const { t } = useTranslation('settings');
+  const { can, isReadOnly } = useDeploymentPolicy();
+  const { authMode, user } = useAuth();
+  const canManageSkills = can('provider.write')
+    && !isReadOnly
+    && !isManagedIdentityRestricted(authMode, user);
   const {
     skills,
     isLoading,
@@ -203,7 +210,7 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
     saveStatus,
     addSkills,
     refreshSkills,
-  } = useProviderSkills({ selectedProvider, currentProjects });
+  } = useProviderSkills({ selectedProvider, currentProjects, canManage: canManageSkills });
   const [queuedFiles, setQueuedFiles] = useState<QueuedSkillFile[]>([]);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -226,6 +233,18 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
     setShowInstallPath(false);
     setJustInstalled(false);
   }, [selectedProvider]);
+
+  // Close a skill-import dialog if the server policy changes while Settings is
+  // open (for example, after switching from a local developer identity to a
+  // product/QA identity).  This prevents a stale dialog callback from
+  // continuing to offer a provider configuration write.
+  useEffect(() => {
+    if (!canManageSkills) {
+      setIsAddDialogOpen(false);
+      setQueuedFiles([]);
+      setIsSubmitting(false);
+    }
+  }, [canManageSkills]);
 
   const setFolderInputRef = useCallback((node: HTMLInputElement | null) => {
     folderInputRef.current = node;
@@ -261,15 +280,21 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
   const groupedSkills = useMemo(() => groupSkillsByScope(filteredSkills), [filteredSkills]);
 
   const queueSkillFolders = useCallback((selectedFiles: File[]) => {
+    if (!canManageSkills) {
+      return;
+    }
     const queuedFolders = buildQueuedSkillFolders(selectedFiles);
     setQueuedFiles((previous) => {
       const nextMap = new Map(previous.map((file) => [file.id, file]));
       queuedFolders.forEach((folder) => nextMap.set(folder.id, folder));
       return [...nextMap.values()].slice(0, 20);
     });
-  }, []);
+  }, [canManageSkills]);
 
   const handleDrop = useCallback((files: File[]) => {
+    if (!canManageSkills) {
+      return;
+    }
     const includesDirectory = files.some((file) => getBrowserRelativePath(file).includes('/'));
     if (includesDirectory) {
       try {
@@ -307,9 +332,12 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
       return [...nextMap.values()].slice(0, 20);
     });
     setSubmitError(null);
-  }, [queueSkillFolders]);
+  }, [canManageSkills, queueSkillFolders]);
 
   const handleFolderSelection = useCallback((selectedFiles: File[]) => {
+    if (!canManageSkills) {
+      return;
+    }
     if (selectedFiles.length === 0) {
       return;
     }
@@ -320,7 +348,7 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : 'Failed to read skill folder');
     }
-  }, [queueSkillFolders]);
+  }, [canManageSkills, queueSkillFolders]);
 
   const { getRootProps, isDragActive } = useDropzone({
     maxFiles: MAX_SKILL_FOLDER_FILES,
@@ -330,6 +358,10 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
   });
 
   const handleUploadInstall = useCallback(async () => {
+    if (!canManageSkills) {
+      setSubmitError('Provider skill changes are disabled in this deployment.');
+      return;
+    }
     if (queuedFiles.length === 0) {
       setSubmitError('Add one or more markdown files first.');
       return;
@@ -364,9 +396,12 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
     } finally {
       setIsSubmitting(false);
     }
-  }, [addSkills, queuedFiles]);
+  }, [addSkills, canManageSkills, queuedFiles]);
 
   const handleAddDialogOpenChange = useCallback((open: boolean) => {
+    if (open && !canManageSkills) {
+      return;
+    }
     if (open) {
       setSubmitError(null);
       setShowInstallPath(false);
@@ -380,7 +415,7 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
     setShowInstallPath(false);
     setJustInstalled(false);
     setIsAddDialogOpen(false);
-  }, []);
+  }, [canManageSkills]);
 
   const uploadPanel = (
     <div className="space-y-4">
@@ -544,15 +579,21 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
               </button>
             )}
           </div>
-          <Button
-            type="button"
-            size="sm"
-            className="w-full sm:w-auto"
-            onClick={() => handleAddDialogOpenChange(true)}
-          >
-            <Plus className="h-4 w-4" />
-            Add Skill
-          </Button>
+          {canManageSkills ? (
+            <Button
+              type="button"
+              size="sm"
+              className="w-full sm:w-auto"
+              onClick={() => handleAddDialogOpenChange(true)}
+            >
+              <Plus className="h-4 w-4" />
+              Add Skill
+            </Button>
+          ) : (
+            <span className="inline-flex items-center rounded-md border border-border/60 bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground">
+              Read-only deployment
+            </span>
+          )}
           <Button
             onClick={() => void refreshSkills({ force: true })}
             variant="outline"

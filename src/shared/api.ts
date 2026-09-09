@@ -1,9 +1,9 @@
 import {
   expireAuthSession,
+  getAuthSessionSnapshot,
   getStoredAuthToken,
   storeAuthToken,
 } from '@/shared/authToken';
-import { IS_PLATFORM } from '@/shared/utils';
 import { readVoiceConfig, voiceConfigHeaders } from '@/shared/voiceConfig';
 
 // Headers are a plain record rather than the full `HeadersInit` union so the
@@ -12,12 +12,21 @@ export type ApiRequestOptions = Omit<RequestInit, 'headers'> & {
   headers?: Record<string, string>;
 };
 
+/** One parsed Server-Sent Events record. */
+export type ServerSentEvent = {
+  event: string;
+  data: string;
+};
+
 // Utility function for authenticated API calls
 export const authenticatedFetch = (
   url: string,
   options: ApiRequestOptions = {},
 ): Promise<Response> => {
+  // Expiry validation may itself end the session and advance its epoch, so
+  // capture the request snapshot only after reading the usable token.
   const token = getStoredAuthToken();
+  const requestSession = getAuthSessionSnapshot();
 
   const defaultHeaders: Record<string, string> = {};
 
@@ -26,7 +35,9 @@ export const authenticatedFetch = (
     defaultHeaders['Content-Type'] = 'application/json';
   }
 
-  if (!IS_PLATFORM && token) {
+  // Hosting is not an authentication decision. In particular, a hosted
+  // product/QA build still needs to send its DingTalk-issued bearer token.
+  if (token) {
     defaultHeaders['Authorization'] = `Bearer ${token}`;
   }
 
@@ -39,10 +50,12 @@ export const authenticatedFetch = (
   }).then((response) => {
     const refreshedToken = response.headers.get('X-Refreshed-Token');
     if (refreshedToken) {
-      storeAuthToken(refreshedToken);
+      // This response belongs to the request's captured login lifetime. The
+      // token+epoch CAS prevents user A's late response from modifying user B.
+      storeAuthToken(refreshedToken, requestSession);
     }
     if (response.headers.get('X-Auth-Error')) {
-      expireAuthSession();
+      expireAuthSession(requestSession);
     }
     return response;
   });
@@ -83,6 +96,109 @@ export async function readApiJson<T>(response: Response): Promise<T> {
     throw new Error(data.error || data.details || `Request failed (${response.status})`);
   }
   return data as T;
+}
+
+/**
+ * Consumes an authenticated SSE response using fetch rather than the browser's
+ * EventSource API. EventSource cannot carry an Authorization header, which
+ * would otherwise force callers to put a bearer token in the URL query string.
+ *
+ * The parser intentionally handles the parts of the SSE wire format used by
+ * CloudCLI: event names, one or more data lines, comments and LF/CRLF/CR
+ * record separators. The callback is invoked only for records that contain a
+ * data field; callers decide how to decode the payload (usually JSON).
+ */
+export async function consumeSseResponse(
+  response: Response,
+  onEvent: (event: ServerSentEvent) => void,
+): Promise<void> {
+  if (!response.ok) {
+    throw new Error(`Request failed (${response.status})`);
+  }
+  if (!response.body) {
+    throw new Error('Connection lost while reading event stream');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const dispatch = (rawRecord: string): void => {
+    let event = 'message';
+    const dataLines: string[] = [];
+
+    for (const line of rawRecord.split(/\r\n|\n|\r/)) {
+      if (!line || line.startsWith(':')) {
+        continue;
+      }
+
+      const separator = line.indexOf(':');
+      const field = separator === -1 ? line : line.slice(0, separator);
+      // The optional single space after a field separator is not part of the
+      // value according to the SSE specification.
+      const value = separator === -1
+        ? ''
+        : line.slice(separator + 1).replace(/^ /, '');
+
+      if (field === 'event') {
+        event = value;
+      } else if (field === 'data') {
+        dataLines.push(value);
+      }
+    }
+
+    if (dataLines.length > 0) {
+      onEvent({ event, data: dataLines.join('\n') });
+    }
+  };
+
+  const consumeRecords = (flush: boolean): void => {
+    // A record ends with an empty line. Keep an incomplete trailing record in
+    // the buffer because network chunks are allowed to split anywhere.
+    while (true) {
+      const separator = /\r\n\r\n|\n\n|\r\r/.exec(buffer);
+      if (!separator || separator.index === undefined) {
+        break;
+      }
+      const rawRecord = buffer.slice(0, separator.index);
+      buffer = buffer.slice(separator.index + separator[0].length);
+      dispatch(rawRecord);
+    }
+
+    if (flush && buffer.trim()) {
+      const trailingRecord = buffer;
+      buffer = '';
+      dispatch(trailingRecord);
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (value) {
+        buffer += decoder.decode(value, { stream: !done });
+      } else if (done) {
+        // Flush a possible partial UTF-8 sequence before parsing the final
+        // record. TextDecoder.decode() with no input performs that flush.
+        buffer += decoder.decode();
+      }
+      consumeRecords(done);
+      if (done) {
+        break;
+      }
+    }
+  } catch (error) {
+    // Ensure an aborted/failed consumer closes the HTTP body so the server can
+    // stop its in-flight search instead of retaining a dangling SSE request.
+    try {
+      await reader.cancel();
+    } catch {
+      // Preserve the original stream or callback error.
+    }
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 const get = (url: string, options: ApiRequestOptions = {}) => authenticatedFetch(url, options);
@@ -131,6 +247,11 @@ const pluginAssetPath = (pluginName: string, assetFile: string) =>
 // import a named method instead of assembling URLs of their own.
 
 export const api = {
+  // Deployment capabilities are server-authoritative. The compatibility
+  // endpoint is used by older installations while they are being upgraded.
+  deploymentPolicy: () => get('/api/deployment-policy', { cache: 'no-store' }),
+  capabilities: () => get('/api/capabilities', { cache: 'no-store' }),
+
   // Auth endpoints (no token required)
   auth: {
     status: () => fetch('/api/auth/status'),
@@ -146,6 +267,20 @@ export const api = {
     }),
     refresh: () => post('/api/auth/refresh'),
     user: () => get('/api/auth/user'),
+    /** Resolves the server-owned managed principal without reusing a stale JWT. */
+    managedUser: () => fetch('/api/auth/user', { cache: 'no-store' }),
+    // Cross-tab account switches must bind the returned user to the exact JWT
+    // observed in that storage event, not whichever token is stored later.
+    userForToken: (token: string) => fetch('/api/auth/user', {
+      cache: 'no-store',
+      headers: { Authorization: `Bearer ${token}` },
+    }),
+    dingTalkSession: () => fetch('/api/auth/dingtalk/session', {
+      credentials: 'same-origin',
+      cache: 'no-store',
+    }),
+    dingTalkStartUrl: (provider: string, returnTo = '/'): string =>
+      `/api/auth/dingtalk/start${query({ provider, returnTo })}`,
   },
 
   // Protected endpoints
@@ -165,6 +300,8 @@ export const api = {
     ),
   projectTaskmaster: (projectId: string) =>
     get(`/api/projects/${encodeURIComponent(projectId)}/taskmaster`),
+  projectGuide: (projectId: string) =>
+    get(`/api/collaboration/projects/${encodeURIComponent(projectId)}/guide`),
   renameProject: (projectId: string, displayName: string) =>
     put(`/api/projects/${projectId}/rename`, { displayName }),
   restoreProject: (projectId: string) =>
@@ -177,16 +314,33 @@ export const api = {
     post('/api/projects/migrate-legacy-stars', { projectIds }),
   toggleProjectStar: (projectId: string) =>
     post(`/api/projects/${encodeURIComponent(projectId)}/toggle-star`),
-  // EventSource cannot send an Authorization header, so the token rides along as
-  // a query parameter on the streaming endpoints below.
+  // New clone callers use the authenticated POST stream below. Keep this URL
+  // builder only for older, token-free GET/EventSource integrations; never
+  // serialize a raw GitHub token into a URL.
   cloneProjectProgressUrl: (params: Record<string, QueryValue>) =>
-    `/api/projects/clone-progress${query({ ...params, token: getStoredAuthToken() })}`,
+    `/api/projects/clone-progress${query({
+      path: params.path,
+      githubUrl: params.githubUrl,
+      githubTokenId: params.githubTokenId,
+    })}`,
+  cloneProjectProgress: (payload: Record<string, unknown>) =>
+    post('/api/projects/clone-progress', payload),
   searchConversationsUrl: (searchQuery: string, limit = 50) =>
     `/api/providers/search/sessions${query({
       q: searchQuery,
       limit,
-      token: getStoredAuthToken(),
     })}`,
+  searchConversations: (
+    searchQuery: string,
+    limit = 50,
+    options: ApiRequestOptions = {},
+  ) => get(`/api/providers/search/sessions${query({ q: searchQuery, limit })}`, {
+    ...options,
+    headers: {
+      Accept: 'text/event-stream',
+      ...options.headers,
+    },
+  }),
 
   // Session endpoints. Provider/project metadata are resolved by the backend
   // from the session id.
@@ -212,11 +366,28 @@ export const api = {
     post(`/api/providers/sessions/${encodeURIComponent(sessionId)}/fork`, body),
   renameSession: (sessionId: string, summary: string) =>
     put(`/api/providers/sessions/${sessionId}`, { summary }),
+  createSessionShare: (sessionId: string, expiresInHours = 168) =>
+    post(`/api/collaboration/sessions/${encodeURIComponent(sessionId)}/shares`, { expiresInHours }),
+  listSessionShares: (sessionId: string) =>
+    get(`/api/collaboration/sessions/${encodeURIComponent(sessionId)}/shares`, { cache: 'no-store' }),
+  revokeSessionShare: (shareId: string) =>
+    del(`/api/collaboration/shares/${encodeURIComponent(shareId)}`),
+
+  // Public session snapshots use their own bearer token and must not inherit
+  // the signed-in user's Authorization header.
+  publicSessionShare: (token: string) => fetch(
+    `/api/public/shares/${encodeURIComponent(token)}`,
+    {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+      referrerPolicy: 'no-referrer',
+    },
+  ),
 
   // Scheduled messages: send a message to a session at a future time.
   scheduledMessages: {
-    list: (sessionId?: string) =>
-      get(`/api/scheduled-messages${sessionId ? query({ sessionId }) : ''}`),
+    list: (sessionId?: string, options: ApiRequestOptions = {}) =>
+      get(`/api/scheduled-messages${sessionId ? query({ sessionId }) : ''}`, options),
     create: (body: { sessionId: string; content: string; scheduledFor: string; options?: unknown }) =>
       post('/api/scheduled-messages', body),
     cancel: (id: string) => del(`/api/scheduled-messages/${encodeURIComponent(id)}`),
@@ -233,6 +404,19 @@ export const api = {
     put(`/api/file-tree/projects/${projectId}/file`, { filePath, content }),
   getFiles: (projectId: string, options: ApiRequestOptions = {}) =>
     get(`/api/file-tree/projects/${projectId}/files${query({ respectGitignore: true })}`, options),
+  // Lazy file-tree browsing reads one directory at a time. `.` selects the
+  // project root while absolute paths come from prior FileTreeNode responses.
+  getFilesInDirectory: (
+    projectId: string,
+    directoryPath: string,
+    options: ApiRequestOptions = {},
+  ) => get(
+    `/api/file-tree/projects/${projectId}/files${query({
+      respectGitignore: true,
+      directoryPath: directoryPath || '.',
+    })}`,
+    options,
+  ),
 
   // File operations
   createFile: (
@@ -305,6 +489,8 @@ export const api = {
   },
 
   worktrees: {
+    sessionPlan: (projectId: string) =>
+      get(`/api/worktrees/session-plan${query({ project: projectId })}`),
     list: (projectId: string) => get(`/api/worktrees${query({ project: projectId })}`),
     create: (
       projectId: string,
@@ -340,8 +526,10 @@ export const api = {
 
     createSession: (payload: {
       provider: string;
+      projectId?: string;
       projectPath: string;
       initialMessage?: unknown;
+      repositoryKeys?: string[];
     }) => post('/api/providers/sessions', payload),
     sessionMessages: (
       sessionId: string,
@@ -385,9 +573,17 @@ export const api = {
 
   // Slash commands
   commands: {
-    // `projectPath` stays optional: a workspace without a resolved path omits
-    // the field entirely, which is what the server expects.
-    list: (projectPath: string | undefined) => post('/api/commands/list', { projectPath }),
+    // New callers send the DB project id as the authority and retain the path
+    // only as a compatibility hint. Keep accepting a string for older module
+    // consumers and standalone integrations that have not migrated yet.
+    list: (
+      input: string | { projectId?: string; projectPath?: string } | undefined,
+    ) => {
+      const body = typeof input === 'string' || input === undefined
+        ? { projectPath: input }
+        : input;
+      return post('/api/commands/list', body);
+    },
     execute: (payload: unknown) => post('/api/commands/execute', payload),
   },
 
@@ -432,10 +628,10 @@ export const api = {
     // Preferences and chat drafts live server-side so they follow the user
     // from one device to another. `savePreferences` is a merge-patch: only the
     // keys it is given are written.
-    preferences: () => get('/api/user/preferences'),
+    preferences: (options: ApiRequestOptions = {}) => get('/api/user/preferences', options),
     savePreferences: (updates: Record<string, unknown>) =>
       patch('/api/user/preferences', updates),
-    drafts: () => get('/api/user/drafts'),
+    drafts: (options: ApiRequestOptions = {}) => get('/api/user/drafts', options),
     saveDraft: (scope: string, draft: { text: string; queuedMessage?: unknown }) =>
       put('/api/user/drafts', { scope, ...draft }),
     deleteDraft: (scope: string) => del('/api/user/drafts', { scope }),

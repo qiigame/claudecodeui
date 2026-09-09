@@ -2,8 +2,9 @@ import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import JSZip from 'jszip';
 
+import { walkProjectDirectory } from '@/modules/file-tree/utils/walkProjectDirectory';
 import { api } from '@/shared/api';
-import type { FileTreeNode,Project } from '@/shared/types';
+import type { FileTreeNode, Project } from '@/shared/types';
 
 // Invalid filename characters
 const INVALID_FILENAME_CHARS = /[<>:"/\\|?*\x00-\x1f]/;
@@ -23,6 +24,8 @@ export type UseFileTreeOperationsOptions = {
   selectedProject: Project | null;
   onRefresh: () => void;
   showToast: (message: string, type: 'success' | 'error') => void;
+  /** Server-authorized permission for mutations in the project file tree. */
+  canWriteFiles?: boolean;
 };
 
 export type UseFileTreeOperationsResult = {
@@ -64,6 +67,7 @@ export function useFileTreeOperations({
   selectedProject,
   onRefresh,
   showToast,
+  canWriteFiles = false,
 }: UseFileTreeOperationsOptions): UseFileTreeOperationsResult {
   const { t } = useTranslation();
 
@@ -99,10 +103,11 @@ export function useFileTreeOperations({
 
   // Rename operations
   const handleStartRename = useCallback((item: FileTreeNode) => {
+    if (!canWriteFiles) return;
     setRenamingItem(item);
     setRenameValue(item.name);
     setIsCreating(false);
-  }, []);
+  }, [canWriteFiles]);
 
   const handleCancelRename = useCallback(() => {
     setRenamingItem(null);
@@ -110,7 +115,7 @@ export function useFileTreeOperations({
   }, []);
 
   const handleConfirmRename = useCallback(async () => {
-    if (!renamingItem || !selectedProject) return;
+    if (!canWriteFiles || !renamingItem || !selectedProject) return;
 
     const error = validateFilename(renameValue);
     if (error) {
@@ -143,12 +148,13 @@ export function useFileTreeOperations({
     } finally {
       setOperationLoading(false);
     }
-  }, [renamingItem, renameValue, selectedProject, validateFilename, showToast, t, onRefresh, handleCancelRename]);
+  }, [canWriteFiles, renamingItem, renameValue, selectedProject, validateFilename, showToast, t, onRefresh, handleCancelRename]);
 
   // Delete operations
   const handleStartDelete = useCallback((item: FileTreeNode) => {
+    if (!canWriteFiles) return;
     setDeleteConfirmation({ isOpen: true, item });
-  }, []);
+  }, [canWriteFiles]);
 
   const handleCancelDelete = useCallback(() => {
     setDeleteConfirmation({ isOpen: false, item: null });
@@ -156,7 +162,7 @@ export function useFileTreeOperations({
 
   const handleConfirmDelete = useCallback(async () => {
     const { item } = deleteConfirmation;
-    if (!item || !selectedProject) return;
+    if (!canWriteFiles || !item || !selectedProject) return;
 
     setOperationLoading(true);
     try {
@@ -183,16 +189,17 @@ export function useFileTreeOperations({
     } finally {
       setOperationLoading(false);
     }
-  }, [deleteConfirmation, selectedProject, showToast, t, onRefresh, handleCancelDelete]);
+  }, [canWriteFiles, deleteConfirmation, selectedProject, showToast, t, onRefresh, handleCancelDelete]);
 
   // Create operations
   const handleStartCreate = useCallback((parentPath: string, type: 'file' | 'directory') => {
+    if (!canWriteFiles) return;
     setNewItemParent(parentPath || '');
     setNewItemType(type);
     setNewItemName(type === 'file' ? 'untitled.txt' : 'new-folder');
     setIsCreating(true);
     setRenamingItem(null);
-  }, []);
+  }, [canWriteFiles]);
 
   const handleCancelCreate = useCallback(() => {
     setIsCreating(false);
@@ -201,7 +208,7 @@ export function useFileTreeOperations({
   }, []);
 
   const handleConfirmCreate = useCallback(async () => {
-    if (!selectedProject) return;
+    if (!canWriteFiles || !selectedProject) return;
 
     const error = validateFilename(newItemName);
     if (error) {
@@ -235,7 +242,7 @@ export function useFileTreeOperations({
     } finally {
       setOperationLoading(false);
     }
-  }, [selectedProject, newItemParent, newItemType, newItemName, validateFilename, showToast, t, onRefresh, handleCancelCreate]);
+  }, [canWriteFiles, selectedProject, newItemParent, newItemType, newItemName, validateFilename, showToast, t, onRefresh, handleCancelCreate]);
 
   // Copy path to clipboard
   const handleCopyPath = useCallback((item: FileTreeNode) => {
@@ -282,33 +289,27 @@ export function useFileTreeOperations({
 
     const zip = new JSZip();
 
-    // Recursively get all files in the folder
-    const collectFiles = async (node: FileTreeNode, currentPath: string) => {
-      const fullPath = currentPath ? `${currentPath}/${node.name}` : node.name;
+    // Traverse through the lazy directory API instead of trusting the UI's
+    // partially loaded `children`, which would silently produce incomplete ZIPs.
+    await walkProjectDirectory({
+      projectId: selectedProject.projectId,
+      directoryPath: folder.path,
+      onEntry: async (entry, relativePath) => {
+        if (entry.type === 'directory') {
+          zip.folder(relativePath);
+          return;
+        }
 
-      if (node.type === 'file') {
-        const response = await api.readFileBlob(selectedProject.projectId, node.path);
+        const response = await api.readFileBlob(selectedProject.projectId, entry.path);
         if (!response.ok) {
-          throw new Error(`Failed to download "${node.name}" for ZIP export`);
+          throw new Error(`Failed to download "${entry.name}" for ZIP export`);
         }
 
         // Store raw bytes in the archive so binary files stay intact.
         const fileBytes = await response.arrayBuffer();
-        zip.file(fullPath, fileBytes);
-      } else if (node.type === 'directory' && node.children) {
-        // Recursively process children
-        for (const child of node.children) {
-          await collectFiles(child, fullPath);
-        }
-      }
-    };
-
-    // If the folder has children, process them
-    if (folder.children && folder.children.length > 0) {
-      for (const child of folder.children) {
-        await collectFiles(child, '');
-      }
-    }
+        zip.file(relativePath, fileBytes);
+      },
+    });
 
     // Generate ZIP file
     const zipBlob = await zip.generateAsync({ type: 'blob' });

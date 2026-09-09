@@ -16,6 +16,8 @@ type BranchesViewProps = {
   onCreateBranch: (branchName: string) => Promise<boolean>;
   onDeleteBranch: (branchName: string, force?: boolean) => Promise<boolean>;
   onRequestConfirmation: (request: ConfirmationRequest) => void;
+  /** Enables branch switch/create/delete controls for writable deployments. */
+  canMutateBranches?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -31,9 +33,10 @@ type BranchRowProps = {
   isMobile: boolean;
   onSwitch: () => void;
   onDelete: () => void;
+  canMutate: boolean;
 };
 
-function BranchRow({ name, isCurrent, isRemote, aheadCount, behindCount, isMobile, onSwitch, onDelete }: BranchRowProps) {
+function BranchRow({ name, isCurrent, isRemote, aheadCount, behindCount, isMobile, onSwitch, onDelete, canMutate }: BranchRowProps) {
   return (
     <div
       className={`group flex items-center gap-3 border-b border-border/40 px-4 transition-colors hover:bg-accent/40 ${
@@ -85,7 +88,7 @@ function BranchRow({ name, isCurrent, isRemote, aheadCount, behindCount, isMobil
       <div className={`flex shrink-0 items-center gap-1 ${isCurrent ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity`}>
         {isCurrent ? (
           <Check className="h-4 w-4 text-primary" />
-        ) : !isRemote ? (
+        ) : !isRemote && canMutate ? (
           <>
             <button
               onClick={onSwitch}
@@ -138,6 +141,7 @@ export default function BranchesView({
   onCreateBranch,
   onDeleteBranch,
   onRequestConfirmation,
+  canMutateBranches = false,
 }: BranchesViewProps) {
   const [showNewBranchModal, setShowNewBranchModal] = useState(false);
   const [branchSearchQuery, setBranchSearchQuery] = useState('');
@@ -192,13 +196,15 @@ export default function BranchesView({
         <span className="text-sm text-muted-foreground">
           {localBranches.length} local{remoteBranches.length > 0 ? `, ${remoteBranches.length} remote` : ''}
         </span>
-        <button
-          onClick={() => setShowNewBranchModal(true)}
-          className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20"
-        >
-          <Plus className="h-3.5 w-3.5" />
-          New branch
-        </button>
+        {canMutateBranches && (
+          <button
+            onClick={() => setShowNewBranchModal(true)}
+            className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            New branch
+          </button>
+        )}
       </div>
 
       {/* Branch search */}
@@ -238,6 +244,7 @@ export default function BranchesView({
                 isMobile={isMobile}
                 onSwitch={() => requestSwitch(branch)}
                 onDelete={() => requestDelete(branch)}
+                canMutate={canMutateBranches}
               />
             ))}
           </>
@@ -257,6 +264,7 @@ export default function BranchesView({
                 isMobile={isMobile}
                 onSwitch={() => requestSwitch(branch)}
                 onDelete={() => requestDelete(branch)}
+                canMutate={canMutateBranches}
               />
             ))}
           </>
@@ -271,7 +279,7 @@ export default function BranchesView({
       </div>
 
       <NewBranchModal
-        isOpen={showNewBranchModal}
+        isOpen={canMutateBranches && showNewBranchModal}
         currentBranch={currentBranch}
         isCreatingBranch={isCreatingBranch}
         onClose={() => setShowNewBranchModal(false)}

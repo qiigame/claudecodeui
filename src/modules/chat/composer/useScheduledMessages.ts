@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { api } from '@/shared/api';
 import type { ScheduledMessage } from '@/shared/types';
@@ -10,26 +10,108 @@ import type { ScheduledMessage } from '@/shared/types';
  * anything realtime: the list changes only when this client schedules or
  * cancels something, and it is refetched when the session is reopened.
  */
-export function useScheduledMessages(sessionId: string | null) {
-  const [scheduledMessages, setScheduledMessages] = useState<ScheduledMessage[]>([]);
+type UseScheduledMessagesOptions = {
+  /** Server-authorized ability to enqueue or cancel a future provider run. */
+  canSchedule?: boolean;
+};
+
+type ScheduledMessagesState = {
+  scope: ScheduledMessagesScope | null;
+  messages: ScheduledMessage[];
+};
+
+type ScheduledMessagesScope = {
+  key: string | null;
+  epoch: number;
+};
+
+export function useScheduledMessages(
+  sessionId: string | null,
+  // Omitted server capability state is denied by default. ChatInterface
+  // supplies the explicit value for writable developer sessions.
+  { canSchedule = false }: UseScheduledMessagesOptions = {},
+) {
+  const scopeKey = canSchedule && sessionId ? sessionId : null;
+  const scopeRef = useRef<ScheduledMessagesScope>({ key: scopeKey, epoch: 0 });
+  if (scopeRef.current.key !== scopeKey) {
+    // A new object makes A -> B -> A a new lifetime even though the string key
+    // eventually repeats; late work from the first A must never touch the last.
+    scopeRef.current = {
+      key: scopeKey,
+      epoch: scopeRef.current.epoch + 1,
+    };
+  }
+  const scope = scopeRef.current;
+  const requestGenerationRef = useRef(0);
+  const activeListRequestRef = useRef<AbortController | null>(null);
+  // Keep the list tagged with the session/capability lifetime so a render that
+  // switches sessions never briefly displays the previous session's entries.
+  const [scheduledState, setScheduledState] = useState<ScheduledMessagesState>({
+    scope: null,
+    messages: [],
+  });
 
   const refresh = useCallback(async () => {
-    if (!sessionId) {
-      setScheduledMessages([]);
+    // A refresh function retained by an old render must not cancel or replace
+    // a request belonging to the current session.
+    if (scopeRef.current !== scope) {
       return;
     }
 
-    try {
-      const response = await api.scheduledMessages.list(sessionId);
-      const payload = await response.json();
-      setScheduledMessages(Array.isArray(payload?.data) ? payload.data : []);
-    } catch (error) {
-      console.error('Failed to load scheduled messages:', error);
+    const generation = requestGenerationRef.current + 1;
+    requestGenerationRef.current = generation;
+    activeListRequestRef.current?.abort();
+    activeListRequestRef.current = null;
+
+    if (!scopeKey) {
+      setScheduledState({ scope: null, messages: [] });
+      return;
     }
-  }, [sessionId]);
+
+    const controller = new AbortController();
+    activeListRequestRef.current = controller;
+
+    try {
+      const response = await api.scheduledMessages.list(scopeKey, {
+        signal: controller.signal,
+      });
+      const payload = await response.json();
+      if (
+        controller.signal.aborted
+        || requestGenerationRef.current !== generation
+        || scopeRef.current !== scope
+        || activeListRequestRef.current !== controller
+      ) {
+        return;
+      }
+      setScheduledState({
+        scope,
+        messages: Array.isArray(payload?.data) ? payload.data : [],
+      });
+    } catch (error) {
+      if (
+        controller.signal.aborted
+        || requestGenerationRef.current !== generation
+        || scopeRef.current !== scope
+        || activeListRequestRef.current !== controller
+      ) {
+        return;
+      }
+      console.error('Failed to load scheduled messages:', error);
+    } finally {
+      if (activeListRequestRef.current === controller) {
+        activeListRequestRef.current = null;
+      }
+    }
+  }, [scope, scopeKey]);
 
   useEffect(() => {
     void refresh();
+    return () => {
+      requestGenerationRef.current += 1;
+      activeListRequestRef.current?.abort();
+      activeListRequestRef.current = null;
+    };
   }, [refresh]);
 
   const schedule = useCallback(async (input: {
@@ -37,11 +119,11 @@ export function useScheduledMessages(sessionId: string | null) {
     scheduledFor: Date;
     options?: Record<string, unknown>;
   }) => {
-    if (!sessionId) return false;
+    if (!scopeKey || scopeRef.current !== scope) return false;
 
     try {
       const response = await api.scheduledMessages.create({
-        sessionId,
+        sessionId: scopeKey,
         content: input.content,
         scheduledFor: input.scheduledFor.toISOString(),
         options: input.options,
@@ -49,22 +131,36 @@ export function useScheduledMessages(sessionId: string | null) {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
+      // The mutation may have succeeded while the user navigated away. Do not
+      // refresh the new session or report success to a composer that could
+      // otherwise clear its newly entered text.
+      if (scopeRef.current !== scope) {
+        return false;
+      }
       await refresh();
-      return true;
+      return scopeRef.current === scope;
     } catch (error) {
       console.error('Failed to schedule message:', error);
       return false;
     }
-  }, [refresh, sessionId]);
+  }, [refresh, scope, scopeKey]);
 
   const cancel = useCallback(async (id: string) => {
+    if (!scopeKey || scopeRef.current !== scope) return;
+
     try {
       await api.scheduledMessages.cancel(id);
     } catch (error) {
       console.error('Failed to cancel scheduled message:', error);
     }
-    await refresh();
-  }, [refresh]);
+    if (scopeRef.current === scope) {
+      await refresh();
+    }
+  }, [refresh, scope, scopeKey]);
+
+  const scheduledMessages = scheduledState.scope === scope
+    ? scheduledState.messages
+    : [];
 
   return { scheduledMessages, schedule, cancel, refresh };
 }

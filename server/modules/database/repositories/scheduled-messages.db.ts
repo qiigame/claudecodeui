@@ -109,6 +109,23 @@ export const scheduledMessagesDb = {
       .run(reason.slice(0, 500), id);
   },
 
+  /**
+   * Returns a claimed message to the pending queue when admission is
+   * temporarily blocked (for example, a DingTalk identity is awaiting
+   * verification).  This is deliberately narrower than markFailed: a
+   * provider/session failure remains terminal and visible to the user, while
+   * an identity enrollment must not silently consume a scheduled turn.
+   */
+  restorePending(id: string): void {
+    getConnection()
+      .prepare(
+        `UPDATE scheduled_messages
+         SET status = 'pending', failure_reason = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND status = 'sent'`
+      )
+      .run(id);
+  },
+
   /** Cancels a pending message. Returns false when it had already fired. */
   cancel(userId: number, id: string): boolean {
     const result = getConnection()

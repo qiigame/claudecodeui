@@ -40,6 +40,26 @@ export const APP_VERSION: string = typeof __APP_VERSION__ === 'string' ? __APP_V
 
 // ---------------------------
 
+//----------------- AUTHENTICATION STORAGE ------------
+
+/** Browser storage key containing the active self-hosted JWT shared between tabs. */
+export const AUTH_TOKEN_STORAGE_KEY = 'auth-token';
+
+/** Browser storage key identifying one login lifetime, even when two JWT strings happen to match. */
+export const AUTH_SESSION_EPOCH_STORAGE_KEY = 'auth-session-epoch';
+
+// ---------------------------
+
+//----------------- COMIC RUNTIME MODE ------------
+
+/**
+ * Runtimes available in the focused comic workspace experience. The chat
+ * empty state and persisted-provider reader share this allowlist.
+ */
+export const COMIC_RUNTIME_PROVIDERS: readonly LLMProvider[] = ['codex', 'claude'];
+
+// ---------------------------
+
 //----------------- SETTINGS NAVIGATION ------------
 
 /** Shape of one entry in `SETTINGS_MAIN_TABS`; only that constant needs it. */
