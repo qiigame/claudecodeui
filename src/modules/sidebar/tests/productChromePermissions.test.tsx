@@ -20,6 +20,7 @@ const deploymentState = vi.hoisted(() => ({
 
 vi.mock('@/modules/auth', () => ({
   useAuth: () => authState,
+  isManagedIdentityRestricted: () => false,
 }));
 
 vi.mock('@/shared/context/DeploymentPolicyContext', () => ({

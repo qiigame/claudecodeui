@@ -7,6 +7,14 @@ import { afterEach, beforeEach, test, vi } from 'vitest';
 import CommandPalette from '@/modules/command-palette/CommandPalette';
 import type { Project } from '@/shared/types';
 
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, options?: { label?: string }) => key === 'commandPalette.settingsItem'
+      ? `Settings: ${options?.label ?? ''}`
+      : key,
+  }),
+}));
+
 const authState = vi.hoisted(() => ({ canManageSettings: false }));
 const deploymentState = vi.hoisted(() => ({
   isReadOnly: true,
@@ -15,6 +23,7 @@ const deploymentState = vi.hoisted(() => ({
 
 vi.mock('@/modules/auth', () => ({
   useAuth: () => authState,
+  isManagedIdentityRestricted: () => false,
 }));
 
 vi.mock('@/shared/context/DeploymentPolicyContext', () => ({

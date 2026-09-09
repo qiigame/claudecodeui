@@ -26,7 +26,7 @@ test('switching sessions clears the previous session\'s scheduled messages immed
   vi.spyOn(api.scheduledMessages, 'list').mockImplementation(async (sessionId?: string) =>
     listResponse(sessionId === 'session-a' ? [MESSAGE_A] : []));
 
-  const { result, rerender } = renderHook(({ sessionId }) => useScheduledMessages(sessionId), {
+  const { result, rerender } = renderHook(({ sessionId }) => useScheduledMessages(sessionId, { canSchedule: true }), {
     initialProps: { sessionId: 'session-a' },
   });
   await waitFor(() => assert.equal(result.current.scheduledMessages.length, 1));
@@ -48,7 +48,7 @@ test('a slow fetch for the previous session cannot land on the next one', async 
     return Promise.resolve(listResponse([]));
   });
 
-  const { result, rerender } = renderHook(({ sessionId }) => useScheduledMessages(sessionId), {
+  const { result, rerender } = renderHook(({ sessionId }) => useScheduledMessages(sessionId, { canSchedule: true }), {
     initialProps: { sessionId: 'session-a' },
   });
   rerender({ sessionId: 'session-b' });

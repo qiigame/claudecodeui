@@ -36,6 +36,7 @@ test('TaskMaster setup launches the installed CLI without npm package resolution
         isStarred: false,
         sessions: [],
       } as TaskMasterProject}
+      canMutate
       onClose={() => undefined}
     />,
   );
