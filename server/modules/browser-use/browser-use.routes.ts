@@ -1,4 +1,4 @@
-import express, { type RequestHandler } from 'express';
+import express, { type RequestHandler, type Response } from 'express';
 
 import {
   captureDeploymentPolicy,

@@ -317,7 +317,7 @@ test('PRD templates require project read capability and remain available to prod
       deploymentPolicy,
       resolveProjectPathById: () => null,
       taskmasterService: {
-        detectMcpServer: async () => ({ hasMCPServer: false }),
+        detectMcpServer: async () => ({ hasMCPServer: false, reason: 'Not configured', hasConfig: false }),
       },
     });
 
@@ -373,7 +373,7 @@ test('managed writable actors do not receive an absolute path from PRD success r
     deploymentPolicy: developerPolicy,
     resolveProjectPathById: () => projectPath,
     taskmasterService: {
-      detectMcpServer: async () => ({ hasMCPServer: false }),
+      detectMcpServer: async () => ({ hasMCPServer: false, reason: 'Not configured', hasConfig: false }),
     },
   });
   const app = express();

@@ -233,7 +233,7 @@ test('a repointed session does not reuse or overwrite a pending load from its ol
     firstRelease!();
     await firstRequest;
 
-    assert.equal(second.messages[0]?.id, 'second');
+    assert.equal(second?.messages[0]?.id, 'second');
     // The newer path remains the cache winner after the stale first read ends.
     const cachedSecond = await cache.getFullHistory({
       sessionId: 'repointed-session',

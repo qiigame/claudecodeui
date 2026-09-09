@@ -22,6 +22,10 @@ const MAX_ATTACHMENT_FILE_COUNT = 10;
 const INVALID_IMAGE_FILE_TYPE_MESSAGE =
   'Invalid file type. Only JPEG, PNG, GIF, WebP, and SVG are allowed.';
 
+const readFilename = (value: string | string[] | undefined): string => (
+  Array.isArray(value) ? value[0] ?? '' : value ?? ''
+);
+
 // Multer writes uploads straight into the global assets folder; the service
 // owns the folder location and the response record shape.
 const storage = multer.diskStorage({
@@ -184,7 +188,8 @@ export function createAssetsRouter(
    * global assets folder are reachable; traversal attempts resolve to null.
    */
   router.get('/images/:filename', assetReadCapabilityGuard, async (req, res) => {
-    const asset = await openStoredAttachmentAsset(req.params.filename);
+    const filename = readFilename(req.params.filename);
+    const asset = await openStoredAttachmentAsset(filename);
     if (asset.status === 'invalid') {
       return res.status(400).json({ error: 'Invalid asset filename' });
     }
@@ -227,7 +232,8 @@ export function createAssetsRouter(
    * uploaded HTML or other active formats from rendering in the application.
    */
   router.get('/files/:filename', assetReadCapabilityGuard, async (req, res) => {
-    const asset = await openStoredAttachmentAsset(req.params.filename);
+    const filename = readFilename(req.params.filename);
+    const asset = await openStoredAttachmentAsset(filename);
     if (asset.status === 'invalid') {
       return res.status(400).json({ error: 'Invalid asset filename' });
     }
@@ -237,7 +243,7 @@ export function createAssetsRouter(
 
     res.setHeader('Content-Type', asset.contentType);
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Disposition', `attachment; filename="${req.params.filename.replace(/["\r\n]/g, '_')}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/["\r\n]/g, '_')}"`);
     asset.stream.pipe(res);
     asset.stream.on('error', (error) => {
       console.error('Error streaming attachment asset:', error);

@@ -28,6 +28,7 @@ import {
   readObjectRecord,
   readFirstJsonlRecordFromHandle,
   resolveCodexHomeDirectory,
+  validateProviderTranscriptRecord,
   sliceTailPage,
   truncateSubagentActivity,
 } from '@/shared/utils.js';

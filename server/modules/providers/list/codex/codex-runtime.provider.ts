@@ -13,6 +13,7 @@
 
 import { Codex } from '@openai/codex-sdk';
 import type { ModelReasoningEffort, Thread, ThreadOptions } from '@openai/codex-sdk';
+import type { AnyRecord, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/types.js';
 
 import {
   appendFilesInputTag,
@@ -286,7 +287,7 @@ async function queryCodex(
   // Session-map key: the app session id when the caller supplied one, else
   // the provider-native thread id once captured (legacy/direct API callers).
   const sessionKey = () => sessionId || capturedSessionId || null;
-  const sendTerminalComplete = (message) => {
+  const sendTerminalComplete = (message: Parameters<typeof createCompleteMessage>[0]) => {
     if (terminalCompleteSent) {
       return false;
     }
@@ -324,7 +325,7 @@ async function queryCodex(
         && typeof options.executionEnvironment === 'object'
         ? options.executionEnvironment
         : {};
-    const runtimeClientOptions = runtimeBridge?.clientOptions || {};
+    const runtimeClientOptions: AnyRecord = (runtimeBridge?.clientOptions ?? {}) as AnyRecord;
     // Host Codex configuration may contain arbitrary MCP commands. A
     // product/QA turn must not inherit those commands because the SDK can
     // execute them outside the filesystem sandbox. Keep the bridge's normal
@@ -345,7 +346,7 @@ async function queryCodex(
     // hidden from a read-only model.
     const readonlyCredentialKeys = deploymentReadOnly
       ? Object.values(safeRuntimeClientOptions.config?.model_providers || {})
-        .map((provider) => provider?.env_key)
+        .map((provider) => (provider as AnyRecord)?.env_key)
         .filter((key) => typeof key === 'string' && key.trim())
       : [];
     codex = new Codex({
@@ -369,7 +370,7 @@ async function queryCodex(
       networkAccessEnabled,
       webSearchMode,
       model: runtimeModel,
-      modelReasoningEffort: resolvedEffort,
+      modelReasoningEffort: resolvedEffort as ModelReasoningEffort | undefined,
       // Uploaded images and ordinary attachments live in the server-owned
       // asset store, outside the project snapshot. Codex's read-only sandbox
       // must receive that directory explicitly; without --add-dir the prompt

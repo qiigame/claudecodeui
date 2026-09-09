@@ -201,7 +201,7 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
         ? {
           sessionId,
           projectPath,
-          isSubagent: this.isSubagentSessionMeta(payload),
+          isSubagent: this.isSubagentSessionMeta(payload ?? {}),
         }
         : null;
       if (!metadata || metadata.isSubagent) {

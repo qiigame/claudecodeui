@@ -272,7 +272,7 @@ const extractClaudeModelFromMessageContent = (content: unknown): string | null =
   return null;
 };
 
-const readClaudeSessionModelFromContent = (
+const readClaudeSessionModelFromContent = async (
   sessionId: string,
   content: string,
 ): Promise<ProviderCurrentActiveModel | null> => {
@@ -410,7 +410,7 @@ export class ClaudeProviderModels implements IProviderModels {
           if (authenticated) {
             try {
               const content = await authenticated.handle.readFile({ encoding: 'utf8' });
-              activeModel = readClaudeSessionModelFromContent(providerSessionId, content);
+              activeModel = await readClaudeSessionModelFromContent(providerSessionId, content);
             } finally {
               await closeProviderTranscriptReadHandle(authenticated.handle);
             }
@@ -425,7 +425,7 @@ export class ClaudeProviderModels implements IProviderModels {
             expectedProjectPath,
           });
           activeModel = validated
-            ? readClaudeSessionModelFromContent(providerSessionId, await readFile(validated, 'utf8'))
+            ? await readClaudeSessionModelFromContent(providerSessionId, await readFile(validated, 'utf8'))
             : null;
         }
       }

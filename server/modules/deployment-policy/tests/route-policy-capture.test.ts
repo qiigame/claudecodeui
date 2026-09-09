@@ -216,7 +216,7 @@ test('TaskMaster external capability guards receive one startup policy and honor
     }) as never,
     resolveProjectPathById: () => '/workspace/project',
     taskmasterService: {
-      detectMcpServer: async () => ({ hasMCPServer: false }),
+        detectMcpServer: async () => ({ hasMCPServer: false, reason: 'Not configured', hasConfig: false }),
     },
     deploymentPolicy: () => {
       sourceCalls += 1;

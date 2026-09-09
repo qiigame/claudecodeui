@@ -655,7 +655,7 @@ async function resolveClaudeTranscriptPath(
       : '';
     return transcriptCwd
       && normalizeProjectPath(transcriptCwd) === normalizeProjectPath(expectedProjectPath)
-      ? validated
+      ? { canonicalPath: validated }
       : null;
   };
 

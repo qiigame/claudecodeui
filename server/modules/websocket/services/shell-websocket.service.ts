@@ -373,7 +373,7 @@ function assertReadonlyProviderExecutable(
     ...(dependencies.allowedReadOnlyProviderExecutables ?? []),
     ...(bundled ? [bundled] : []),
   ]);
-  if (explicitlyAllowed.includes(normalized)) {
+  if (explicitlyAllowed.has(normalized)) {
     return normalized;
   }
 

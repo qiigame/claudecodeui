@@ -8,7 +8,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
-import express from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 
 import {
   createDeploymentPolicyMiddleware,
@@ -169,8 +169,9 @@ test('Git fetch has an independent capability while pull still requires Git writ
     capabilityGuard,
   });
   const app = express().use(express.json()).use('/api/git', router);
-  app.use((error: unknown, _request, response, _next) => {
-    response.status(error?.statusCode ?? 500).json({ code: error?.code ?? 'UNKNOWN' });
+  app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
+    const details = error && typeof error === 'object' ? error as { statusCode?: number; code?: string } : {};
+    response.status(details.statusCode ?? 500).json({ code: details.code ?? 'UNKNOWN' });
   });
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -239,8 +240,9 @@ test('Git read routes require git.read before resolving or spawning a repository
     },
   });
   const app = express().use(express.json()).use('/api/git', router);
-  app.use((error: unknown, _request, response, _next) => {
-    response.status(error?.statusCode ?? 500).json({ code: error?.code ?? 'UNKNOWN' });
+  app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
+    const details = error && typeof error === 'object' ? error as { statusCode?: number; code?: string } : {};
+    response.status(details.statusCode ?? 500).json({ code: details.code ?? 'UNKNOWN' });
   });
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');

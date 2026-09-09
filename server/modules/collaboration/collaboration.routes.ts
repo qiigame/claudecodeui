@@ -15,7 +15,6 @@ import {
 } from '@/shared/utils.js';
 import { extractBearerToken } from '@/shared/bearer-token.js';
 import {
-  captureDeploymentPolicy,
   createDeploymentPolicyGuard,
   parseDeploymentPolicy,
   type DeploymentPolicy,

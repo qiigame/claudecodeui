@@ -29,7 +29,7 @@ function captureDeploymentPolicy(
 }
 
 function readText(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
+  return Array.isArray(value) ? readText(value[0]) : typeof value === 'string' ? value.trim() : '';
 }
 
 function sanitizeEndpoint(endpoint: any) {
@@ -125,7 +125,8 @@ export function createNotificationsRouter(
 
   router.patch('/endpoints/:channel/:endpointId', sessionWriteGuard, (req, res) => {
   try {
-    const { channel, endpointId } = req.params;
+    const channel = readText(req.params.channel);
+    const endpointId = readText(req.params.endpointId);
     const { enabled } = req.body || {};
     if (typeof enabled !== 'boolean') {
       return res.status(400).json({ error: 'enabled must be a boolean' });
@@ -148,7 +149,8 @@ export function createNotificationsRouter(
 
   router.delete('/endpoints/:channel/:endpointId', sessionWriteGuard, (req, res) => {
   try {
-    const { channel, endpointId } = req.params;
+    const channel = readText(req.params.channel);
+    const endpointId = readText(req.params.endpointId);
     const userId = readUserId(req);
     const removed = notificationChannelEndpointsDb.removeEndpoint(userId, channel, endpointId);
     if (!removed) {
