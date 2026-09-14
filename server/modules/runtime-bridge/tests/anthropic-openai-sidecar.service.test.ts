@@ -418,7 +418,7 @@ test('repairs only unresolved scoped definition pointers and preserves other ref
       },
     },
     {
-      name: 'percent-encoded slash in nested definition',
+      name: 'percent-encoded slash does not escape a definition name',
       schema: {
         type: 'object',
         properties: {
@@ -428,12 +428,55 @@ test('repairs only unresolved scoped definition pointers and preserves other ref
           },
         },
       },
+    },
+    {
+      name: 'percent-encoded pointer escape addresses a slash in a definition name',
+      schema: {
+        type: 'object',
+        properties: {
+          scoped: {
+            definitions: { 'value/name': { type: 'string' } },
+            $ref: '#/definitions/value%7E1name',
+          },
+        },
+      },
       expected: {
         type: 'object',
         properties: {
           scoped: {
             definitions: { 'value/name': { type: 'string' } },
             $ref: '#/properties/scoped/definitions/value~1name',
+          },
+        },
+      },
+    },
+    {
+      name: 'percent-encoded root separators retain the valid root target',
+      schema: {
+        definitions: { value: { properties: { name: { type: 'integer' } } } },
+        properties: {
+          scoped: {
+            definitions: { 'value/properties/name': { type: 'string' } },
+            $ref: '#/definitions/value%2Fproperties%2Fname',
+          },
+        },
+      },
+    },
+    {
+      name: 'percent-encoded separators resolve a nested scoped pointer',
+      schema: {
+        properties: {
+          scoped: {
+            definitions: { value: { properties: { name: { type: 'integer' } } } },
+            $ref: '#/definitions/value%2Fproperties%2Fname',
+          },
+        },
+      },
+      expected: {
+        properties: {
+          scoped: {
+            definitions: { value: { properties: { name: { type: 'integer' } } } },
+            $ref: '#/properties/scoped/definitions/value/properties/name',
           },
         },
       },

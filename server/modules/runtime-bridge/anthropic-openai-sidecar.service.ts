@@ -352,20 +352,15 @@ function normalizeOpenAiToolSchema(
   if (reference?.startsWith('#/$defs/') || reference?.startsWith('#/definitions/')) {
     let segments: string[] = [];
     try {
-      // Split the raw fragment before decoding each token. A definition name
-      // may legitimately contain an encoded slash (`%2F`); decoding the whole
-      // fragment first would mistake that slash for a JSON Pointer separator.
-      const rawSegments = reference.slice(2).split('/');
-      const decodedSegments: string[] = [];
-      for (const rawSegment of rawSegments) {
-        const segment = decodeURIComponent(rawSegment);
-        if (/~(?:[^01]|$)/.test(segment)) {
-          decodedSegments.length = 0;
-          break;
-        }
-        decodedSegments.push(segment.replaceAll('~1', '/').replaceAll('~0', '~'));
+      // RFC 6901 sections 3 and 6: decode the URI fragment before parsing the
+      // JSON Pointer. An encoded slash is a path separator; a slash within a
+      // definition name must use the JSON Pointer escape `~1`.
+      const source = decodeURIComponent(reference.slice(2));
+      if (!/~(?:[^01]|$)/.test(source)) {
+        segments = source.split('/').map((segment) => (
+          segment.replaceAll('~1', '/').replaceAll('~0', '~')
+        ));
       }
-      segments = decodedSegments;
     } catch {
       // Malformed URI escapes are left for the upstream validator.
     }
