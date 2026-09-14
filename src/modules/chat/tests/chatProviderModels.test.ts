@@ -23,6 +23,7 @@ const providerModelsRequest = vi.fn((_provider: string) => okJson({
   success: true,
   data: null,
 }));
+const providerCapabilitiesRequest = vi.fn(() => okJson({ success: true, data: null }));
 
 vi.mock('@/shared/api', () => ({
   api: {
@@ -34,7 +35,7 @@ vi.mock('@/shared/api', () => ({
     },
     providers: {
       models: (provider: string) => providerModelsRequest(provider),
-      capabilities: () => okJson({ success: true, data: null }),
+      capabilities: () => providerCapabilitiesRequest(),
       sessionActiveModel: () => okJson({ success: true, data: null }),
       setSessionActiveModel: () => okJson({ success: true, data: null }),
       setSessionActiveEffort: () => okJson({ success: true, data: null }),
@@ -48,18 +49,24 @@ vi.mock('@/shared/api', () => ({
 const renderProviderState = async (
   readOnly = false,
   selectedSession: Pick<ProjectSession, 'id' | 'provider' | '__provider'> | null = null,
+  options: {
+    defaultPermissionMode?: 'default' | 'bypassPermissions';
+    newSessionTrigger?: number;
+  } = {},
 ) => {
   const { useChatProviderState } = await import(
     '@/modules/chat/hooks/useChatProviderState'
   );
-  return renderHook(() =>
-    useChatProviderState({ selectedSession, selectedProject: null, readOnly }),
+  return renderHook((props) =>
+    useChatProviderState({ ...props, selectedProject: null }),
+    { initialProps: { selectedSession, readOnly, ...options } },
   );
 };
 
 beforeEach(() => {
   localStorage.clear();
   providerModelsRequest.mockClear();
+  providerCapabilitiesRequest.mockReset().mockImplementation(() => okJson({ success: true, data: null }));
   // The preference store is a module-level singleton, so its in-memory copy
   // outlives localStorage.clear() and would leak one test's writes into the next.
   resetUserPreferences();
@@ -67,6 +74,128 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.resetModules();
+});
+
+test('a configured developer default applies to each new chat without overwriting an existing session', async () => {
+  writeUserPreference('selectedProvider', 'codex');
+  localStorage.setItem('permissionMode-last-codex', 'default');
+  localStorage.setItem('permissionMode-existing-session', 'acceptEdits');
+  const options = { defaultPermissionMode: 'bypassPermissions' as const, newSessionTrigger: 1 };
+  const { result, rerender } = await renderProviderState(false, null, options);
+
+  await waitFor(() => assert.equal(result.current.permissionMode, 'bypassPermissions'));
+  act(() => result.current.selectPermissionMode('default'));
+  assert.equal(result.current.permissionMode, 'default');
+
+  // Repeated new-chat intent matters even when the composer has no session ID.
+  rerender({ selectedSession: null, readOnly: false, ...options, newSessionTrigger: 2 });
+  await waitFor(() => assert.equal(result.current.permissionMode, 'bypassPermissions'));
+
+  rerender({
+    selectedSession: { id: 'existing-session', __provider: 'codex' },
+    readOnly: false,
+    ...options,
+  });
+  await waitFor(() => assert.equal(result.current.permissionMode, 'acceptEdits'));
+});
+
+test('the first send pins its current permission mode before the session ID handoff', async () => {
+  writeUserPreference('selectedProvider', 'codex');
+  localStorage.setItem('permissionMode-last-codex', 'default');
+  const options = { defaultPermissionMode: 'bypassPermissions' as const };
+  const { result, rerender } = await renderProviderState(false, null, options);
+
+  await waitFor(() => assert.equal(result.current.permissionMode, 'bypassPermissions'));
+  act(() => result.current.pinPermissionModeForSession('created-session'));
+  rerender({
+    selectedSession: { id: 'created-session', __provider: 'codex' },
+    readOnly: false,
+    ...options,
+  });
+
+  await waitFor(() => assert.equal(result.current.permissionMode, 'bypassPermissions'));
+  assert.equal(localStorage.getItem('permissionMode-created-session'), 'bypassPermissions');
+  assert.equal(localStorage.getItem('permissionMode-last-codex'), 'default');
+});
+
+test('a late provider capability response preserves the mode explicitly chosen for an unsent draft', async () => {
+  writeUserPreference('selectedProvider', 'codex');
+  let resolveCapabilities!: (response: Awaited<ReturnType<typeof okJson>>) => void;
+  providerCapabilitiesRequest.mockReturnValue(new Promise((resolve) => { resolveCapabilities = resolve; }));
+  const { result } = await renderProviderState(false, null, { defaultPermissionMode: 'bypassPermissions' });
+
+  await waitFor(() => assert.equal(result.current.permissionMode, 'bypassPermissions'));
+  act(() => result.current.selectPermissionMode('acceptEdits'));
+  await act(async () => resolveCapabilities(await okJson({
+    success: true,
+    data: {
+      providers: [{
+        provider: 'codex',
+        permissionModes: ['default', 'acceptEdits', 'bypassPermissions'],
+        defaultPermissionMode: 'default',
+      }],
+    },
+  })));
+
+  assert.equal(result.current.permissionMode, 'acceptEdits');
+  act(() => result.current.pinPermissionModeForSession('chosen-session'));
+  assert.equal(localStorage.getItem('permissionMode-chosen-session'), 'acceptEdits');
+});
+
+test('the deployment default cannot select a mode excluded by provider capabilities', async () => {
+  writeUserPreference('selectedProvider', 'codex');
+  providerCapabilitiesRequest.mockImplementation(() => okJson({
+    success: true,
+    data: {
+      providers: [{
+        provider: 'codex',
+        permissionModes: ['default'],
+        defaultPermissionMode: 'default',
+      }],
+    },
+  }));
+  const { result } = await renderProviderState(false, null, { defaultPermissionMode: 'bypassPermissions' });
+
+  await waitFor(() => assert.deepEqual(result.current.availablePermissionModes, ['default']));
+  assert.equal(result.current.permissionMode, 'default');
+});
+
+test('a temporary policy refresh restricts the draft without discarding its explicit choice', async () => {
+  writeUserPreference('selectedProvider', 'codex');
+  const { result, rerender } = await renderProviderState(false, null, { defaultPermissionMode: 'bypassPermissions' });
+  await waitFor(() => assert.equal(result.current.permissionMode, 'bypassPermissions'));
+  act(() => result.current.selectPermissionMode('acceptEdits'));
+
+  // Policy reloads fail closed while the server response is in flight.
+  rerender({ selectedSession: null, readOnly: true, defaultPermissionMode: 'default' });
+  await waitFor(() => assert.equal(result.current.permissionMode, 'default'));
+  assert.equal(result.current.availablePermissionModes.length, 0);
+
+  rerender({ selectedSession: null, readOnly: false, defaultPermissionMode: 'bypassPermissions' });
+  await waitFor(() => assert.equal(result.current.permissionMode, 'acceptEdits'));
+});
+
+test('read-only policy overrides the configured default, stored preference and attempted selection', async () => {
+  writeUserPreference('selectedProvider', 'codex');
+  localStorage.setItem('permissionMode-last-codex', 'bypassPermissions');
+  const { result } = await renderProviderState(true, null, { defaultPermissionMode: 'bypassPermissions' });
+
+  await waitFor(() => assert.equal(result.current.permissionMode, 'default'));
+  act(() => result.current.selectPermissionMode('bypassPermissions'));
+  act(() => result.current.pinPermissionModeForSession('readonly-session'));
+
+  assert.equal(result.current.permissionMode, 'default');
+  assert.equal(result.current.availablePermissionModes.length, 0);
+  assert.equal(result.current.resolvePermissionModeForProvider('codex', 'bypassPermissions'), 'default');
+  assert.equal(localStorage.getItem('permissionMode-readonly-session'), 'default');
+});
+
+test('an unconfigured deployment retains the provider preference used by the fork', async () => {
+  writeUserPreference('selectedProvider', 'codex');
+  localStorage.setItem('permissionMode-last-codex', 'acceptEdits');
+  const { result } = await renderProviderState();
+
+  await waitFor(() => assert.equal(result.current.permissionMode, 'acceptEdits'));
 });
 
 test('each provider gets its own model from its own storage key', async () => {

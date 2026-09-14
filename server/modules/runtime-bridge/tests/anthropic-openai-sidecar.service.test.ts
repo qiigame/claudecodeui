@@ -187,8 +187,36 @@ test('translates non-streaming Anthropic messages, tools, and usage without leak
           description: 'Echo a value.',
           input_schema: {
             type: 'object',
-            properties: { value: { type: 'string' } },
-            required: ['value'],
+            properties: {
+              payload: {
+                $schema: 'https://json-schema.org/draft/2020-12/schema',
+                $defs: {
+                  FilterRelation: {
+                    type: 'string',
+                    enum: ['and', 'or'],
+                  },
+                },
+                type: 'object',
+                properties: {
+                  relation: {
+                    $ref: '#/$defs/FilterRelation',
+                    description: 'How filters are combined.',
+                  },
+                  count: {
+                    type: 'integer',
+                    format: 'int32',
+                    additionalProperties: false,
+                  },
+                  anything: true,
+                  values: {
+                    type: 'array',
+                    items: true,
+                  },
+                },
+                required: ['relation'],
+              },
+            },
+            required: ['payload'],
           },
         }],
         tool_choice: { type: 'auto', disable_parallel_tool_use: true },
@@ -226,8 +254,33 @@ test('translates non-streaming Anthropic messages, tools, and usage without leak
         description: 'Echo a value.',
         parameters: {
           type: 'object',
-          properties: { value: { type: 'string' } },
-          required: ['value'],
+          properties: {
+            payload: {
+              $schema: 'https://json-schema.org/draft/2020-12/schema',
+              $defs: {
+                FilterRelation: { type: 'string', enum: ['and', 'or'] },
+              },
+              type: 'object',
+              properties: {
+                relation: {
+                  $ref: '#/properties/payload/$defs/FilterRelation',
+                  description: 'How filters are combined.',
+                },
+                count: {
+                  type: 'integer',
+                  format: 'int32',
+                  additionalProperties: false,
+                },
+                anything: true,
+                values: {
+                  type: 'array',
+                  items: true,
+                },
+              },
+              required: ['relation'],
+            },
+          },
+          required: ['payload'],
         },
       },
     }]);
@@ -265,6 +318,215 @@ test('translates non-streaming Anthropic messages, tools, and usage without leak
   } finally {
     await close(bridge);
     await close(upstream);
+  }
+});
+
+test('preserves valid root references, recursive constraints, booleans and literal defaults', async () => {
+  let upstreamBody: JsonRecord | undefined;
+  const upstream = http.createServer((request, response) => {
+    void (async () => {
+      upstreamBody = await readJsonBody(request);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }));
+    })();
+  });
+  const upstreamUrl = await listen(upstream);
+  const bridge = createAnthropicOpenAiBridgeServer({ upstreamBaseUrl: `${upstreamUrl}/v1` });
+  const bridgeUrl = await listen(bridge);
+  const literal = { format: 'literal', $defs: { type: 'keep' }, $ref: '#/literal' };
+
+  try {
+    const response = await fetch(`${bridgeUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'schema-test-token' },
+      body: JSON.stringify({
+        model: 'schema-test-model',
+        messages: [{ role: 'user', content: 'Inspect schemas.' }],
+        tools: [{
+          name: 'inspect',
+          input_schema: {
+            type: 'object',
+            definitions: {
+              'with/slash': { type: 'string', enum: ['ready'] },
+              Node: { type: 'object', properties: { next: { $ref: '#/definitions/Node' } } },
+            },
+            properties: {
+              label: { $ref: '#/definitions/with~1slash', description: 'Label.' },
+              tree: { $ref: '#/definitions/Node' },
+              payload: { type: 'object', default: literal, enum: [literal] },
+              excluded: false,
+              allowed: { not: false },
+              condition: { if: false, then: false, else: true },
+            },
+            additionalProperties: false,
+          },
+        }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamBody?.tools, [{
+      type: 'function',
+      function: {
+        name: 'inspect',
+        parameters: {
+          type: 'object',
+          definitions: {
+            'with/slash': { type: 'string', enum: ['ready'] },
+            Node: { type: 'object', properties: { next: { $ref: '#/definitions/Node' } } },
+          },
+          properties: {
+            label: { $ref: '#/definitions/with~1slash', description: 'Label.' },
+            tree: { $ref: '#/definitions/Node' },
+            payload: { type: 'object', default: literal, enum: [literal] },
+            excluded: false,
+            allowed: { not: false },
+            condition: { if: false, then: false, else: true },
+          },
+          additionalProperties: false,
+        },
+      },
+    }]);
+  } finally {
+    await close(bridge);
+    await close(upstream);
+  }
+});
+
+test('repairs only unresolved scoped definition pointers and preserves other reference boundaries', async () => {
+  const cases: Array<{ name: string; schema: JsonRecord; expected?: JsonRecord }> = [
+    {
+      name: 'escaped nested definition',
+      schema: {
+        type: 'object',
+        properties: {
+          'with/slash': {
+            definitions: { 'value/name': { type: 'string' } },
+            $ref: '#/definitions/value~1name',
+            enum: ['restricted'],
+          },
+        },
+      },
+      expected: {
+        type: 'object',
+        properties: {
+          'with/slash': {
+            definitions: { 'value/name': { type: 'string' } },
+            $ref: '#/properties/with~1slash/definitions/value~1name',
+            enum: ['restricted'],
+          },
+        },
+      },
+    },
+    {
+      name: 'percent-encoded slash in nested definition',
+      schema: {
+        type: 'object',
+        properties: {
+          scoped: {
+            definitions: { 'value/name': { type: 'string' } },
+            $ref: '#/definitions/value%2Fname',
+          },
+        },
+      },
+      expected: {
+        type: 'object',
+        properties: {
+          scoped: {
+            definitions: { 'value/name': { type: 'string' } },
+            $ref: '#/properties/scoped/definitions/value~1name',
+          },
+        },
+      },
+    },
+    {
+      name: 'valid root reference wins over a same-name local definition',
+      schema: {
+        $defs: { Entry: { type: 'integer' } },
+        properties: {
+          scoped: { $defs: { Entry: { type: 'string' } }, $ref: '#/$defs/Entry' },
+        },
+      },
+    },
+    {
+      name: 'nested recursive reference retains recursion',
+      schema: {
+        properties: {
+          tree: {
+            $defs: { Node: { properties: { next: { $ref: '#/$defs/Node' } } } },
+            $ref: '#/$defs/Node',
+          },
+        },
+      },
+      expected: {
+        properties: {
+          tree: {
+            $defs: {
+              Node: { properties: { next: { $ref: '#/properties/tree/$defs/Node' } } },
+            },
+            $ref: '#/properties/tree/$defs/Node',
+          },
+        },
+      },
+    },
+    {
+      name: 'unresolved reference is not silently discarded',
+      schema: { type: 'object', properties: { unknown: { $ref: '#/$defs/Missing' } } },
+    },
+    {
+      name: 'malformed pointer escapes remain visible to upstream validation',
+      schema: {
+        properties: {
+          scoped: { $defs: { 'bad~2': { type: 'string' } }, $ref: '#/$defs/bad~2' },
+        },
+      },
+    },
+    {
+      name: 'nested resource keeps its own fragment base',
+      schema: {
+        properties: {
+          resource: {
+            $id: 'https://schemas.example.test/resource',
+            $defs: { Entry: { type: 'string' } },
+            $ref: '#/$defs/Entry',
+          },
+        },
+      },
+    },
+    {
+      name: 'external reference is not fetched or rewritten',
+      schema: { $ref: 'https://schemas.example.test/external', minLength: 3 },
+    },
+  ];
+  let upstreamBody: JsonRecord | undefined;
+  const bridge = createAnthropicOpenAiBridgeServer({}, {
+    fetchImpl: async (_input, init) => {
+      upstreamBody = JSON.parse(String(init?.body)) as JsonRecord;
+      return new Response(JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  const bridgeUrl = await listen(bridge);
+  try {
+    for (const fixture of cases) {
+      const response = await fetch(`${bridgeUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': 'schema-boundary-test-token' },
+        body: JSON.stringify({
+          model: 'schema-test-model',
+          messages: [{ role: 'user', content: 'Inspect the schema.' }],
+          tools: [{ name: 'inspect', input_schema: fixture.schema }],
+        }),
+      });
+      assert.equal(response.status, 200, fixture.name);
+      assert.deepEqual(upstreamBody?.tools, [{
+        type: 'function',
+        function: { name: 'inspect', parameters: fixture.expected ?? fixture.schema },
+      }], fixture.name);
+    }
+  } finally {
+    await close(bridge);
   }
 });
 

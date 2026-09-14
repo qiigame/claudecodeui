@@ -37,3 +37,6 @@ export {
   mountPreApiKeyCapabilityRoute,
   mountProtectedApiRoute,
 } from './protected-route-mount.js';
+
+// Server composition exposes the captured new-conversation preference to UI clients.
+export { resolveDefaultPermissionMode } from './session-defaults.service.js';

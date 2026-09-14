@@ -92,6 +92,10 @@ type ProviderCapabilitiesApiResponse = {
 type UseChatProviderStateArgs = {
   selectedSession: ProjectSession | null;
   selectedProject: Project | null;
+  /** Explicit new-chat intent, including starting again from an empty composer. */
+  newSessionTrigger?: number;
+  /** Server-owned startup preference. Existing session choices always take precedence. */
+  defaultPermissionMode?: 'default' | 'bypassPermissions';
   /**
    * Product/QA deployments expose only a server-managed, read-only runtime.
    * The provider capability endpoint still reports the full provider matrix,
@@ -149,9 +153,16 @@ const getSessionSelectionKey = (provider: LLMProvider, sessionId: string): strin
 export function useChatProviderState({
   selectedSession,
   selectedProject: _selectedProject,
+  newSessionTrigger,
+  defaultPermissionMode = 'default',
   readOnly = false,
 }: UseChatProviderStateArgs) {
+  // The displayed mode follows the selected session; read-only policy and
+  // provider capabilities clamp any stored or deployment-selected default.
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
+  // Preserve an explicit choice in an unsent draft when provider capabilities
+  // arrive later; a new-conversation intent clears this override below.
+  const draftPermissionChoiceRef = useRef<PermissionMode | null>(null);
   const [pendingPermissionRequests, setPendingPermissionRequests] = useState<PendingPermissionRequest[]>([]);
   // The provider the composer sends under. Held here rather than read from
   // storage per render because switching it has to reset the model menu, the
@@ -470,12 +481,26 @@ export function useChatProviderState({
   }, [providerEfforts, providerModelCatalog, providerModels, reconcileStoredEffort]);
 
   useEffect(() => {
+    draftPermissionChoiceRef.current = null;
+  }, [newSessionTrigger, provider, selectedSession?.id]);
+
+  useEffect(() => {
     const validModes = getPermissionModesForProvider(provider);
     if (readOnly) {
       // The server maps every provider run to its read-only sandbox. Keep the
       // browser-side payload equally conservative so a stale localStorage
       // value such as `bypassPermissions` cannot be replayed as metadata.
       setPermissionMode('default');
+      return;
+    }
+
+    if (!selectedSession?.id && defaultPermissionMode === 'bypassPermissions') {
+      // A deployment can explicitly choose the new-conversation default
+      // without changing existing sessions or the default fork behavior.
+      const requestedMode = draftPermissionChoiceRef.current ?? 'bypassPermissions';
+      setPermissionMode(validModes.includes(requestedMode)
+        ? requestedMode
+        : getDefaultPermissionModeForProvider(provider));
       return;
     }
 
@@ -491,7 +516,7 @@ export function useChatProviderState({
       (mode): mode is PermissionMode => Boolean(mode && validModes.includes(mode)),
     );
     setPermissionMode(savedMode ?? getDefaultPermissionModeForProvider(provider));
-  }, [readOnly, selectedSession?.id, provider, getDefaultPermissionModeForProvider, getPermissionModesForProvider]);
+  }, [defaultPermissionMode, newSessionTrigger, readOnly, selectedSession?.id, provider, getDefaultPermissionModeForProvider, getPermissionModesForProvider]);
 
   useEffect(() => {
     // API payloads from the current sessions endpoint use `__provider`, while
@@ -539,6 +564,9 @@ export function useChatProviderState({
     }
 
     setPermissionMode(nextMode);
+    if (!selectedSession?.id) {
+      draftPermissionChoiceRef.current = nextMode;
+    }
 
     // Persist per provider as well as per session: a brand-new chat has no
     // session id yet, and the per-provider key keeps the choice sticky when
@@ -548,6 +576,13 @@ export function useChatProviderState({
       localStorage.setItem(`permissionMode-${selectedSession.id}`, nextMode);
     }
   }, [provider, readOnly, selectedSession?.id]);
+
+  // The first send allocates a stable ID before navigation. Pin the current
+  // draft choice so an older provider preference cannot replace it when the
+  // newly created session becomes the selected session.
+  const pinPermissionModeForSession = useCallback((sessionId: string) => {
+    localStorage.setItem(`permissionMode-${sessionId}`, readOnly ? 'default' : permissionMode);
+  }, [permissionMode, readOnly]);
 
   const cyclePermissionMode = useCallback(() => {
     if (readOnly) {
@@ -953,6 +988,7 @@ export function useChatProviderState({
     setPendingPermissionRequests,
     availablePermissionModes,
     selectPermissionMode,
+    pinPermissionModeForSession,
     cyclePermissionMode,
     providerModelCatalog,
     providerModelsLoading,

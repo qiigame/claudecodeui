@@ -296,6 +296,117 @@ function convertSystemMessage(system: unknown): JsonRecord | null {
   return text ? { role: 'system', content: text } : null;
 }
 
+function encodeSchemaPointerToken(value: string): string {
+  return encodeURIComponent(value.replaceAll('~', '~0').replaceAll('/', '~1'));
+}
+
+function hasSchemaPointer(root: unknown, segments: readonly string[]): boolean {
+  let current = root;
+  for (const segment of segments) {
+    if ((!isRecord(current) && !Array.isArray(current))
+      || !Object.prototype.hasOwnProperty.call(current, segment)) {
+      return false;
+    }
+    current = (current as JsonRecord)[segment];
+  }
+  return true;
+}
+
+/**
+ * Repairs one MCP compatibility defect observed in the deployed bridge's
+ * regression fixture: a nested `$defs`/`definitions` table accompanied by a
+ * document-root reference to that local table. Rewrite only such unresolved
+ * root references to the actual definition pointer. Valid root references,
+ * recursive schemas, booleans, annotations and constraints remain intact.
+ * This is not a JSON Schema validator or a lossy upstream schema converter;
+ * unresolved/external references remain visible to the upstream validator.
+ */
+function normalizeOpenAiToolSchema(
+  value: unknown,
+  root: unknown = value,
+  pointer = '',
+  scopes: readonly { keyword: string; pointer: string; definitions: JsonRecord }[] = [],
+): unknown {
+  if (!isRecord(value)) {
+    return value;
+  }
+  // A nested $id starts a separate schema resource with its own fragment
+  // resolution rules. Leave it untouched instead of guessing a document-root
+  // pointer across that boundary.
+  if (pointer && readString(value.$id)) {
+    return value;
+  }
+  const localScopes = [...scopes];
+  for (const keyword of ['$defs', 'definitions']) {
+    if (isRecord(value[keyword])) {
+      localScopes.push({
+        keyword,
+        pointer: `${pointer}/${keyword}`,
+        definitions: value[keyword],
+      });
+    }
+  }
+
+  const normalized: JsonRecord = { ...value };
+  const reference = readString(value.$ref);
+  if (reference?.startsWith('#/$defs/') || reference?.startsWith('#/definitions/')) {
+    let segments: string[] = [];
+    try {
+      // Split the raw fragment before decoding each token. A definition name
+      // may legitimately contain an encoded slash (`%2F`); decoding the whole
+      // fragment first would mistake that slash for a JSON Pointer separator.
+      const rawSegments = reference.slice(2).split('/');
+      const decodedSegments: string[] = [];
+      for (const rawSegment of rawSegments) {
+        const segment = decodeURIComponent(rawSegment);
+        if (/~(?:[^01]|$)/.test(segment)) {
+          decodedSegments.length = 0;
+          break;
+        }
+        decodedSegments.push(segment.replaceAll('~1', '/').replaceAll('~0', '~'));
+      }
+      segments = decodedSegments;
+    } catch {
+      // Malformed URI escapes are left for the upstream validator.
+    }
+    if (segments.length > 1 && !hasSchemaPointer(root, segments)) {
+      const keyword = segments[0];
+      const definitionSegments = segments.slice(1);
+      const scope = [...localScopes].reverse().find((candidate) => (
+        candidate.keyword === keyword
+        && hasSchemaPointer(candidate.definitions, definitionSegments)
+      ));
+      if (scope) {
+        normalized.$ref = `#${scope.pointer}/${definitionSegments.map(encodeSchemaPointerToken).join('/')}`;
+      }
+    }
+  }
+
+  for (const [key, entry] of Object.entries(value)) {
+    const childPointer = `${pointer}/${encodeSchemaPointerToken(key)}`;
+    if (['$defs', 'definitions', 'properties', 'patternProperties', 'dependentSchemas'].includes(key)
+      && isRecord(entry)) {
+      normalized[key] = Object.fromEntries(Object.entries(entry).map(([name, schema]) => [
+        name,
+        normalizeOpenAiToolSchema(schema, root, `${childPointer}/${encodeSchemaPointerToken(name)}`, localScopes),
+      ]));
+    } else if (['allOf', 'anyOf', 'oneOf', 'prefixItems', 'items'].includes(key)
+      && Array.isArray(entry)) {
+      normalized[key] = entry.map((schema, index) => (
+        normalizeOpenAiToolSchema(schema, root, `${childPointer}/${index}`, localScopes)
+      ));
+    } else if ([
+      'items', 'contains', 'propertyNames', 'not', 'if', 'then', 'else',
+      'additionalProperties', 'additionalItems', 'unevaluatedProperties', 'unevaluatedItems',
+    ].includes(key)) {
+      normalized[key] = normalizeOpenAiToolSchema(entry, root, childPointer, localScopes);
+    }
+    // Other values (notably default/enum/const/examples) are user data. Never
+    // recurse into them or strip keys that happen to look like schema syntax.
+  }
+  return normalized;
+}
+
 function convertTools(tools: unknown): JsonRecord[] | undefined {
   if (!Array.isArray(tools)) {
     return undefined;
@@ -315,7 +426,7 @@ function convertTools(tools: unknown): JsonRecord[] | undefined {
         name,
         ...(readString(tool.description) ? { description: readString(tool.description) } : {}),
         parameters: isRecord(tool.input_schema)
-          ? tool.input_schema
+          ? normalizeOpenAiToolSchema(tool.input_schema)
           : { type: 'object', properties: {} },
       },
     }];

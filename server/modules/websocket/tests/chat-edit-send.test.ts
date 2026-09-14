@@ -22,8 +22,49 @@ function createFakeSocket() {
   };
   socket.readyState = 1;
   socket.frames = [];
-  socket.send = (data: string) => socket.frames.push(JSON.parse(data) as Record<string, unknown>);
+  socket.send = (data: string) => {
+    const frame = JSON.parse(data) as Record<string, unknown>;
+    socket.frames.push(frame);
+    socket.emit('frame', frame);
+  };
   return socket;
+}
+
+/** Bounded event-driven waits keep filesystem scheduling out of fixture assertions. */
+async function waitForSocketState(
+  socket: ReturnType<typeof createFakeSocket>,
+  event: string,
+  isReady: () => boolean,
+  description: string,
+): Promise<void> {
+  if (isReady()) return;
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      socket.off(event, onStateChange);
+      reject(new Error(`Timed out waiting for ${description}`));
+    }, 5_000);
+    function onStateChange(): void {
+      if (!isReady()) return;
+      clearTimeout(timeout);
+      socket.off(event, onStateChange);
+      resolve();
+    }
+    socket.on(event, onStateChange);
+  });
+}
+
+/** Waits for the requested response while retaining protocol-code checks for rejected turns. */
+async function waitForFrame(
+  socket: ReturnType<typeof createFakeSocket>,
+  kind: string,
+  code?: string,
+): Promise<Record<string, unknown>> {
+  const findFrame = () => socket.frames.find((frame) => (
+    frame.kind === kind && (code === undefined || frame.code === code)
+  ));
+  await waitForSocketState(socket, 'frame', () => Boolean(findFrame()), code ?? kind);
+  return findFrame()!;
 }
 
 /** Two turns and an edit of the second, which is the transcript the gateway reads. */
@@ -124,6 +165,7 @@ async function withGateway(
           hasRuntime: () => true,
           run: async (runProvider: string, command: string, options: Record<string, unknown>) => {
             runs.push({ provider: runProvider, command, options });
+            socket.emit('runtime_call');
             if (holdRun) {
               await holdRun;
             }
@@ -140,27 +182,29 @@ async function withGateway(
     releaseHeldRun?.();
     // The websocket listener owns the async run. Let its finally block persist
     // execution completion before this fixture closes and swaps the database.
-    await new Promise((resolve) => { setTimeout(resolve, 30); });
-    releaseHeldRun = null;
-    holdRun = null;
-    connectedClients.clear();
-    chatRunRegistry.clearAll();
-    if (previousClaudeConfig === undefined) delete process.env.COMIC_CLAUDE_CONFIG_DIR;
-    else process.env.COMIC_CLAUDE_CONFIG_DIR = previousClaudeConfig;
-    if (previousCodexHome === undefined) delete process.env.COMIC_CODEX_HOME;
-    else process.env.COMIC_CODEX_HOME = previousCodexHome;
-    closeConnection();
-    if (previousDatabasePath === undefined) {
-      delete process.env.DATABASE_PATH;
-    } else {
-      process.env.DATABASE_PATH = previousDatabasePath;
+    try {
+      if (chatRunRegistry.isProcessing(SESSION_ID)) {
+        await waitForFrame(socket, 'complete');
+      }
+    } finally {
+      releaseHeldRun = null;
+      holdRun = null;
+      connectedClients.clear();
+      chatRunRegistry.clearAll();
+      if (previousClaudeConfig === undefined) delete process.env.COMIC_CLAUDE_CONFIG_DIR;
+      else process.env.COMIC_CLAUDE_CONFIG_DIR = previousClaudeConfig;
+      if (previousCodexHome === undefined) delete process.env.COMIC_CODEX_HOME;
+      else process.env.COMIC_CODEX_HOME = previousCodexHome;
+      closeConnection();
+      if (previousDatabasePath === undefined) {
+        delete process.env.DATABASE_PATH;
+      } else {
+        process.env.DATABASE_PATH = previousDatabasePath;
+      }
+      await rm(tempDirectory, { recursive: true, force: true });
     }
-    await rm(tempDirectory, { recursive: true, force: true });
   }
 }
-
-/** The handler is async and the socket listener does not await it. */
-const settle = () => new Promise((resolve) => { setTimeout(resolve, 30); });
 
 test('an edit resumes through the turn before the one being replaced', async () => {
   await withGateway('claude', async ({ socket, runs }) => {
@@ -170,7 +214,7 @@ test('an edit resumes through the turn before the one being replaced', async () 
       anchorId: 'e-u2',
       content: 'a better second prompt',
     }));
-    await settle();
+    await waitForFrame(socket, 'complete');
 
     assert.equal(runs.length, 1);
     assert.equal(runs[0].command, 'a better second prompt');
@@ -188,7 +232,7 @@ test('editing the first prompt starts the conversation over', async () => {
       anchorId: 'e-u1',
       content: 'a better first prompt',
     }));
-    await settle();
+    await waitForFrame(socket, 'complete');
 
     assert.equal(runs.length, 1);
     assert.equal(runs[0].options.resumeAnchorId, undefined);
@@ -204,9 +248,7 @@ test('every subscribed client is told to drop the superseded turns', async () =>
       anchorId: 'e-u2',
       content: 'replacement',
     }));
-    await settle();
-
-    const truncation = socket.frames.find((frame) => frame.kind === 'history_truncated');
+    const truncation = await waitForFrame(socket, 'history_truncated');
     assert.ok(truncation, 'a history_truncated frame is emitted');
     assert.equal(truncation?.anchorId, 'e-u2');
     assert.equal(truncation?.sessionId, SESSION_ID);
@@ -222,7 +264,7 @@ test('an edit without an anchor is refused', async () => {
       sessionId: SESSION_ID,
       content: 'no anchor',
     }));
-    await settle();
+    await waitForFrame(socket, 'protocol_error', 'ANCHOR_REQUIRED');
 
     assert.equal(runs.length, 0);
     assert.equal(socket.frames.at(-1)?.code, 'ANCHOR_REQUIRED');
@@ -237,7 +279,7 @@ test('an anchor the transcript does not hold is refused', async () => {
       anchorId: 'not-in-transcript',
       content: 'replacement',
     }));
-    await settle();
+    await waitForFrame(socket, 'protocol_error', 'ANCHOR_NOT_FOUND');
 
     assert.equal(runs.length, 0);
     assert.equal(socket.frames.at(-1)?.code, 'ANCHOR_NOT_FOUND');
@@ -252,7 +294,7 @@ test('a provider that cannot re-run from a point is refused rather than sending 
       anchorId: 'e-u2',
       content: 'replacement',
     }));
-    await settle();
+    await waitForFrame(socket, 'protocol_error', 'EDIT_NOT_SUPPORTED');
 
     assert.equal(runs.length, 0);
     assert.equal(socket.frames.at(-1)?.code, 'EDIT_NOT_SUPPORTED');
@@ -276,7 +318,7 @@ test('a refused send never rewinds the conversation', async () => {
         sessionId: SESSION_ID,
         content: 'a turn that is already running',
       }));
-      await settle();
+      await waitForSocketState(socket, 'runtime_call', () => runs.length > 0, 'held runtime call');
       assert.equal(runs.length, 1);
 
       socket.emit('message', JSON.stringify({
@@ -285,7 +327,7 @@ test('a refused send never rewinds the conversation', async () => {
         anchorId: 'turn-b',
         content: 'an edit that arrives too late',
       }));
-      await settle();
+      await waitForFrame(socket, 'protocol_error', 'RUN_IN_PROGRESS');
     } finally {
       sessionsService.rewindSessionForEdit = realRewind;
     }
@@ -317,7 +359,7 @@ test('a provider that has to branch to rewind is rewound before the run, not dur
         anchorId: 'turn-b',
         content: 'a better second prompt',
       }));
-      await settle();
+      await waitForFrame(socket, 'complete');
     } finally {
       sessionsService.rewindSessionForEdit = realRewind;
     }
@@ -355,7 +397,7 @@ test('an actor revoked during async edit preparation cannot reach the provider r
         anchorId: 'turn-b',
         content: 'must not run after revocation',
       }));
-      await settle();
+      await waitForFrame(socket, 'complete');
     } finally {
       sessionsService.rewindSessionForEdit = realRewind;
     }

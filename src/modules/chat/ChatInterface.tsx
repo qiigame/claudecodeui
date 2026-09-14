@@ -73,7 +73,7 @@ function ChatInterface({
   onShowAllTasks,
 }: ChatInterfaceProps) {
   const { tasksEnabled, isTaskMasterInstalled } = useTasksSettings();
-  const { can, isReadOnly, status: deploymentPolicyStatus } = useDeploymentPolicy();
+  const { can, isReadOnly, policy, status: deploymentPolicyStatus } = useDeploymentPolicy();
   const { subscribe } = useWebSocket();
   const { t } = useTranslation('chat');
   const processingSessions = useProcessingSessions();
@@ -119,6 +119,7 @@ function ChatInterface({
     setPendingPermissionRequests,
     availablePermissionModes,
     selectPermissionMode,
+    pinPermissionModeForSession,
     cyclePermissionMode,
     providerModelCatalog,
     providerModelsLoading,
@@ -131,6 +132,10 @@ function ChatInterface({
   } = useChatProviderState({
     selectedSession,
     selectedProject,
+    newSessionTrigger,
+    defaultPermissionMode: deploymentPolicyStatus === 'ready' && !uiReadOnly
+      ? policy?.defaultPermissionMode
+      : 'default',
     readOnly: uiReadOnly,
   });
 
@@ -241,10 +246,11 @@ function ChatInterface({
   // the session gateway before the first send. Record it locally and put it
   // in the URL — this id never changes again, so there is no later handoff.
   const handleSessionEstablished = useCallback<NonNullable<ChatInterfaceProps['onSessionEstablished']>>((sessionId, context) => {
+    pinPermissionModeForSession(sessionId);
     setCurrentSessionId(sessionId);
     onSessionEstablished?.(sessionId, context);
     onNavigateToSession?.(sessionId);
-  }, [setCurrentSessionId, onSessionEstablished, onNavigateToSession]);
+  }, [pinPermissionModeForSession, setCurrentSessionId, onSessionEstablished, onNavigateToSession]);
 
   const {
     input,

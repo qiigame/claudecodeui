@@ -13,6 +13,8 @@ export type DeploymentPolicy = {
   profile: string;
   capabilities: Readonly<Record<string, boolean>>;
   capabilityNames: Readonly<Record<string, string>>;
+  /** Optional startup preference for new developer conversations; never grants capabilities. */
+  defaultPermissionMode?: 'default' | 'bypassPermissions';
 };
 
 /** Loading state exposed to UI components so they can fail closed while policy is unavailable. */
@@ -262,6 +264,18 @@ function parsePolicyPayload(payload: unknown): DeploymentPolicy {
     profile,
     capabilities: Object.freeze(capabilities),
     capabilityNames: Object.freeze(capabilityNames),
+    // Older servers omit this field. Only an explicit developer deployment
+    // can opt into the unrestricted new-chat default; read-only wins even
+    // over a contradictory response from a partially upgraded server.
+    defaultPermissionMode: profile === 'developer'
+      && candidate.defaultPermissionMode === 'bypassPermissions'
+      && capabilities['repo.write'] === true
+      && capabilities['file.write'] === true
+      && capabilities['git.write'] === true
+      && capabilities['shell.exec'] === true
+      && capabilities['provider.runtime'] === true
+      ? 'bypassPermissions'
+      : 'default',
   };
 }
 

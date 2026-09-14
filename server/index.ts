@@ -90,6 +90,7 @@ import {
     mountProtectedApiRoute,
     mountPreApiKeyCapabilityRoute,
     parseDeploymentPolicy,
+    resolveDefaultPermissionMode,
 } from './modules/deployment-policy/index.js';
 
 const __dirname = getModuleDirectory(import.meta.url);
@@ -101,6 +102,7 @@ const installMode = fs.existsSync(path.join(APP_ROOT, '.git')) ? 'git' : 'npm';
 // Auth has its own immutable mode snapshot, but all capability/update wiring
 // must use this same startup policy rather than reparsing process.env later.
 const deploymentPolicy = parseDeploymentPolicy();
+const defaultPermissionMode = resolveDefaultPermissionMode(deploymentPolicy);
 // Provider execution is composed from the same immutable startup snapshot as
 // the HTTP/WebSocket capability guards. Keeping this instance local to the
 // composition root prevents a direct runtime caller from silently selecting a
@@ -468,6 +470,7 @@ app.get('/api/deployment-policy', authenticateToken, (_req, res) => {
         profile: deploymentPolicy.profile,
         capabilities: deploymentPolicy.capabilities,
         capabilityNames: DEPLOYMENT_CAPABILITIES,
+        defaultPermissionMode,
     });
 });
 
@@ -477,6 +480,7 @@ app.get('/api/capabilities', authenticateToken, (_req, res) => {
         profile: deploymentPolicy.profile,
         capabilities: deploymentPolicy.capabilities,
         capabilityNames: DEPLOYMENT_CAPABILITIES,
+        defaultPermissionMode,
     });
 });
 
