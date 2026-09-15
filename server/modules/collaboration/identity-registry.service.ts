@@ -54,10 +54,19 @@ type RuntimeSubjectBinding = {
   status?: unknown;
 };
 
+type RuntimeBridgeSenderBinding = RuntimeSubjectBinding & {
+  sender_id?: unknown;
+  sender_scope?: unknown;
+  namespace?: unknown;
+  subject_type?: unknown;
+  person_id?: unknown;
+};
+
 type IdentityRuntimeMap = {
   schema_version?: unknown;
   dingtalk_subjects?: unknown;
   subjects?: unknown;
+  dingtalk_senders?: unknown;
 };
 
 /**
@@ -100,6 +109,14 @@ export type ResolvedDingTalkIdentity = {
   externalSubject: string;
   subjectScope: 'global' | 'provider';
   vcsIdentityIds: string[];
+};
+
+export type ResolveDingTalkBridgeInput = {
+  providerKey: string;
+  namespace: string;
+  senderScope: 'open_dingtalk_id' | 'user_id' | 'union_id';
+  senderId: string;
+  displayName?: string;
 };
 
 type ResolveDingTalkInput = {
@@ -232,7 +249,7 @@ function readRegistry(options: IdentityRegistryOptions = {}): IdentityRegistry |
   return parsed;
 }
 
-function readRuntimeSubjectBindings(): RuntimeSubjectBinding[] {
+function readRuntimeSubjectBindings(kind: 'subjects' | 'senders' = 'subjects'): RuntimeSubjectBinding[] {
   const file = runtimeMapPath();
   if (!file) return [];
   let fileStat;
@@ -295,10 +312,17 @@ function readRuntimeSubjectBindings(): RuntimeSubjectBinding[] {
       statusCode: 503,
     });
   }
-  const entries = Array.isArray(parsed.dingtalk_subjects)
-    ? parsed.dingtalk_subjects
-    : Array.isArray(parsed.subjects) ? parsed.subjects : [];
-  if (!Array.isArray(parsed.dingtalk_subjects) && !Array.isArray(parsed.subjects)) {
+  if (kind === 'senders' && parsed.dingtalk_senders !== undefined && !Array.isArray(parsed.dingtalk_senders)) {
+    throw new AppError('The identity runtime map dingtalk_senders must be an array.', {
+      code: 'IDENTITY_RUNTIME_MAP_INVALID', statusCode: 503,
+    });
+  }
+  const entries = kind === 'senders'
+    ? (Array.isArray(parsed.dingtalk_senders) ? parsed.dingtalk_senders : [])
+    : (Array.isArray(parsed.dingtalk_subjects)
+      ? parsed.dingtalk_subjects
+      : Array.isArray(parsed.subjects) ? parsed.subjects : []);
+  if (kind === 'subjects' && !Array.isArray(parsed.dingtalk_subjects) && !Array.isArray(parsed.subjects)) {
     throw new AppError('The identity runtime map must contain a dingtalk_subjects array.', {
       code: 'IDENTITY_RUNTIME_MAP_INVALID',
       statusCode: 503,
@@ -311,6 +335,36 @@ function readRuntimeSubjectBindings(): RuntimeSubjectBinding[] {
     });
   }
   const bindings = entries as RuntimeSubjectBinding[];
+  if (kind === 'senders') {
+    const seen = new Set<string>();
+    for (const entry of bindings as RuntimeBridgeSenderBinding[]) {
+      const provider = asString(entry.provider_key);
+      const namespace = asString(entry.namespace);
+      const subjectType = asString(entry.subject_type);
+      const subject = asString(entry.subject);
+      const personId = asString(entry.person_id);
+      const key = `${provider}\0${namespace}\0${subjectType}\0${subject}`;
+      if (!provider || !namespace || !subject
+        || !['open_dingtalk_id', 'user_id', 'union_id'].includes(subjectType)
+        || !['pending', 'active', 'configured', 'verified'].includes(asString(entry.status))) {
+        throw new AppError('The identity runtime map contains an invalid bridge sender binding.', {
+          code: 'IDENTITY_RUNTIME_MAP_INVALID', statusCode: 503,
+        });
+      }
+      if (asString(entry.status) === 'verified' && !personId) {
+        throw new AppError('The identity runtime map contains a verified sender without a person_id.', {
+          code: 'IDENTITY_RUNTIME_MAP_INVALID', statusCode: 503,
+        });
+      }
+      if (seen.has(key)) {
+        throw new AppError('The identity runtime map contains an ambiguous bridge sender.', {
+          code: 'IDENTITY_RUNTIME_MAP_AMBIGUOUS', statusCode: 503,
+        });
+      }
+      seen.add(key);
+    }
+    return bindings;
+  }
   const seenBindings = new Set<string>();
   const seenSubjects = new Set<string>();
   for (const binding of bindings) {
@@ -452,6 +506,7 @@ function writeAutomaticRuntimeBinding(input: {
   if (!file) return 'unavailable';
 
   const initialStat = fs.lstatSync(file);
+  const bridgeSenderBindings = readRuntimeSubjectBindings('senders');
   const bindings = readRuntimeSubjectBindings();
   const subjectMatch = bindings.find((binding) =>
     asString(binding.provider_key) === input.providerKey
@@ -520,6 +575,7 @@ function writeAutomaticRuntimeBinding(input: {
     fs.writeFileSync(fileDescriptor, `${JSON.stringify({
       schema_version: 1,
       dingtalk_subjects: nextBindings,
+      ...(bridgeSenderBindings.length ? { dingtalk_senders: bridgeSenderBindings } : {}),
     }, null, 2)}\n`, 'utf8');
     fs.fsyncSync(fileDescriptor);
     fs.closeSync(fileDescriptor);
@@ -652,6 +708,77 @@ export const identityRegistryService = {
     return registryPath() !== null || registryRequired(options.required);
   },
 
+  /** Resolve a bridge sender through the separately namespaced sender map. */
+  resolveDingTalkBridgeIdentity(
+    input: ResolveDingTalkBridgeInput,
+    options: IdentityRegistryOptions = {},
+  ): ResolvedDingTalkIdentity {
+    const registry = readRegistry(options);
+    const senderId = input.senderId.trim();
+    const providerKey = input.providerKey.trim();
+    const namespace = input.namespace.trim();
+    if (!registry || !senderId || !providerKey || !namespace) {
+      return {
+        personId: null,
+        displayName: input.displayName?.trim() || '钉钉用户',
+        identityStatus: 'pending',
+        providerKey,
+        externalSubject: senderId,
+        subjectScope: 'provider',
+        vcsIdentityIds: [],
+      };
+    }
+    const bindings = readRuntimeSubjectBindings('senders');
+    const matches = bindings.filter((binding) => {
+      const sender = binding as RuntimeBridgeSenderBinding;
+      return asString(sender.provider_key) === providerKey
+        && asString(sender.namespace) === namespace
+        && asString(sender.subject) === senderId
+        && asString(sender.subject_type) === input.senderScope
+        && !['suspended', 'disabled'].includes(asString(sender.status).toLowerCase());
+    });
+    if (matches.length !== 1) {
+      return {
+        personId: null,
+        displayName: input.displayName?.trim() || '钉钉用户',
+        identityStatus: matches.length > 1 ? 'ambiguous' : 'pending',
+        providerKey,
+        externalSubject: senderId,
+        subjectScope: 'provider',
+        vcsIdentityIds: [],
+      };
+    }
+    const senderBinding = matches[0] as RuntimeBridgeSenderBinding;
+    const person = (registry.people as RegistryPerson[]).find((entry) =>
+      asString(entry.person_id) === asString(senderBinding.person_id)
+      && asString(entry.status).toLowerCase() === 'active');
+    if (!person) {
+      return {
+        personId: null,
+        displayName: input.displayName?.trim() || '钉钉用户',
+        identityStatus: 'pending',
+        providerKey,
+        externalSubject: senderId,
+        subjectScope: 'provider',
+        vcsIdentityIds: [],
+      };
+    }
+    const status = asString(matches[0]?.status).toLowerCase();
+    const identityStatus: RegistryIdentityStatus = status === 'verified'
+      ? 'verified' : status === 'pending' ? 'pending' : 'configured';
+    return {
+      personId: identityStatus === 'verified' ? asString(person.person_id) : null,
+      displayName: asString(person.display_name) || input.displayName?.trim() || '钉钉用户',
+      identityStatus,
+      providerKey,
+      externalSubject: senderId,
+      subjectScope: 'provider',
+      vcsIdentityIds: Array.isArray(person.vcs_identity_ids)
+        ? person.vcs_identity_ids.map(asString).filter(Boolean)
+        : [],
+    };
+  },
+
   resolveDingTalkIdentity(
     input: ResolveDingTalkInput,
     options: IdentityRegistryOptions = {},
@@ -692,6 +819,7 @@ export const identityRegistryService = {
             const runtimeValues = [
               asString(runtimeBinding.subject),
               asString(runtimeBinding.external_subject),
+              asString(runtimeBinding.stable_subject),
               asString(runtimeBinding.union_id),
               asString(runtimeBinding.open_id),
             ].filter(Boolean);

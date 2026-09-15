@@ -76,6 +76,7 @@ import { configureWebPush } from './modules/notifications/index.js';
 import {
   configureIdentityRegistryRequirement,
   createCollaborationModule,
+  createDingTalkBridgeRoutes,
   createInternalCommitReceiptModule,
   identityRegistryService,
   publicSharePageHeaders,
@@ -422,6 +423,28 @@ app.use(
     '/api/internal/commit-receipts',
     createInternalCommitReceiptModule(deploymentCapabilityGuard),
 );
+
+// The DIDI bridge is a local service-to-service caller.  It is only mounted
+// when all deployment-owned values are provisioned; the bridge itself resolves
+// the sender against the protected runtime map and never accepts person/user ids.
+const bridgeTokenFile = process.env.CLOUDCLI_DINGTALK_BRIDGE_TOKEN_FILE?.trim();
+const bridgeProjectPath = process.env.CLOUDCLI_DINGTALK_BRIDGE_PROJECT_PATH?.trim();
+const bridgeProviderKey = process.env.CLOUDCLI_DINGTALK_BRIDGE_PROVIDER_KEY?.trim();
+const bridgeNamespace = process.env.CLOUDCLI_DINGTALK_BRIDGE_NAMESPACE?.trim();
+const bridgeGroupNamespace = process.env.CLOUDCLI_DINGTALK_BRIDGE_GROUP_NAMESPACE?.trim();
+const bridgeDirectNamespace = process.env.CLOUDCLI_DINGTALK_BRIDGE_DIRECT_NAMESPACE?.trim();
+const bridgeNamespaces = [bridgeNamespace, bridgeGroupNamespace, bridgeDirectNamespace].filter(
+  (value, index, values): value is string => Boolean(value) && values.indexOf(value) === index,
+);
+if (bridgeTokenFile && bridgeProjectPath && bridgeProviderKey && bridgeNamespaces.length > 0) {
+  app.use('/api/internal/dingtalk-bridge', createDingTalkBridgeRoutes({
+    tokenFile: bridgeTokenFile,
+    projectPath: bridgeProjectPath,
+    providerKey: bridgeProviderKey,
+    namespace: bridgeNamespaces,
+    runtime: providerRuntimeService,
+  }));
+}
 
 // The Browser MCP child authenticates with its own installation-local bearer
 // token. Mount its callback before the optional API-wide key without weakening

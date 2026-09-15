@@ -95,6 +95,8 @@ export type PendingIdentityEnrollment = {
  * supplied by the browser.
  */
 export type DingTalkActorIdentityInput = {
+  /** Authentication source; bridge actors are kept separate from OAuth actors. */
+  source?: 'dingtalk' | 'dingtalk-bridge';
   providerKey: string;
   providerName: string;
   externalSubject: string;
@@ -114,7 +116,8 @@ export type DingTalkActorIdentityInput = {
  * events are fetched separately so initial sidebar payloads stay bounded.
  */
 export type SessionAttributionSummary = {
-  createdBy: CollaborationActorSummary;
+  /** Null until an explicit create event identifies the original creator. */
+  createdBy: CollaborationActorSummary | null;
   lastActor: CollaborationActorSummary;
   participantCount: number;
   lastAction: string;

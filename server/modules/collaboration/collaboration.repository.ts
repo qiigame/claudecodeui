@@ -55,15 +55,15 @@ type SessionAttributionRow = {
   last_action: string;
   updated_at: string;
   participant_count: number;
-  created_actor_id: number;
-  created_user_id: number;
-  created_display_name: string;
-  created_badge: string;
-  created_provider: string;
-  created_provider_key: string;
-  created_provider_name: string;
+  created_actor_id: number | null;
+  created_user_id: number | null;
+  created_display_name: string | null;
+  created_badge: string | null;
+  created_provider: string | null;
+  created_provider_key: string | null;
+  created_provider_name: string | null;
   created_person_id: string | null;
-  created_identity_status: string;
+  created_identity_status: string | null;
   last_actor_id: number;
   last_user_id: number;
   last_display_name: string;
@@ -136,14 +136,15 @@ const actorSummary = (row: ActorRow): CollaborationActorSummary => ({
 });
 
 const attributionSummary = (row: SessionAttributionRow): SessionAttributionSummary => ({
-  createdBy: actorSummary({
+  // A LEFT JOIN has no creator columns for imported sessions first seen on send.
+  createdBy: row.created_actor_id === null ? null : actorSummary({
     actor_id: row.created_actor_id,
-    user_id: row.created_user_id,
-    display_name: row.created_display_name,
-    badge: row.created_badge,
-    provider: row.created_provider,
-    provider_key: row.created_provider_key,
-    provider_name: row.created_provider_name,
+    user_id: row.created_user_id!,
+    display_name: row.created_display_name!,
+    badge: row.created_badge!,
+    provider: row.created_provider!,
+    provider_key: row.created_provider_key!,
+    provider_name: row.created_provider_name!,
     person_id: row.created_person_id,
     identity_status: row.created_identity_status,
   }),
@@ -231,6 +232,19 @@ function ensureLocalActor(userId: number): ActorRow {
  */
 function refreshActorIdentity(actor: ActorRow): ActorRow {
   const registryRequired = isIdentityRegistryRequired();
+  if (actor.provider === 'dingtalk-bridge') {
+    try {
+      const input = JSON.parse(actor.external_subject || '{}');
+      const resolved = identityRegistryService.resolveDingTalkBridgeIdentity(input, { required: true });
+      getConnection().prepare(`
+        UPDATE collaboration_actors SET person_id = ?, identity_status = ?, display_name = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE actor_id = ?
+      `).run(resolved.personId, resolved.identityStatus, resolved.displayName, actor.actor_id);
+      return { ...actor, person_id: resolved.personId, identity_status: resolved.identityStatus, display_name: resolved.displayName };
+    } catch {
+      return { ...actor, person_id: null, identity_status: 'pending' };
+    }
+  }
   if (actor.provider !== 'dingtalk') {
     return actor;
   }
@@ -349,7 +363,7 @@ const SESSION_ATTRIBUTION_SELECT = `
     last_actor.person_id AS last_person_id,
     last_actor.identity_status AS last_identity_status
   FROM session_actor_state state
-  JOIN collaboration_actors created_actor ON created_actor.actor_id = state.created_by_actor_id
+  LEFT JOIN collaboration_actors created_actor ON created_actor.actor_id = state.created_by_actor_id
   JOIN collaboration_actors last_actor ON last_actor.actor_id = state.last_actor_id
   LEFT JOIN session_participants participants ON participants.session_id = state.session_id
 `;
@@ -374,7 +388,8 @@ export const collaborationRepository = {
     actor: CollaborationActorSummary;
   } {
     const db = getConnection();
-    const registryAuthoritative = identityRegistryService.isConfigured();
+    const actorProvider = input.source ?? 'dingtalk';
+    const registryAuthoritative = actorProvider === 'dingtalk' && identityRegistryService.isConfigured();
     const registryIdentity = registryAuthoritative
       ? identityRegistryService.resolveDingTalkIdentity({
         providerKey: input.providerKey,
@@ -392,26 +407,26 @@ export const collaborationRepository = {
     const displayName = normalizeDisplayName(registryIdentity?.displayName || input.displayName);
     // The registry is authoritative when enabled. A legacy credentials-file
     // gitEmail must not smuggle a guessed identity into a shared deployment.
-    const gitEmail = identityRegistryService.isConfigured() ? null : input.gitEmail ?? null;
+    const gitEmail = registryAuthoritative ? null : input.gitEmail ?? null;
     const badge = normalizeBadge(input.badge, displayName);
     const identityProviderKey = input.subjectScope === 'global' ? 'global' : input.providerKey;
     const subjectHash = hashSubject(identityProviderKey, input.externalSubject);
     let existing = db.prepare(`
       SELECT actor_id, user_id, display_name, badge, provider, provider_key, provider_name, git_email, external_subject, subject_scope, external_provider_key, person_id, identity_status
       FROM collaboration_actors
-      WHERE provider = 'dingtalk' AND provider_key = ? AND subject_hash = ?
-    `).get(identityProviderKey, subjectHash) as ActorRow | undefined;
+      WHERE provider = ? AND provider_key = ? AND subject_hash = ?
+    `).get(actorProvider, identityProviderKey, subjectHash) as ActorRow | undefined;
 
     if (!existing && input.subjectScope === 'global') {
       const legacySubjectHash = hashSubject(input.providerKey, input.externalSubject);
       existing = db.prepare(`
         SELECT actor_id, user_id, display_name, badge, provider, provider_key, provider_name, git_email, external_subject, subject_scope, external_provider_key, person_id, identity_status
         FROM collaboration_actors
-        WHERE provider = 'dingtalk' AND provider_key = ? AND subject_hash = ?
-      `).get(input.providerKey, legacySubjectHash) as ActorRow | undefined;
+        WHERE provider = ? AND provider_key = ? AND subject_hash = ?
+      `).get(actorProvider, input.providerKey, legacySubjectHash) as ActorRow | undefined;
     }
 
-    if (!existing && !registryIdentity && input.personId) {
+    if (!existing && actorProvider === 'dingtalk' && !registryIdentity && input.personId) {
       // A registry person id is stable across providers. Display names are not
       // identity keys and therefore never participate in actor migration. This
       // legacy-only compatibility path is deliberately disabled when the
@@ -420,8 +435,8 @@ export const collaborationRepository = {
       const personMatches = db.prepare(`
         SELECT actor_id, user_id, display_name, badge, provider, provider_key, provider_name, git_email, external_subject, subject_scope, external_provider_key, person_id, identity_status
         FROM collaboration_actors
-        WHERE provider = 'dingtalk' AND person_id = ?
-      `).all(input.personId) as ActorRow[];
+        WHERE provider = ? AND person_id = ?
+      `).all(actorProvider, input.personId) as ActorRow[];
       if (personMatches.length === 1) {
         [existing] = personMatches;
       } else if (personMatches.length > 1) {
@@ -468,12 +483,13 @@ export const collaborationRepository = {
         userId = Number(userResult.lastInsertRowid);
         db.prepare(`
           INSERT INTO collaboration_actors (
-            user_id, provider, provider_key, provider_name, subject_hash, external_subject, subject_scope, external_provider_key, display_name, badge, git_email,
+          user_id, provider, provider_key, provider_name, subject_hash, external_subject, subject_scope, external_provider_key, display_name, badge, git_email,
             person_id, identity_status,
             last_login_at
-          ) VALUES (?, 'dingtalk', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        `).run(
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          `).run(
           userId,
+          actorProvider,
           identityProviderKey,
           input.providerName,
           subjectHash,
@@ -569,6 +585,12 @@ export const collaborationRepository = {
     // reached.  DingTalk actors, on the other hand, are revalidated below
     // whenever a registry is configured.
     const registryRequired = requiresIdentityRegistry(options);
+    if (actor.provider === 'dingtalk-bridge') {
+      throw new AppError('Bridge actors may only use the protected read-only bridge entry.', {
+        code: 'BRIDGE_ACTOR_READ_ONLY',
+        statusCode: 403,
+      });
+    }
     if (actor.provider !== 'dingtalk') {
       if (registryRequired) {
         throw new AppError('A verified DingTalk project identity is required before this operation.', {
@@ -619,7 +641,23 @@ export const collaborationRepository = {
     userId: number,
     options: ExecutionActorOptions = {},
   ): ExecutionActorIdentity {
-    const actor = ensureLocalActor(userId);
+    const actor = refreshActorIdentity(ensureLocalActor(userId));
+    if (actor.provider === 'dingtalk-bridge') {
+      if (options.requireVerifiedIdentity !== false) {
+        throw new AppError('Bridge actors are restricted to read-only chat.', {
+          code: 'BRIDGE_ACTOR_READ_ONLY', statusCode: 403,
+        });
+      }
+      if (!actor.person_id || actor.identity_status !== 'verified') {
+        throw new AppError('Your bridge identity is pending registration.', {
+          code: 'IDENTITY_ENROLLMENT_REQUIRED', statusCode: 403,
+        });
+      }
+      return {
+        actor: actorSummary(actor), personId: actor.person_id, identityStatus: 'verified',
+        gitIdentityId: null, gitIdentityMode: 'unknown', gitName: actor.display_name, gitEmail: null,
+      };
+    }
     const requireVerifiedIdentity = options.requireVerifiedIdentity !== false;
     if (requireVerifiedIdentity) {
       this.assertActorCanWrite(userId);
@@ -677,15 +715,18 @@ export const collaborationRepository = {
     const db = getConnection();
     const transaction = db.transaction(() => {
       const actor = ensureLocalActor(userId);
+      // Continuing an imported session proves only the current operator.
+      // Only an explicit create event supplies or fills a missing creator.
       db.prepare(`
         INSERT INTO session_actor_state (
           session_id, created_by_actor_id, last_actor_id, last_action, updated_at
         ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(session_id) DO UPDATE SET
+          created_by_actor_id = COALESCE(session_actor_state.created_by_actor_id, excluded.created_by_actor_id),
           last_actor_id = excluded.last_actor_id,
           last_action = excluded.last_action,
           updated_at = CURRENT_TIMESTAMP
-      `).run(sessionId, actor.actor_id, actor.actor_id, action);
+      `).run(sessionId, action === 'create' ? actor.actor_id : null, actor.actor_id, action);
       db.prepare(`
         INSERT INTO session_participants (
           session_id, actor_id, first_seen_at, last_seen_at, action_count

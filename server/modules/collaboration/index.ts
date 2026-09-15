@@ -16,9 +16,11 @@ export { executionAttributionService } from './execution-attribution.service.js'
 export { identityRegistryService } from './identity-registry.service.js';
 export type {
   IdentityRegistryOptions,
+  ResolveDingTalkBridgeInput,
   ResolvedDingTalkIdentity,
 } from './identity-registry.service.js';
 export {
   configureIdentityRegistryRequirement,
   isIdentityRegistryRequired,
 } from './identity-registry.service.js';
+export { createDingTalkBridgeRoutes } from './dingtalk-bridge.routes.js';

@@ -68,7 +68,8 @@ export type CollaborationActorSummary = {
 
 /** Compact shared-workspace attribution returned with one sidebar session. */
 export type SessionAttributionSummary = {
-  createdBy: CollaborationActorSummary;
+  /** Null until an explicit create event identifies the original creator. */
+  createdBy: CollaborationActorSummary | null;
   lastActor: CollaborationActorSummary;
   participantCount: number;
   lastAction: string;

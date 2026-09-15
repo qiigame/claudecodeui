@@ -189,6 +189,54 @@ test('unknown and ambiguous subjects remain pending instead of guessing by name'
   });
 });
 
+test('bridge sender resolution requires the explicit namespace and subject type', async () => {
+  await withRegistry(async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'cloudcli-identity-bridge-'));
+    const runtimeMap = path.join(directory, 'identity-runtime-map.json');
+    await writeFile(runtimeMap, JSON.stringify({
+      schema_version: 1,
+      dingtalk_subjects: [],
+      dingtalk_senders: [{
+        provider_key: 'comic', namespace: 'bridge-app', subject_type: 'open_dingtalk_id',
+        subject: 'sender-1', person_id: 'alice', binding_ref: 'dingtalk-sender/alice/comic', status: 'verified',
+      }],
+    }), { mode: 0o600 });
+    process.env.CLOUDCLI_IDENTITY_RUNTIME_MAP_PATH = runtimeMap;
+    const resolved = identityRegistryService.resolveDingTalkBridgeIdentity({
+      providerKey: 'comic', namespace: 'bridge-app', senderScope: 'open_dingtalk_id', senderId: 'sender-1',
+    });
+    assert.equal(resolved.personId, 'alice');
+    assert.equal(resolved.identityStatus, 'verified');
+    const wrongNamespace = identityRegistryService.resolveDingTalkBridgeIdentity({
+      providerKey: 'comic', namespace: 'other-app', senderScope: 'open_dingtalk_id', senderId: 'sender-1',
+    });
+    assert.equal(wrongNamespace.personId, null);
+    assert.equal(wrongNamespace.identityStatus, 'pending');
+    const wrongType = identityRegistryService.resolveDingTalkBridgeIdentity({
+      providerKey: 'comic', namespace: 'bridge-app', senderScope: 'user_id', senderId: 'sender-1',
+      displayName: '张三',
+    });
+    assert.equal(wrongType.personId, null, 'same display name cannot bypass the typed namespace');
+    const data = JSON.parse(await readFile(runtimeMap, 'utf8'));
+    for (const status of ['pending', 'configured', 'active']) {
+      data.dingtalk_senders[0].status = status;
+      await writeFile(runtimeMap, JSON.stringify(data));
+      const unverified = identityRegistryService.resolveDingTalkBridgeIdentity({
+        providerKey: 'comic', namespace: 'bridge-app', senderScope: 'open_dingtalk_id', senderId: 'sender-1',
+      });
+      assert.equal(unverified.personId, null, status);
+      assert.notEqual(unverified.identityStatus, 'verified', status);
+    }
+    data.dingtalk_senders.push({ ...data.dingtalk_senders[0], person_id: 'bob' });
+    await writeFile(runtimeMap, JSON.stringify(data));
+    assert.throws(() => identityRegistryService.resolveDingTalkBridgeIdentity({
+      providerKey: 'comic', namespace: 'bridge-app', senderScope: 'open_dingtalk_id', senderId: 'sender-1',
+    }), (error: unknown) => error instanceof Error && 'code' in error
+      && error.code === 'IDENTITY_RUNTIME_MAP_AMBIGUOUS');
+    await rm(directory, { recursive: true, force: true });
+  });
+});
+
 test('binding references resolve through a protected runtime subject map', async () => {
   await withRegistry(async () => {
     const directory = await mkdtemp(path.join(tmpdir(), 'cloudcli-identity-runtime-map-'));

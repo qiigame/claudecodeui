@@ -231,7 +231,8 @@ CREATE TABLE IF NOT EXISTS collaboration_actors (
 
 CREATE TABLE IF NOT EXISTS session_actor_state (
     session_id TEXT PRIMARY KEY,
-    created_by_actor_id INTEGER NOT NULL,
+    -- NULL means no creation event was observed (for example imported CLI history).
+    created_by_actor_id INTEGER,
     last_actor_id INTEGER NOT NULL,
     last_action TEXT NOT NULL,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,

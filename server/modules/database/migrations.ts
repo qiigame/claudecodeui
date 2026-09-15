@@ -30,6 +30,7 @@ lower(hex(randomblob(6)))
 type TableInfoRow = {
   name: string;
   pk: number;
+  notnull: number;
 };
 
 const addColumnToTableIfNotExists = (
@@ -530,6 +531,41 @@ const enforceOneSessionSharePerCreator = (db: Database): void => {
   `);
 };
 
+/** Remove the old implicit creator without rewriting immutable action history. */
+const allowUnknownSessionCreators = (db: Database): void => {
+  const creatorColumn = getTableInfo(db, 'session_actor_state')
+    .find((column) => column.name === 'created_by_actor_id');
+  if (!creatorColumn?.notnull) return;
+
+  // This table has no dependent foreign keys. Rebuild atomically with foreign
+  // key enforcement left on; participants and immutable events stay untouched.
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE session_actor_state__unknown_creator (
+        session_id TEXT PRIMARY KEY,
+        created_by_actor_id INTEGER,
+        last_actor_id INTEGER NOT NULL,
+        last_action TEXT NOT NULL,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+        FOREIGN KEY (created_by_actor_id) REFERENCES collaboration_actors(actor_id),
+        FOREIGN KEY (last_actor_id) REFERENCES collaboration_actors(actor_id)
+      );
+      INSERT INTO session_actor_state__unknown_creator (
+        session_id, created_by_actor_id, last_actor_id, last_action, updated_at
+      )
+      SELECT state.session_id,
+        (SELECT events.actor_id FROM session_actor_events events
+         WHERE events.session_id = state.session_id AND events.action = 'create'
+         ORDER BY events.event_id LIMIT 1),
+        state.last_actor_id, state.last_action, state.updated_at
+      FROM session_actor_state state;
+      DROP TABLE session_actor_state;
+      ALTER TABLE session_actor_state__unknown_creator RENAME TO session_actor_state;
+    `);
+  })();
+};
+
 export const runMigrations = (db: Database) => {
   try {
     const usersTableInfo = db.prepare('PRAGMA table_info(users)').all() as { name: string }[];
@@ -578,6 +614,7 @@ export const runMigrations = (db: Database) => {
     // Collaboration tables reference the final repaired sessions shape, so
     // they must be created only after all session rebuilds and column adds.
     db.exec(COLLABORATION_TABLES_SCHEMA_SQL);
+    allowUnknownSessionCreators(db);
     // Identity columns were added after the first collaboration rollout. Keep
     // upgrades additive so existing actors and receipts remain readable and
     // are explicitly treated as legacy/unknown until re-bound.
