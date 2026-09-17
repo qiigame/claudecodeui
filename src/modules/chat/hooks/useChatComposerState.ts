@@ -947,16 +947,73 @@ export function useChatComposerState({
       const resolvedProjectPath = selectedProject.fullPath || selectedProject.path || '';
       const sessionSummary = getNotificationSessionSummary(selectedSession, currentInput);
 
+      const attachmentRecords = uploadedAttachments as ChatAttachment[];
+      const userMessage: ChatMessage = {
+        type: 'user',
+        content: currentInput,
+        images: attachmentRecords.filter(isImageAttachment),
+        files: attachmentRecords.filter((attachment) => !isImageAttachment(attachment)),
+        timestamp: new Date(),
+        // Tags this echo as the replacement, so the truncation the server
+        // broadcasts a moment later cuts the turns being replaced without
+        // taking the message the user just sent with them.
+        ...(editingAnchorId ? { replacesAnchorId: editingAnchorId } : {}),
+      };
+
+      const clearComposer = () => {
+        setInput('');
+        inputValueRef.current = '';
+        resetCommandMenuState();
+        setAttachedFiles([]);
+        setFileErrors(new Map());
+        setIsTextareaExpanded(false);
+
+        if (textareaRef.current) {
+          textareaRef.current.style.height = 'auto';
+        }
+
+        if (draftScopeRef.current) {
+          writeDraftText(draftScopeRef.current, '');
+        }
+      };
+
       // The conversation always has a stable backend-allocated session id
       // BEFORE the first websocket send: brand-new chats allocate one here
       // via the session gateway. There is no client-visible session-id
       // handoff later — this id stays valid for the conversation's lifetime.
       let targetSessionId = selectedSession?.id || currentSessionId || null;
+      let userMessageShown = false;
       if (!targetSessionId) {
         if (sessionCreationRequestRef.current) {
           return;
         }
         sessionCreationRequestRef.current = true;
+
+        // Allocation can take seconds (the server fetches the remote and
+        // provisions a worktree), so echo the message and clear the composer
+        // first. Without a session the echo is held as the pending message and
+        // flushed into the transcript once the session id is established.
+        addMessage(userMessage);
+        userMessageShown = true;
+        clearComposer();
+        setIsUserScrolledUp(false);
+        setTimeout(() => scrollToBottom(), 100);
+
+        // A failed allocation must not silently swallow the text: the error
+        // replaces the pending echo, and the text returns to the composer
+        // unless the user has already started typing something new.
+        const restoreComposer = () => {
+          if (inputValueRef.current) {
+            return;
+          }
+          setInput(currentInput);
+          inputValueRef.current = currentInput;
+          setAttachedFiles(currentAttachments);
+          if (draftScopeRef.current) {
+            writeDraftText(draftScopeRef.current, currentInput);
+          }
+        };
+
         let createdSessionName = sessionSummary;
         let createdWorkspace: SessionWorkspaceSummary | null = null;
         try {
@@ -984,6 +1041,7 @@ export function useChatComposerState({
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Unknown error';
           console.error('Session creation failed:', error);
+          restoreComposer();
           addMessage({
             type: 'error',
             content: `Failed to start a new session: ${message}`,
@@ -995,6 +1053,7 @@ export function useChatComposerState({
         }
 
         if (!targetSessionId) {
+          restoreComposer();
           addMessage({
             type: 'error',
             content: 'Failed to start a new session: no session id returned.',
@@ -1011,20 +1070,9 @@ export function useChatComposerState({
         });
       }
 
-      const attachmentRecords = uploadedAttachments as ChatAttachment[];
-      const userMessage: ChatMessage = {
-        type: 'user',
-        content: currentInput,
-        images: attachmentRecords.filter(isImageAttachment),
-        files: attachmentRecords.filter((attachment) => !isImageAttachment(attachment)),
-        timestamp: new Date(),
-        // Tags this echo as the replacement, so the truncation the server
-        // broadcasts a moment later cuts the turns being replaced without
-        // taking the message the user just sent with them.
-        ...(editingAnchorId ? { replacesAnchorId: editingAnchorId } : {}),
-      };
-
-      addMessage(userMessage);
+      if (!userMessageShown) {
+        addMessage(userMessage);
+      }
       // Mark this request as processing in the per-session activity map (the
       // single source of truth the indicator derives from). The id is always
       // concrete at this point — no pending placeholder exists anymore.
@@ -1059,19 +1107,8 @@ export function useChatComposerState({
       // navigated to. Queued drafts were recorded when they were queued; the
       // consecutive-duplicate check keeps this second call a no-op.
       recordSentMessage(currentInput, targetSessionId);
-      setInput('');
-      inputValueRef.current = '';
-      resetCommandMenuState();
-      setAttachedFiles([]);
-      setFileErrors(new Map());
-      setIsTextareaExpanded(false);
-
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
-
-      if (draftScopeRef.current) {
-        writeDraftText(draftScopeRef.current, '');
+      if (!userMessageShown) {
+        clearComposer();
       }
     },
     [
