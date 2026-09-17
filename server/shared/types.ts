@@ -67,6 +67,15 @@ export type CollaborationActorSummary = {
   personId?: string | null;
   /** Registry state used to decide whether this actor may write. */
   identityStatus?: 'verified' | 'configured' | 'pending' | 'ambiguous' | 'legacy';
+  /**
+   * True only for legacy DingTalk rows that predate the stable-subject
+   * binding columns. Such rows can never be re-resolved in place (the
+   * registry refresh deliberately refuses to guess their subject), so the
+   * only repair is a fresh OAuth login. The auth middleware turns this flag
+   * into a session-expiring 401 instead of leaving the user stuck on
+   * per-operation 403s.
+   */
+  requiresIdentityRelogin?: boolean;
 };
 
 /**

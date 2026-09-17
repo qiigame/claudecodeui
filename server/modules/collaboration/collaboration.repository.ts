@@ -135,6 +135,28 @@ const actorSummary = (row: ActorRow): CollaborationActorSummary => ({
   identityStatus: normalizeIdentityStatus(row.identity_status),
 });
 
+/**
+ * Legacy DingTalk rows predate the stable-subject binding columns.
+ * refreshActorIdentity deliberately refuses to guess their subject, so they
+ * can never leave `pending` on their own; a fresh OAuth login is the only
+ * repair. The auth middleware surfaces this flag as a session-expiring 401.
+ * Only the full actor row carries the binding columns, so the flag is
+ * attached on the authenticated-user read path rather than inside
+ * actorSummary (whose attribution join rows intentionally lack them).
+ */
+const isUnresolvableLegacyPending = (row: ActorRow): boolean =>
+  row.provider === 'dingtalk'
+  && normalizeIdentityStatus(row.identity_status) === 'pending'
+  && (!row.external_subject
+    || !row.external_provider_key
+    || (row.subject_scope !== 'global' && row.subject_scope !== 'provider'));
+
+const actorSummaryWithReloginFlag = (row: ActorRow): CollaborationActorSummary => {
+  const summary = actorSummary(row);
+  if (isUnresolvableLegacyPending(row)) summary.requiresIdentityRelogin = true;
+  return summary;
+};
+
 const attributionSummary = (row: SessionAttributionRow): SessionAttributionSummary => ({
   // A LEFT JOIN has no creator columns for imported sessions first seen on send.
   createdBy: row.created_actor_id === null ? null : actorSummary({
@@ -526,7 +548,7 @@ export const collaborationRepository = {
   getActorByUserId(userId: number): CollaborationActorSummary | null {
     const actor = selectActorByUserId(userId);
     const currentActor = actor ? refreshActorIdentity(actor) : null;
-    return currentActor ? actorSummary(currentActor) : null;
+    return currentActor ? actorSummaryWithReloginFlag(currentActor) : null;
   },
 
   getActorById(actorId: number): CollaborationActorSummary | null {

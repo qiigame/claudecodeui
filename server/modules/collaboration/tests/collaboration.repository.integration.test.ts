@@ -437,3 +437,43 @@ test('old database migration removes implicit creators but preserves explicit cr
     assert.equal(collaborationRepository.recordSessionAction('old-import', bob.user.id, 'retry').createdBy, null);
   });
 });
+
+test('legacy pending DingTalk actors are flagged for forced re-login, modern ones are not', async () => {
+  await withIsolatedDatabase(() => {
+    const legacy = collaborationRepository.upsertDingTalkActor({
+      providerKey: 'haohan',
+      providerName: '灏瀚',
+      externalSubject: 'legacy-union',
+      subjectScope: 'global',
+      displayName: '呼延翼云',
+      badge: '呼',
+    });
+    const modern = collaborationRepository.upsertDingTalkActor({
+      providerKey: 'haohan',
+      providerName: '灏瀚',
+      externalSubject: 'modern-union',
+      subjectScope: 'global',
+      displayName: '刘盛文',
+      badge: '刘',
+    });
+    const db = getConnection();
+    // Simulate the pre-registry row shape: no stable-subject binding columns.
+    db.prepare(`UPDATE collaboration_actors
+      SET external_subject = NULL, external_provider_key = NULL, subject_scope = NULL,
+          person_id = NULL, identity_status = 'pending'
+      WHERE actor_id = ?`).run(legacy.actor.actorId);
+    db.prepare(`UPDATE collaboration_actors
+      SET person_id = NULL, identity_status = 'pending'
+      WHERE actor_id = ?`).run(modern.actor.actorId);
+
+    const legacySummary = collaborationRepository.getActorByUserId(legacy.user.id);
+    assert.equal(legacySummary?.identityStatus, 'pending');
+    assert.equal(legacySummary?.requiresIdentityRelogin, true);
+    // The raw subject must stay out of the public summary even on this path.
+    assert.equal('externalSubject' in (legacySummary ?? {}), false);
+
+    const modernSummary = collaborationRepository.getActorByUserId(modern.user.id);
+    assert.equal(modernSummary?.identityStatus, 'pending');
+    assert.equal(modernSummary?.requiresIdentityRelogin, undefined);
+  });
+});

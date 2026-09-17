@@ -49,6 +49,19 @@ const rejectInvalidSsoPrincipal = (authenticatedUser) => {
     };
   }
 
+  // Legacy DingTalk rows predate the stable-subject registry and can never
+  // be re-resolved in place; a fresh OAuth login is the only repair. Answer
+  // 401 so the browser expires its stored session and returns to the login
+  // screen, instead of leaving the user authenticated but stuck on
+  // per-operation 403s (plugin RPC, execution, commit hooks).
+  if (actor.requiresIdentityRelogin) {
+    return {
+      error: 'Your project identity predates the registry. Please sign in with DingTalk again to re-link it.',
+      code: 'IDENTITY_RELOGIN_REQUIRED',
+      statusCode: 401,
+    };
+  }
+
   // Person mapping is attribution metadata, not authentication. Route-level
   // deployment capabilities and settings permissions remain authoritative for
   // writes, while commit hooks separately require verified attribution.
@@ -58,6 +71,16 @@ const rejectInvalidSsoPrincipal = (authenticatedUser) => {
 /** Applies the SSO principal check before route-specific capability checks. */
 const rejectAuthenticatedPrincipal = (_req, authenticatedUser) =>
   rejectInvalidSsoPrincipal(authenticatedUser);
+
+// The frontend expires its stored session whenever X-Auth-Error is present;
+// identity re-login errors must carry it so the browser actually returns to
+// the DingTalk login screen instead of retrying with the stale token.
+const respondPrincipalError = (res, principalError) => {
+  if (principalError?.code === 'IDENTITY_RELOGIN_REQUIRED') {
+    res.setHeader('X-Auth-Error', 'identity-relogin-required');
+  }
+  return res.status(principalError.statusCode ?? 403).json(principalError);
+};
 
 // Use env var if set, otherwise auto-generate a unique secret per installation
 const JWT_SECRET = process.env.JWT_SECRET || appConfigDb.getOrCreateJwtSecret();
@@ -94,7 +117,7 @@ const authenticateToken = async (req, res, next) => {
       }
       req.user = withCollaborationActor(user);
       const mutationError = rejectAuthenticatedPrincipal(req, req.user);
-      if (mutationError) return res.status(mutationError.statusCode ?? 403).json(mutationError);
+      if (mutationError) return respondPrincipalError(res, mutationError);
       return next();
     } catch (error) {
       console.error('Platform mode error:', error);
@@ -151,7 +174,7 @@ const authenticateToken = async (req, res, next) => {
 
     req.user = withCollaborationActor(user);
     const principalError = rejectAuthenticatedPrincipal(req, req.user);
-    if (principalError) return res.status(principalError.statusCode ?? 403).json(principalError);
+    if (principalError) return respondPrincipalError(res, principalError);
     next();
   } catch (error) {
     if (error instanceof jwt.TokenExpiredError) {
